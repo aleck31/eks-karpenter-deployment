@@ -46,6 +46,7 @@ data:
       rolearn: arn:aws:iam::ACCOUNT_ID:role/ROLE_NAME
       username: admin:{{SessionName}}
 '
+# 注意：执行 kubectl patch 会完全覆盖 mapRoles 字段，因此需要包含原有的限配置
 ```
 
 #### 方法 2: User 映射（为 IAM User 添加集群访问权限）
@@ -56,6 +57,7 @@ data:
 kubectl patch configmap aws-auth -n kube-system --patch '
 data:
   mapUsers: |
+    # 保留现有的用户映射...
     - userarn: arn:aws:sts::ACCOUNT_ID:assumed-role/ROLE_NAME/USER_NAME
       username: admin-user
       groups:
@@ -87,6 +89,17 @@ kubectl get configmap aws-auth -n kube-system -o yaml
 kubectl patch configmap aws-auth -n kube-system --patch '
 data:
   mapRoles: |
+    - groups:
+      - system:bootstrappers
+      - system:nodes
+      - system:node-proxier
+      rolearn: arn:aws:iam::123456789012:role/eksctl-eks-karpenter-env-cl-FargatePodExecutionRole-1234567
+      username: system:node:{{SessionName}}
+    - groups:
+      - system:bootstrappers
+      - system:nodes
+      rolearn: arn:aws:iam::123456789012:role/KarpenterNodeInstanceRole-eks-karpenter-env
+      username: system:node:{{EC2PrivateDNSName}}
     - groups:
       - system:masters
       rolearn: arn:aws:iam::123456789012:role/Admin

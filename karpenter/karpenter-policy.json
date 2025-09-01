@@ -48,6 +48,7 @@
             "Action": [
                 "iam:CreateInstanceProfile",
                 "iam:TagInstanceProfile",
+                "iam:GetInstanceProfile",
                 "iam:AddRoleToInstanceProfile",
                 "iam:RemoveRoleFromInstanceProfile",
                 "iam:DeleteInstanceProfile"

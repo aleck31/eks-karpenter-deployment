@@ -2,7 +2,7 @@
 apiVersion: karpenter.sh/v1
 kind: NodePool
 metadata:
-  name: amd64-nodes
+  name: nodepool-amd64
 spec:
   weight: 50  # 较低优先级 - 兼容性需求时使用
   template:
@@ -15,7 +15,7 @@ spec:
       nodeClassRef:
         group: karpenter.k8s.aws
         kind: EC2NodeClass
-        name: amd64-nodeclass
+        name: nodeclass-amd64
       requirements:
         - key: kubernetes.io/arch
           operator: In
@@ -54,7 +54,7 @@ spec:
 apiVersion: karpenter.k8s.aws/v1
 kind: EC2NodeClass
 metadata:
-  name: amd64-nodeclass
+  name: nodeclass-amd64
 spec:
   # 使用 Amazon Linux 2023
   amiFamily: AL2023

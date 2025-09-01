@@ -1,0 +1,46 @@
+# 本地 NVMe 存储类配置
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: local-nvme-cache
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete
+
+---
+# 本地存储 PV 示例 (需要根据实际节点创建)
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: local-nvme-pv-example
+spec:
+  capacity:
+    storage: 100Gi  # 根据实际 NVMe 容量调整
+  volumeMode: Filesystem
+  accessModes:
+  - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Delete
+  storageClassName: local-nvme-cache
+  local:
+    path: /mnt/nvme-cache/k8s-local-storage
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: node-type
+          operator: In
+          values: ["gpu"]
+
+---
+# 使用本地存储的 PVC 示例
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: training-cache-pvc
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: local-nvme-cache
+  resources:
+    requests:
+      storage: 50Gi

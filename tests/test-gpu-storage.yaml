@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-storage-test
+spec:
+  containers:
+  - name: gpu-storage
+    image: nvcr.io/nvidia/k8s/cuda-sample:vectoradd-cuda12.5.0-ubi8
+    command: ["sh", "-c", "echo 'Testing local storage...' && df -h /tmp/cache && echo 'Writing test file...' && echo 'GPU + NVMe Storage Test' > /tmp/cache/test.txt && cat /tmp/cache/test.txt && sleep 3600"]
+    resources:
+      limits:
+        nvidia.com/gpu: 1
+    volumeMounts:
+    - name: local-nvme
+      mountPath: /tmp/cache
+  volumes:
+  - name: local-nvme
+    hostPath:
+      path: /mnt/nvme-cache/k8s-local-storage
+  nodeSelector:
+    node-type: gpu
+  tolerations:
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule

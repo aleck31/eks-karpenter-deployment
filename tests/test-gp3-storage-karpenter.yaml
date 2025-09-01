@@ -24,7 +24,7 @@ metadata:
 spec:
   # 指定部署到 Karpenter ARM64 节点
   nodeSelector:
-    karpenter.sh/nodepool: arm64-nodes
+    karpenter.sh/nodepool: nodepool-arm64
   containers:
   - name: test-container
     image: nginx:alpine
