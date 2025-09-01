@@ -1,0 +1,37 @@
+# 通用存储类配置
+---
+# GP3 存储类 - 默认推荐
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  fsType: ext4
+  # GP3 性能参数
+  iops: "3000"        # 基准 IOPS
+  throughput: "125"   # 基准吞吐量 (MiB/s)
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain  # 保留数据
+allowVolumeExpansion: true
+
+---
+# EFS 存储类 - 共享存储
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: efs-sc
+provisioner: efs.csi.aws.com
+parameters:
+  provisioningMode: efs-ap
+  fileSystemId: fs-0123456789abcdef0  # EKS Karpenter 集群的 EFS ID
+  directoryPerms: "700"
+  gidRangeStart: "1000"
+  gidRangeEnd: "2000"
+  basePath: "/dynamic_provisioning"
+volumeBindingMode: Immediate
+reclaimPolicy: Retain  # 保留数据
+allowVolumeExpansion: false

@@ -1,0 +1,84 @@
+# ARM64 NodePool - Graviton 性价比优先
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: arm64-nodes
+spec:
+  weight: 100  # 高优先级 - 推荐使用 ARM64
+  template:
+    metadata:
+      labels:
+        node-type: "arm64"
+        arch: "arm64"
+        cost-tier: "optimized"
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: arm64-nodeclass
+      requirements:
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["arm64"]
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]  # Spot 优先
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: 
+            # Graviton4 (M8g) - 最新最佳性价比
+            - m8g.large
+            - m8g.xlarge
+            - m8g.2xlarge
+            - m8g.4xlarge
+            # Graviton3 (M7g) - 成熟稳定
+            - m7g.large
+            - m7g.xlarge
+            - m7g.2xlarge
+            - m7g.4xlarge
+        - key: topology.kubernetes.io/zone
+          operator: In
+          values: ["ap-southeast-1a", "ap-southeast-1b", "ap-southeast-1c"]
+  limits:
+    cpu: 1000
+    memory: 1000Gi
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 30s
+
+---
+# ARM64 NodeClass
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: arm64-nodeclass
+spec:
+  # 使用 Amazon Linux 2023
+  amiFamily: AL2023
+  amiSelectorTerms:
+    - name: "amazon-eks-node-al2023-arm64-standard-1.33-*"
+  
+  instanceStorePolicy: RAID0
+  userData: |
+    #!/bin/bash
+    /usr/bin/nodeadm init --cluster-name eks-karpenter-env
+    
+  # 子网和安全组使用 karpenter.sh/discovery 标签
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "eks-karpenter-env"
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "eks-karpenter-env"
+  
+  instanceProfile: "KarpenterNodeInstanceProfile-eks-karpenter-env"
+  
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 100Gi
+        volumeType: gp3
+        deleteOnTermination: true

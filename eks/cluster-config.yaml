@@ -1,0 +1,112 @@
+# cluster-config.yaml - 完整版本包含所有必要的服务账户和插件
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: eks-karpenter-env
+  region: ap-southeast-1
+  version: "1.33"  # 使用 Kubernetes v1.33
+
+# VPC 配置 - 使用 10.1.0.0/16 网段
+vpc:
+  cidr: "10.1.0.0/16"
+
+# 可用区配置 (新加坡区域 3 个 AZ)
+availabilityZones:
+  - ap-southeast-1a
+  - ap-southeast-1b
+  - ap-southeast-1c
+
+# IAM 配置
+iam:
+  withOIDC: true
+  serviceAccounts:
+    # Karpenter 服务账户
+    - metadata:
+        name: karpenter
+        namespace: karpenter
+      wellKnownPolicies:
+        autoScaler: true
+      roleName: KarpenterServiceAccount-eks-karpenter-env
+      roleOnly: true
+    
+    # AWS LoadBalancer Controller 服务账户
+    - metadata:
+        name: aws-load-balancer-controller
+        namespace: kube-system
+      wellKnownPolicies:
+        awsLoadBalancerController: true
+      roleName: AmazonEKSLoadBalancerControllerRole
+    
+    # S3 CSI Driver 服务账户 (为 addon 提供 IAM 角色)
+    - metadata:
+        name: s3-csi-driver-sa
+        namespace: kube-system
+      attachPolicyARNs:
+        - "arn:aws:iam::aws:policy/AmazonS3FullAccess"
+      roleName: AmazonEKS_S3_CSI_DriverRole
+
+# 不创建默认节点组
+managedNodeGroups: []
+
+# Fargate Profile 用于运行系统组件和 Karpenter 等组件
+fargateProfiles:
+  - name: default
+    selectors:
+      - namespace: default
+        labels:
+          fargate: enabled
+      - namespace: kube-system
+        labels:
+          fargate: enabled
+  - name: karpenter
+    selectors:
+      - namespace: karpenter
+        labels:
+          fargate: enabled
+  - name: portainer
+    selectors:
+      - namespace: portainer
+        labels:
+          fargate: enabled
+
+# 启用必要的插件
+addons:
+  - name: vpc-cni
+    version: latest
+  - name: coredns
+    version: latest
+    configurationValues: |-
+      podLabels:
+        fargate: enabled
+  - name: kube-proxy
+    version: latest
+  - name: aws-ebs-csi-driver
+    version: latest
+    wellKnownPolicies:
+      ebsCSIController: true
+  - name: aws-efs-csi-driver
+    version: latest
+    wellKnownPolicies:
+      efsCSIController: true
+  - name: eks-pod-identity-agent
+    version: latest
+  - name: metrics-server
+    version: latest
+    configurationValues: |-
+      podLabels:
+        fargate: enabled
+  - name: aws-mountpoint-s3-csi-driver
+    version: latest
+    wellKnownPolicies:
+      s3CSIController: true
+
+# CloudWatch 日志
+cloudWatch:
+  clusterLogging:
+    enableTypes:
+      - api
+      - audit
+      - authenticator
+      - controllerManager
+      - scheduler

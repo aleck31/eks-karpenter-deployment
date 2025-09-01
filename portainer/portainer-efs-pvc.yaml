@@ -1,0 +1,25 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: efs-sc
+provisioner: efs.csi.aws.com
+parameters:
+  provisioningMode: efs-ap
+  fileSystemId: fs-0123456789abcdef0  # 新创建的 EFS ID
+  directoryPerms: "700"
+  gidRangeStart: "1000"
+  gidRangeEnd: "2000"
+  basePath: "/portainer"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: portainer-data-pvc
+  namespace: portainer
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: efs-portainer
+  resources:
+    requests:
+      storage: 5Gi
