@@ -31,11 +31,49 @@ spec:
         - key: node.kubernetes.io/instance-type
           operator: In
           values: 
-            # 测试用 g4dn.xlarge (ap-southeast-1 可用)
-            - g4dn.xlarge    # 1x NVIDIA T4, 4 vCPU, 16 GB RAM, 125GB NVMe
+            # G4dn 系列 - NVIDIA T4 (x86_64) - 小模型推理
+            - g4dn.xlarge    # 1x T4, 4 vCPU, 16 GB, 125GB NVMe
+            - g4dn.2xlarge   # 1x T4, 8 vCPU, 32 GB, 225GB NVMe  
+            - g4dn.4xlarge   # 1x T4, 16 vCPU, 64 GB, 225GB NVMe
+            - g4dn.8xlarge   # 1x T4, 32 vCPU, 128 GB, 900GB NVMe
+            - g4dn.12xlarge  # 4x T4, 48 vCPU, 192 GB, 900GB NVMe
+            
+            # G6 系列 - NVIDIA L4 (x86_64) - 高效推理
+            - g6.xlarge      # 1x L4, 4 vCPU, 16 GB
+            - g6.2xlarge     # 1x L4, 8 vCPU, 32 GB
+            - g6.4xlarge     # 1x L4, 16 vCPU, 64 GB
+            - g6.8xlarge     # 1x L4, 32 vCPU, 128 GB
+            - g6.12xlarge    # 4x L4, 48 vCPU, 192 GB
+            - g6.16xlarge    # 1x L4, 64 vCPU, 256 GB
+            - g6.24xlarge    # 4x L4, 96 vCPU, 384 GB
+
+            # G5g 系列 - NVIDIA T4g (ARM64) - 成本优化推理
+            - g5g.xlarge     # 1x T4g, 4 vCPU, 8 GB
+            - g5g.2xlarge    # 1x T4g, 8 vCPU, 16 GB
+            - g5g.4xlarge    # 1x T4g, 16 vCPU, 32 GB
+            - g5g.8xlarge    # 1x T4g, 32 vCPU, 64 GB
+            - g5g.16xlarge   # 2x T4g, 64 vCPU, 128 GB
+            
+            # G5 系列 - NVIDIA A10G (x86_64) - 中大模型推理
+            - g5.xlarge      # 1x A10G, 4 vCPU, 16 GB
+            - g5.2xlarge     # 1x A10G, 8 vCPU, 32 GB
+            - g5.4xlarge     # 1x A10G, 16 vCPU, 64 GB
+            - g5.8xlarge     # 1x A10G, 32 vCPU, 128 GB
+            - g5.12xlarge    # 4x A10G, 48 vCPU, 192 GB
+            - g5.24xlarge    # 4x A10G, 96 vCPU, 384 GB
+            - g5.48xlarge    # 8x A10G, 192 vCPU, 768 GB
+            
+            # G6e 系列 - NVIDIA L40S (x86_64) - 大模型推理
+            - g6e.xlarge     # 1x L40S, 4 vCPU, 16 GB
+            - g6e.2xlarge    # 1x L40S, 8 vCPU, 32 GB
+            - g6e.4xlarge    # 1x L40S, 16 vCPU, 64 GB
+            - g6e.8xlarge    # 1x L40S, 32 vCPU, 128 GB
+            - g6e.12xlarge   # 4x L40S, 48 vCPU, 192 GB
+            - g6e.24xlarge   # 4x L40S, 96 vCPU, 384 GB
+            - g6e.48xlarge   # 8x L40S, 192 vCPU, 768 GB
         - key: kubernetes.io/arch
           operator: In
-          values: ["amd64"]
+          values: ["amd64", "arm64"]  # 支持 x86_64 和 ARM64
   
   # 扩展限制
   limits:

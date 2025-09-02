@@ -29,16 +29,43 @@ spec:
         - key: node.kubernetes.io/instance-type
           operator: In
           values: 
-            # Intel 第4代 (M7i) - 高性能
-            - m7i.large
-            - m7i.xlarge
-            - m7i.2xlarge
-            - m7i.4xlarge
-            # 计算优化 Intel (C7i)
-            - c7i.large
-            - c7i.xlarge
-            - c7i.2xlarge
-            - c7i.4xlarge
+            # 通用实例
+            - m7i.large      # Intel 4th Gen, 2 vCPU, 8 GB
+            - m7i.xlarge     # Intel 4th Gen, 4 vCPU, 16 GB
+            - m7i.2xlarge    # Intel 4th Gen, 8 vCPU, 32 GB
+            - m7i.4xlarge    # Intel 4th Gen, 16 vCPU, 64 GB
+            - m6i.large      # Intel 3rd Gen, 2 vCPU, 8 GB
+            - m6i.xlarge     # Intel 3rd Gen, 4 vCPU, 16 GB
+            - m6i.2xlarge    # Intel 3rd Gen, 8 vCPU, 32 GB
+            - m6i.4xlarge    # Intel 3rd Gen, 16 vCPU, 64 GB
+            - m6a.large      # AMD EPYC 3rd Gen, 2 vCPU, 8 GB
+            - m6a.xlarge     # AMD EPYC 3rd Gen, 4 vCPU, 16 GB
+            - m6a.2xlarge    # AMD EPYC 3rd Gen, 8 vCPU, 32 GB
+            - m6a.4xlarge    # AMD EPYC 3rd Gen, 16 vCPU, 64 GB
+            
+            # 计算优化
+            - c7i.large      # Intel 4th Gen, 2 vCPU, 4 GB
+            - c7i.xlarge     # Intel 4th Gen, 4 vCPU, 8 GB
+            - c7i.2xlarge    # Intel 4th Gen, 8 vCPU, 16 GB
+            - c7i.4xlarge    # Intel 4th Gen, 16 vCPU, 32 GB
+            - c6i.large      # Intel 3rd Gen, 2 vCPU, 4 GB
+            - c6i.xlarge     # Intel 3rd Gen, 4 vCPU, 8 GB
+            - c6i.2xlarge    # Intel 3rd Gen, 8 vCPU, 16 GB
+            - c6i.4xlarge    # Intel 3rd Gen, 16 vCPU, 32 GB
+            - c6a.large      # AMD EPYC 3rd Gen, 2 vCPU, 4 GB
+            - c6a.xlarge     # AMD EPYC 3rd Gen, 4 vCPU, 8 GB
+            - c6a.2xlarge    # AMD EPYC 3rd Gen, 8 vCPU, 16 GB
+            - c6a.4xlarge    # AMD EPYC 3rd Gen, 16 vCPU, 32 GB
+            
+            # 内存优化
+            - r6i.large      # Intel 3rd Gen, 2 vCPU, 16 GB
+            - r6i.xlarge     # Intel 3rd Gen, 4 vCPU, 32 GB
+            - r6i.2xlarge    # Intel 3rd Gen, 8 vCPU, 64 GB
+            - r6i.4xlarge    # Intel 3rd Gen, 16 vCPU, 128 GB
+            - r6a.large      # AMD EPYC 3rd Gen, 2 vCPU, 16 GB
+            - r6a.xlarge     # AMD EPYC 3rd Gen, 4 vCPU, 32 GB
+            - r6a.2xlarge    # AMD EPYC 3rd Gen, 8 vCPU, 64 GB
+            - r6a.4xlarge    # AMD EPYC 3rd Gen, 16 vCPU, 128 GB
         - key: topology.kubernetes.io/zone
           operator: In
           values: ["ap-southeast-1a", "ap-southeast-1b", "ap-southeast-1c"]

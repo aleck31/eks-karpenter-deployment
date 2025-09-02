@@ -29,16 +29,54 @@ spec:
         - key: node.kubernetes.io/instance-type
           operator: In
           values: 
-            # Graviton4 (M8g) - 最新最佳性价比
-            - m8g.large
-            - m8g.xlarge
-            - m8g.2xlarge
-            - m8g.4xlarge
-            # Graviton3 (M7g) - 成熟稳定
-            - m7g.large
-            - m7g.xlarge
-            - m7g.2xlarge
-            - m7g.4xlarge
+            # 通用实例 - Graviton 处理器
+            - m8g.large      # Graviton4, 2 vCPU, 8 GB - 最新一代
+            - m8g.xlarge     # Graviton4, 4 vCPU, 16 GB
+            - m8g.2xlarge    # Graviton4, 8 vCPU, 32 GB
+            - m8g.4xlarge    # Graviton4, 16 vCPU, 64 GB
+            - m7g.large      # Graviton3, 2 vCPU, 8 GB
+            - m7g.xlarge     # Graviton3, 4 vCPU, 16 GB
+            - m7g.2xlarge    # Graviton3, 8 vCPU, 32 GB
+            - m7g.4xlarge    # Graviton3, 16 vCPU, 64 GB
+            - m6g.large      # Graviton2, 2 vCPU, 8 GB
+            - m6g.xlarge     # Graviton2, 4 vCPU, 16 GB
+            - m6g.2xlarge    # Graviton2, 8 vCPU, 32 GB
+            - m6g.4xlarge    # Graviton2, 16 vCPU, 64 GB
+            
+            # 计算优化 - Graviton 处理器
+            - c8g.large      # Graviton4, 2 vCPU, 4 GB - 最新一代
+            - c8g.xlarge     # Graviton4, 4 vCPU, 8 GB
+            - c8g.2xlarge    # Graviton4, 8 vCPU, 16 GB
+            - c8g.4xlarge    # Graviton4, 16 vCPU, 32 GB
+            - c7g.large      # Graviton3, 2 vCPU, 4 GB
+            - c7g.xlarge     # Graviton3, 4 vCPU, 8 GB
+            - c7g.2xlarge    # Graviton3, 8 vCPU, 16 GB
+            - c7g.4xlarge    # Graviton3, 16 vCPU, 32 GB
+            - c6g.large      # Graviton2, 2 vCPU, 4 GB
+            - c6g.xlarge     # Graviton2, 4 vCPU, 8 GB
+            - c6g.2xlarge    # Graviton2, 8 vCPU, 16 GB
+            - c6g.4xlarge    # Graviton2, 16 vCPU, 32 GB
+            
+            # 内存优化 - Graviton 处理器
+            - r8g.large      # Graviton4, 2 vCPU, 16 GB - 最新一代
+            - r8g.xlarge     # Graviton4, 4 vCPU, 32 GB
+            - r8g.2xlarge    # Graviton4, 8 vCPU, 64 GB
+            - r8g.4xlarge    # Graviton4, 16 vCPU, 128 GB
+            - r7g.large      # Graviton3, 2 vCPU, 16 GB
+            - r7g.xlarge     # Graviton3, 4 vCPU, 32 GB
+            - r7g.2xlarge    # Graviton3, 8 vCPU, 64 GB
+            - r7g.4xlarge    # Graviton3, 16 vCPU, 128 GB
+            - r6g.large      # Graviton2, 2 vCPU, 16 GB
+            - r6g.xlarge     # Graviton2, 4 vCPU, 32 GB
+            - r6g.2xlarge    # Graviton2, 8 vCPU, 64 GB
+            - r6g.4xlarge    # Graviton2, 16 vCPU, 128 GB
+            
+            # 突发性能实例 - 适合开发测试环境
+            # - t4g.small      # Graviton2, 2 vCPU, 2 GB
+            # - t4g.medium     # Graviton2, 2 vCPU, 4 GB
+            # - t4g.large      # Graviton2, 2 vCPU, 8 GB
+            # - t4g.xlarge     # Graviton2, 4 vCPU, 16 GB
+            # - t4g.2xlarge    # Graviton2, 8 vCPU, 32 GB
         - key: topology.kubernetes.io/zone
           operator: In
           values: ["ap-southeast-1a", "ap-southeast-1b", "ap-southeast-1c"]
