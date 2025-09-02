@@ -23,6 +23,20 @@
 
 ### 1. 部署 GPU NodePool
 
+GPU NodePool 推荐使用 EKS 优化的 NVIDIA AMI，预集成了 GPU 支持所需的核心组件。
+
+**AL2023 EKS-optimized NVIDIA AMI** 包含以下预配置组件：
+
+| 组件 | 版本 | 功能 | 状态 |
+|------|------|------|------|
+| **NVIDIA 驱动** | 470+ | GPU 硬件驱动程序 | ✅ 预装 |
+| **CUDA 运行时** | 11.4+ | GPU 计算库和工具 | ✅ 预装 |
+| **Container Runtime** | containerd + nvidia-runtime | 容器 GPU 访问支持 | ✅ 预配置 |
+| **kubelet GPU 支持** | - | GPU 资源识别和管理 | ✅ 预配置 |
+| **NVIDIA Device Plugin** | - | Kubernetes GPU 资源调度 | ❌ 需手动部署 |
+
+#### 部署 NodePool
+
 ```bash
 # 应用 GPU NodePool 配置
 kubectl apply -f gpu/nodepool-gpu.yaml
@@ -31,6 +45,11 @@ kubectl apply -f gpu/nodepool-gpu.yaml
 kubectl get nodepool nodepool-gpu
 kubectl get ec2nodeclass nodeclass-gpu
 ```
+
+**NodePool 配置要点**：
+- **AMI 选择**: `amazon-eks-node-al2023-x86_64-nvidia-*` 
+- **实例存储**: `instanceStorePolicy: RAID0` (本地 NVMe 优化)
+- **用户数据**: 包含 kubelet 启动修复和存储挂载配置
 
 ### 2. 部署 NVIDIA Device Plugin
 
@@ -41,7 +60,18 @@ NVIDIA Device Plugin 负责 GPU 资源的发现、分配和管理，是生产环
 - **设备分配**: 为 Pod 分配专用 GPU 设备
 - **资源隔离**: 防止多个 Pod 争抢同一 GPU
 
-#### 部署官方 NVIDIA Device Plugin
+**为什么需要 Device Plugin？**
+
+虽然 EKS GPU AMI 预装了 GPU 驱动和运行时，但 Kubernetes 层面的 GPU 资源管理需要额外的 Device Plugin：
+
+| 功能 | EKS GPU AMI | NVIDIA Device Plugin |
+|------|-------------|---------------------|
+| GPU 硬件访问 | ✅ 支持 | - |
+| 容器 GPU 运行 | ✅ 支持 | - |
+| GPU 资源调度 | ❌ 不支持 | ✅ 提供 |
+| 资源隔离管理 | ❌ 不支持 | ✅ 提供 |
+
+#### 部署步骤
 ```bash
 kubectl apply -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.16.2/deployments/static/nvidia-device-plugin.yml
 ```
@@ -76,32 +106,17 @@ kubectl describe node <gpu-node-name> | grep nvidia.com/gpu
 
 ## 🧪 测试 GPU 功能
 
-### 部署测试 Pod
+### 1. 基础 GPU 检测 (快速验证)
 
 ```bash
-## 🧪 测试 GPU 功能
-
-### 方式1: 标准 GPU 资源请求 (推荐)
-
-```bash
-# 部署标准 GPU 测试 Pod (使用 nvidia.com/gpu 资源)
-kubectl apply -f tests/test-gpu-standard.yaml
+# 部署基础 GPU 测试 - nvidia-smi 检测
+kubectl apply -f tests/test-gpu-simple.yaml
 
 # 查看测试结果
-kubectl logs gpu-standard-test
+kubectl logs gpu-simple-test
 ```
 
-### 方式2: NodeSelector 调度 (兼容方式)
-
-```bash
-# 部署 NodeSelector 方式的 GPU 测试 Pod
-kubectl apply -f tests/test-gpu-workload.yaml
-
-# 查看测试结果
-kubectl logs gpu-test-pod
-```
-
-### 预期输出
+**预期输出**：
 ```
 +-----------------------------------------------------------------------------+
 | NVIDIA-SMI 470.182.03   Driver Version: 470.182.03   CUDA Version: 11.4   |
@@ -114,6 +129,33 @@ kubectl logs gpu-test-pod
 | N/A   34C    P8     9W /  70W |      0MiB / 15109MiB |      0%      Default |
 |                               |                      |                  N/A |
 +-------------------------------+----------------------+----------------------+
+```
+
+### 2. PyTorch GPU 功能测试 (完整验证)
+
+```bash
+# 部署 PyTorch GPU 测试 - 完整 ML 框架验证
+kubectl apply -f tests/test-gpu-pytorch.yaml
+
+# 查看测试结果 (容器会持续运行)
+kubectl logs gpu-pytorch-test
+
+# 或直接在容器内执行测试
+kubectl exec gpu-pytorch-test -- python3 -c "
+import torch
+print(f'CUDA available: {torch.cuda.is_available()}')
+print(f'GPU name: {torch.cuda.get_device_name(0)}')
+"
+```
+
+### 3. GPU + 本地存储测试 (存储集成)
+
+```bash
+# 部署 GPU + NVMe 存储测试
+kubectl apply -f tests/test-gpu-nvme.yaml
+
+# 查看存储测试结果
+kubectl logs gpu-storage-test
 ```
 
 ## 📋 GPU 实例类型选择
@@ -174,66 +216,6 @@ disruption:
 2. **生产推理**: g5.xlarge (On-Demand)
 3. **大规模训练**: p3.2xlarge (Spot + On-Demand 混合)
 
-## 🔧 机器学习工作负载示例
-
-### PyTorch 训练任务
-```yaml
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: pytorch-training
-spec:
-  template:
-    spec:
-      containers:
-      - name: pytorch
-        image: pytorch/pytorch:latest
-        resources:
-          limits:
-            nvidia.com/gpu: 1
-          requests:
-            nvidia.com/gpu: 1
-      tolerations:
-      - key: nvidia.com/gpu
-        operator: Exists
-        effect: NoSchedule
-      nodeSelector:
-        node-type: gpu
-      restartPolicy: Never
-```
-
-### TensorFlow Serving
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: tensorflow-serving
-spec:
-  replicas: 2
-  selector:
-    matchLabels:
-      app: tensorflow-serving
-  template:
-    metadata:
-      labels:
-        app: tensorflow-serving
-    spec:
-      containers:
-      - name: tensorflow-serving
-        image: tensorflow/serving:latest-gpu
-        resources:
-          limits:
-            nvidia.com/gpu: 1
-          requests:
-            nvidia.com/gpu: 1
-      tolerations:
-      - key: nvidia.com/gpu
-        operator: Exists
-        effect: NoSchedule
-      nodeSelector:
-        node-type: gpu
-```
-
 ## 🔍 监控和故障排除
 
 ### 检查 GPU 资源
@@ -279,7 +261,7 @@ kubectl describe node <gpu-node> | grep Taints
 
 ## 📚 参考资料
 
-- [AWS Deep Learning AMI](https://docs.aws.amazon.com/dlami/latest/devguide/what-is-dlami.html)
-- [NVIDIA Device Plugin](https://github.com/NVIDIA/k8s-device-plugin)
-- [Karpenter GPU 支持](https://karpenter.sh/docs/concepts/nodepools/)
 - [EKS GPU 工作负载](https://docs.aws.amazon.com/eks/latest/userguide/gpu-ami.html)
+- [Karpenter GPU 支持](https://karpenter.sh/docs/concepts/nodepools/)
+- [NVIDIA Device Plugin](https://github.com/NVIDIA/k8s-device-plugin)
+- [AWS Deep Learning AMI](https://docs.aws.amazon.com/dlami/latest/devguide/what-is-dlami.html)

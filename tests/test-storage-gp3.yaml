@@ -3,7 +3,7 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: test-gp3-karpenter-pvc
+  name: test-gp3-pvc
   namespace: karpenter-test
 spec:
   accessModes:
@@ -17,7 +17,7 @@ spec:
 apiVersion: v1
 kind: Pod
 metadata:
-  name: test-gp3-karpenter-pod
+  name: test-gp3-pod
   namespace: karpenter-test
   labels:
     app: storage-test-karpenter
@@ -53,4 +53,4 @@ spec:
   volumes:
   - name: gp3-storage
     persistentVolumeClaim:
-      claimName: test-gp3-karpenter-pvc
+      claimName: test-gp3-pvc

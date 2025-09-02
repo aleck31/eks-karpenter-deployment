@@ -406,7 +406,7 @@ curl http://$ALB_URL
 
 ```bash
 # 应用 EFS 存储测试配置
-kubectl apply -f ../tests/test-efs-storage.yaml
+kubectl apply -f ../tests/test-storage-efs.yaml
 
 # 验证 PVC 状态
 kubectl get pvc efs-pvc
@@ -422,10 +422,10 @@ kubectl exec efs-test-pod -- cat /mnt/efs/test.txt
 
 ```bash
 # 更新 S3 存储桶名称
-sed -i "s/eks-karpenter-env-storage-1234567890/$BUCKET_NAME/g" ../tests/test-s3-storage.yaml
+sed -i "s/eks-karpenter-env-storage-1234567890/$BUCKET_NAME/g" ../tests/test-storage-s3.yaml
 
 # 应用 S3 存储测试配置（使用 PV + PVC 方式）
-kubectl apply -f ../tests/test-s3-storage.yaml
+kubectl apply -f ../tests/test-storage-s3.yaml
 
 # 验证 PV 和 PVC 状态
 kubectl get pv s3-pv
@@ -444,16 +444,16 @@ kubectl exec s3-test-pod -- cat /mnt/s3/test.txt
 
 ```bash
 # 清理测试资源
-kubectl delete -f ../tests/test-efs-storage.yaml
-kubectl delete -f ../tests/test-s3-storage.yaml
+kubectl delete -f ../tests/test-storage-efs.yaml
+kubectl delete -f ../tests/test-storage-s3.yaml
 kubectl delete -f ../tests/test-alb-ingress.yaml
 ## 清理资源
 
 ### 清理测试资源
 ```bash
 # 清理测试资源
-kubectl delete -f ../tests/test-efs-storage.yaml
-kubectl delete -f ../tests/test-s3-storage.yaml  
+kubectl delete -f ../tests/test-storage-efs.yaml
+kubectl delete -f ../tests/test-storage-s3.yaml  
 kubectl delete -f ../tests/test-alb-ingress.yaml
 ```
 

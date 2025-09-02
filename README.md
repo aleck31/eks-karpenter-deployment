@@ -36,6 +36,10 @@
 │   ├── karpenter-node-role-trust-policy.json
 │   ├── nodepool-arm64.yaml             # ARM64节点池配置
 │   └── nodepool-amd64.yaml             # x86-64节点池配置
+├── gpu/                          # GPU支持部署文档及配置文件
+│   ├── gpu-deployment-guide.md         # GPU部署指南
+│   ├── nodepool-gpu.yaml               # GPU节点池配置
+│   └── nvidia-device-plugin.yaml       # NVIDIA Device Plugin配置
 ├── portainer/                    # Portainer安装文档及配置文件  
 │   ├── portainer-deployment-guide.md   # Portainer部署指南
 │   ├── portainer-deployment.yaml       # Portainer部署配置
@@ -43,11 +47,14 @@
 │   └── portainer-efs-pvc.yaml          # EFS持久卷声明
 ├── tests/                        # 测试组件   
 │   ├── test-alb-ingress.yaml           # ALB Ingress 测试
-│   ├── test-efs-storage.yaml           # EFS 存储测试
-│   ├── test-s3-storage.yaml            # S3 存储测试
-│   ├── test-gp3-storage-karpenter.yaml # GP3 存储测试
-│   └── test-karpenter-simple.yaml      # Karpenter 简单测试
-└── README.md                     # 项目说明
+│   ├── test-storage-efs.yaml           # EFS 存储测试
+│   ├── test-storage-s3.yaml            # S3 存储测试
+│   ├── test-storage-gp3.yaml           # GP3 存储测试
+│   ├── test-karpenter-simple.yaml      # Karpenter 简单测试
+│   ├── test-gpu-simple.yaml            # GPU 基础检测测试
+│   ├── test-gpu-pytorch.yaml           # PyTorch GPU 功能测试
+│   └── test-gpu-nvme.yaml              # GPU + NVMe 存储测试
+└── README.md                     # 项目说明文档
 ```
 
 ## 🚀 快速开始
@@ -64,7 +71,13 @@ eks/create-eks-cluster-guide.md
 karpenter/karpenter-deployment-guide.md
 ```
 
-### 3. 部署 Portainer (可选)
+### 3. 部署 GPU 支持 (可选)
+```bash
+# 已验证详细指南
+gpu/gpu-deployment-guide.md
+```
+
+### 4. 部署 Portainer (可选)
 ```bash
 # 已验证详细指南
 portainer/portainer-deployment-guide.md
