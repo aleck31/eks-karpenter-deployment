@@ -19,9 +19,9 @@ kubectl get serviceaccount karpenter -n karpenter 2>/dev/null || echo "需要先
 
 ```bash
 export CLUSTER_NAME=eks-karpenter-env
-export AWS_DEFAULT_REGION=ap-southeast-1
-export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --profile me)
-export CLUSTER_ENDPOINT=$(aws eks describe-cluster --name ${CLUSTER_NAME} --query "cluster.endpoint" --output text --profile me)
+export AWS_DEFAULT_REGION=us-east-1
+export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --profile lab)
+export CLUSTER_ENDPOINT=$(aws eks describe-cluster --name ${CLUSTER_NAME} --query "cluster.endpoint" --output text --profile lab)
 
 echo "集群: ${CLUSTER_NAME}"
 echo "区域: ${AWS_DEFAULT_REGION}"
@@ -36,25 +36,25 @@ echo "账户: ${AWS_ACCOUNT_ID}"
 # 创建节点角色（使用预配置的信任策略）
 aws iam create-role --role-name "KarpenterNodeInstanceRole-${CLUSTER_NAME}" \
     --assume-role-policy-document file://karpenter-node-role-trust-policy.json \
-    --profile me
+    --profile lab
 
 # 附加必要策略
 aws iam attach-role-policy --role-name "KarpenterNodeInstanceRole-${CLUSTER_NAME}" \
-    --policy-arn arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy --profile me
+    --policy-arn arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy --profile lab
 
 aws iam attach-role-policy --role-name "KarpenterNodeInstanceRole-${CLUSTER_NAME}" \
-    --policy-arn arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy --profile me
+    --policy-arn arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy --profile lab
 
 aws iam attach-role-policy --role-name "KarpenterNodeInstanceRole-${CLUSTER_NAME}" \
-    --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly --profile me
+    --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly --profile lab
 
 aws iam attach-role-policy --role-name "KarpenterNodeInstanceRole-${CLUSTER_NAME}" \
-    --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore --profile me
+    --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore --profile lab
 
 # 创建实例 Profile
-aws iam create-instance-profile --instance-profile-name "KarpenterNodeInstanceProfile-${CLUSTER_NAME}" --profile me
+aws iam create-instance-profile --instance-profile-name "KarpenterNodeInstanceProfile-${CLUSTER_NAME}" --profile lab
 aws iam add-role-to-instance-profile --instance-profile-name "KarpenterNodeInstanceProfile-${CLUSTER_NAME}" \
-    --role-name "KarpenterNodeInstanceRole-${CLUSTER_NAME}" --profile me
+    --role-name "KarpenterNodeInstanceRole-${CLUSTER_NAME}" --profile lab
 ```
 
 ### 2.2 配置 Karpenter 控制器权限
@@ -64,20 +64,20 @@ aws iam add-role-to-instance-profile --instance-profile-name "KarpenterNodeInsta
 aws iam create-policy \
   --policy-name "KarpenterControllerPolicy-${CLUSTER_NAME}" \
   --policy-document file://karpenter-policy.json \
-  --profile me
+  --profile lab
 
 # 附加策略到 Karpenter 服务账户角色（已由 eksctl 创建）
 aws iam attach-role-policy \
   --role-name "KarpenterServiceAccount-${CLUSTER_NAME}" \
   --policy-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:policy/KarpenterControllerPolicy-${CLUSTER_NAME}" \
-  --profile me
+  --profile lab
 ```
 
 ### 2.3 使用 Helm 安装 Karpenter
 
 ```bash
 # 登录到 ECR Public
-aws ecr-public get-login-password --region us-east-1 --profile me | helm registry login --username AWS --password-stdin public.ecr.aws
+aws ecr-public get-login-password --region us-east-1 --profile lab | helm registry login --username AWS --password-stdin public.ecr.aws
 
 # 安装 Karpenter v1.6.3
 helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter \
@@ -176,7 +176,7 @@ kubectl delete namespace karpenter
 kubectl describe serviceaccount karpenter -n karpenter
 
 # 检查 Fargate Profile
-aws eks describe-fargate-profile --cluster-name ${CLUSTER_NAME} --fargate-profile-name karpenter --profile me
+aws eks describe-fargate-profile --cluster-name ${CLUSTER_NAME} --fargate-profile-name karpenter --profile lab
 ```
 
 ### 节点无法创建

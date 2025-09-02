@@ -3,8 +3,8 @@
 ## 前置要求
 
 ### 环境信息
-- AWS Profile: `me`
-- Region: `ap-southeast-1` (新加坡)
+- AWS Profile: `lab`
+- Region: `us-east-1` (按需选择区域)
 - 集群名称: `eks-karpenter-env`
 
 ### 必需工具版本
@@ -43,12 +43,12 @@ helm version
 
 ```bash
 # 验证 AWS 配置
-aws sts get-caller-identity --profile me
-aws configure list --profile me
+aws sts get-caller-identity --profile lab
+aws configure list --profile lab
 
 # 设置默认 profile (可选)
-export AWS_PROFILE=me
-export AWS_DEFAULT_REGION=ap-southeast-1
+export AWS_PROFILE=lab
+export AWS_DEFAULT_REGION=us-east-1
 ```
 
 ## 2: EKS 集群创建
@@ -66,7 +66,7 @@ export AWS_DEFAULT_REGION=ap-southeast-1
 
 ```bash
 # 创建集群 (大约需要 15-20 分钟)
-eksctl create cluster -f cluster-config.yaml --profile me
+eksctl create cluster -f cluster-config.yaml --profile lab
 
 # 验证集群创建
 kubectl get nodes
@@ -74,21 +74,21 @@ kubectl get pods -A
 
 # 为 Karpenter 添加必要的资源标签
 export CLUSTER_NAME=eks-karpenter-env
-export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --profile me)
+export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --profile lab)
 
 # 为私有子网添加 Karpenter 发现标签
-for subnet in $(aws ec2 describe-subnets --filters "Name=tag:aws:cloudformation:logical-id,Values=SubnetPrivate*" "Name=tag:aws:cloudformation:stack-name,Values=eksctl-${CLUSTER_NAME}-cluster" --profile me --query 'Subnets[].SubnetId' --output text); do
+for subnet in $(aws ec2 describe-subnets --filters "Name=tag:aws:cloudformation:logical-id,Values=SubnetPrivate*" "Name=tag:aws:cloudformation:stack-name,Values=eksctl-${CLUSTER_NAME}-cluster" --profile lab --query 'Subnets[].SubnetId' --output text); do
   echo "添加标签到子网: $subnet"
-  aws ec2 create-tags --resources $subnet --tags Key=karpenter.sh/discovery,Value=${CLUSTER_NAME} --profile me
+  aws ec2 create-tags --resources $subnet --tags Key=karpenter.sh/discovery,Value=${CLUSTER_NAME} --profile lab
 done
 
 # 为集群安全组添加 Karpenter 发现标签
-CLUSTER_SG=$(aws eks describe-cluster --name ${CLUSTER_NAME} --profile me --query 'cluster.resourcesVpcConfig.clusterSecurityGroupId' --output text)
+CLUSTER_SG=$(aws eks describe-cluster --name ${CLUSTER_NAME} --profile lab --query 'cluster.resourcesVpcConfig.clusterSecurityGroupId' --output text)
 echo "添加标签到安全组: $CLUSTER_SG"
-aws ec2 create-tags --resources $CLUSTER_SG --tags Key=karpenter.sh/discovery,Value=${CLUSTER_NAME} --profile me
+aws ec2 create-tags --resources $CLUSTER_SG --tags Key=karpenter.sh/discovery,Value=${CLUSTER_NAME} --profile lab
 
 # 更新 aws-auth ConfigMap 添加 Karpenter 节点角色
-FARGATE_ROLE=$(aws iam list-roles --profile me --query 'Roles[?contains(RoleName, `FargatePodExecutionRole`)].Arn' --output text)
+FARGATE_ROLE=$(aws iam list-roles --profile lab --query 'Roles[?contains(RoleName, `FargatePodExecutionRole`)].Arn' --output text)
 kubectl patch configmap aws-auth -n kube-system --patch "
 data:
   mapRoles: |
@@ -130,10 +130,10 @@ data:
 **验证 Fargate Profiles**：
 ```bash
 # 查看已创建的 Fargate Profiles
-aws eks list-fargate-profiles --cluster-name eks-karpenter-env --region ap-southeast-1 --profile me
+aws eks list-fargate-profiles --cluster-name eks-karpenter-env --region us-east-1 --profile lab
 
 # 查看具体配置
-aws eks describe-fargate-profile --cluster-name eks-karpenter-env --fargate-profile-name default --region ap-southeast-1 --profile me
+aws eks describe-fargate-profile --cluster-name eks-karpenter-env --fargate-profile-name default --region us-east-1 --profile lab
 ```
 
 ### 3.2 新 Addon 安装最佳实践
@@ -181,15 +181,15 @@ podLabels:
 aws eks describe-addon \
   --cluster-name eks-karpenter-env \
   --addon-name eks-pod-identity-agent \
-  --region ap-southeast-1 \
-  --profile me \
+  --region us-east-1 \
+  --profile lab \
   --query '{Status:status,Version:addonVersion}'
 
 # 查看 Pod Identity Associations（集群创建后）
 aws eks list-pod-identity-associations \
   --cluster-name eks-karpenter-env \
-  --region ap-southeast-1 \
-  --profile me
+  --region us-east-1 \
+  --profile lab
 ```
 
 ## 4: 存储配置
@@ -211,10 +211,10 @@ aws eks list-pod-identity-associations \
 
 ```bash
 # 获取 VPC ID
-VPC_ID=$(aws eks describe-cluster --name eks-karpenter-env --query "cluster.resourcesVpcConfig.vpcId" --output text --profile me)
+VPC_ID=$(aws eks describe-cluster --name eks-karpenter-env --query "cluster.resourcesVpcConfig.vpcId" --output text --profile lab)
 
 # 获取 CIDR 块
-CIDR_BLOCK=$(aws ec2 describe-vpcs --vpc-ids $VPC_ID --query "Vpcs[0].CidrBlock" --output text --profile me)
+CIDR_BLOCK=$(aws ec2 describe-vpcs --vpc-ids $VPC_ID --query "Vpcs[0].CidrBlock" --output text --profile lab)
 
 # 创建安全组
 SECURITY_GROUP_ID=$(aws ec2 create-security-group \
@@ -223,7 +223,7 @@ SECURITY_GROUP_ID=$(aws ec2 create-security-group \
   --vpc-id $VPC_ID \
   --output text \
   --query 'GroupId' \
-  --profile me)
+  --profile lab)
 
 # 添加 NFS 入站规则
 aws ec2 authorize-security-group-ingress \
@@ -231,7 +231,7 @@ aws ec2 authorize-security-group-ingress \
   --protocol tcp \
   --port 2049 \
   --cidr $CIDR_BLOCK \
-  --profile me
+  --profile lab
 
 # 创建 EFS 文件系统
 EFS_ID=$(aws efs create-file-system \
@@ -242,7 +242,7 @@ EFS_ID=$(aws efs create-file-system \
   --encrypted \
   --output text \
   --query 'FileSystemId' \
-  --profile me)
+  --profile lab)
 
 echo "EFS File System ID: $EFS_ID"
 
@@ -251,7 +251,7 @@ SUBNET_IDS=$(aws ec2 describe-subnets \
   --filters "Name=vpc-id,Values=$VPC_ID" "Name=availability-zone,Values=ap-southeast-1a,ap-southeast-1b,ap-southeast-1c" \
   --query 'Subnets[?MapPublicIpOnLaunch==`false`].SubnetId' \
   --output text \
-  --profile me)
+  --profile lab)
 
 # 为每个子网创建挂载目标
 for subnet in $SUBNET_IDS; do
@@ -259,7 +259,7 @@ for subnet in $SUBNET_IDS; do
     --file-system-id $EFS_ID \
     --subnet-id $subnet \
     --security-groups $SECURITY_GROUP_ID \
-    --profile me
+    --profile lab
 done
 ```
 
@@ -288,7 +288,7 @@ kubectl get storageclass
 aws eks describe-addon \
   --cluster-name eks-karpenter-env \
   --addon-name aws-mountpoint-s3-csi-driver \
-  --profile me \
+  --profile lab \
   --query 'addon.{Status:status,Version:addonVersion}'
 
 # 验证 S3 CSI Driver Pod
@@ -303,7 +303,7 @@ kubectl get csidriver s3.csi.aws.com
 ```bash
 # 创建 S3 存储桶
 BUCKET_NAME="eks-karpenter-env-storage-$(date +%s)"
-aws s3 mb s3://$BUCKET_NAME --region ap-southeast-1 --profile me
+aws s3 mb s3://$BUCKET_NAME --region us-east-1 --profile lab
 
 echo "S3 Bucket: $BUCKET_NAME"
 ```
@@ -326,7 +326,7 @@ helm repo add eks https://aws.github.io/eks-charts
 helm repo update
 
 # 2. 获取 VPC ID
-VPC_ID=$(aws eks describe-cluster --name eks-karpenter-env --query "cluster.resourcesVpcConfig.vpcId" --output text --profile me)
+VPC_ID=$(aws eks describe-cluster --name eks-karpenter-env --query "cluster.resourcesVpcConfig.vpcId" --output text --profile lab)
 
 # 3. 安装 AWS LoadBalancer Controller
 helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
@@ -335,7 +335,7 @@ helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
   --set serviceAccount.create=false \
   --set serviceAccount.name=aws-load-balancer-controller \
   --set vpcId=$VPC_ID \
-  --set region=ap-southeast-1 \
+  --set region=us-east-1 \
   --set podLabels.fargate=enabled
 
 # 4. 验证安装
@@ -436,7 +436,7 @@ kubectl get pod s3-test-pod
 kubectl logs s3-test-pod --tail=5
 
 # 验证 S3 数据同步
-aws s3 ls s3://$BUCKET_NAME/ --profile me
+aws s3 ls s3://$BUCKET_NAME/ --profile lab
 kubectl exec s3-test-pod -- cat /mnt/s3/test.txt
 ```
 
@@ -460,14 +460,14 @@ kubectl delete -f ../tests/test-alb-ingress.yaml
 ### 6.5 完全清理集群
 ```bash
 # 删除集群（会自动清理大部分资源）
-eksctl delete cluster --name eks-karpenter-env --profile me
+eksctl delete cluster --name eks-karpenter-env --profile lab
 
 # 手动清理残留资源
 # 删除 S3 存储桶
-aws s3 rb s3://$BUCKET_NAME --force --profile me
+aws s3 rb s3://$BUCKET_NAME --force --profile lab
 
 # 删除 EFS 文件系统（可选，如果要保留数据可跳过）
-aws efs delete-file-system --file-system-id $EFS_ID --profile me
+aws efs delete-file-system --file-system-id $EFS_ID --profile lab
 ```
 
 ## 注意事项

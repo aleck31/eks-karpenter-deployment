@@ -4,7 +4,7 @@ kind: ClusterConfig
 
 metadata:
   name: eks-karpenter-env
-  region: ap-southeast-1
+  region: us-east-1
   version: "1.33"  # 使用 Kubernetes v1.33
 
 # VPC 配置 - 使用 10.1.0.0/16 网段

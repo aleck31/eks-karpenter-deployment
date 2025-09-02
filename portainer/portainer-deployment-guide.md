@@ -27,8 +27,8 @@ kubectl get svc -n portainer
 FARGATE_ROLE=$(aws eks describe-fargate-profile \
   --cluster-name eks-karpenter-env \
   --fargate-profile-name default \
-  --region ap-southeast-1 \
-  --profile me \
+  --region us-east-1 \
+  --profile lab \
   --query 'fargateProfile.podExecutionRoleArn' \
   --output text)
 
@@ -38,8 +38,8 @@ aws eks create-fargate-profile \
   --fargate-profile-name portainer \
   --pod-execution-role-arn $FARGATE_ROLE \
   --selectors namespace=portainer \
-  --region ap-southeast-1 \
-  --profile me
+  --region us-east-1 \
+  --profile lab
 ```
 
 ### 2. 配置 EFS 持久化存储
@@ -126,8 +126,8 @@ kubectl delete namespace portainer
 aws eks delete-fargate-profile \
   --cluster-name eks-karpenter-env \
   --fargate-profile-name portainer \
-  --region ap-southeast-1 \
-  --profile me
+  --region us-east-1 \
+  --profile lab
 ```
 
 ## 故障排除
@@ -167,7 +167,7 @@ kubectl get pods -n portainer
 kubectl get pods -n kube-system -l app=efs-csi-controller
 
 # 检查 Pod Identity Association
-aws eks list-pod-identity-associations --cluster-name eks-karpenter-env --profile me
+aws eks list-pod-identity-associations --cluster-name eks-karpenter-env --profile lab
 
 # 检查 PVC 事件
 kubectl describe pvc portainer-data-pvc -n portainer

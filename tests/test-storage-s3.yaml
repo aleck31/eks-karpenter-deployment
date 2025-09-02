@@ -10,7 +10,7 @@ spec:
     - ReadWriteMany # supported options: ReadWriteMany / ReadOnlyMany
   mountOptions:
     - allow-delete
-    - region ap-southeast-1
+    - region us-east-1
   csi:
     driver: s3.csi.aws.com # required
     volumeHandle: s3-csi-driver-volume
