@@ -11,8 +11,11 @@
 kubectl get nodes
 kubectl get pods -n kube-system
 
-# 确认 Karpenter 服务账户已创建
-kubectl get serviceaccount karpenter -n karpenter 2>/dev/null || echo "需要先创建 EKS 集群"
+# 确认 Fargate Profile 已创建
+aws eks describe-fargate-profile --cluster-name ${CLUSTER_NAME} --fargate-profile-name karpenter --profile lab
+
+# 确认 OIDC Provider 已启用（IRSA 需要）
+aws eks describe-cluster --name ${CLUSTER_NAME} --query "cluster.identity.oidc.issuer" --output text --profile lab
 ```
 
 ### 1.2 设置环境变量
@@ -172,7 +175,7 @@ kubectl delete namespace karpenter
 
 ### Karpenter Pod 无法启动
 ```bash
-# 检查服务账户权限
+# 检查服务账户配置
 kubectl describe serviceaccount karpenter -n karpenter
 
 # 检查 Fargate Profile

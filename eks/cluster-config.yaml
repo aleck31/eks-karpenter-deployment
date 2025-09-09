@@ -1,4 +1,4 @@
-# cluster-config.yaml - 完整版本包含所有必要的服务账户和插件
+# cluster-config.yaml - 包含所有必要的服务账户和插件
 apiVersion: eksctl.io/v1alpha5
 kind: ClusterConfig
 
@@ -20,25 +20,56 @@ availabilityZones:
 # IAM 配置
 iam:
   withOIDC: true
-  serviceAccounts:
-    # Karpenter 服务账户
-    - metadata:
-        name: karpenter
-        namespace: karpenter
+  
+  # Pod Identity 关联配置 - 为addon使用Pod Identity
+  podIdentityAssociations:
+    # VPC CNI Pod Identity 关联
+    - namespace: kube-system
+      serviceAccountName: aws-node
+      permissionPolicyARNs:
+        - "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+      roleName: VPCCNIPodIdentityRole
+    
+    # EBS CSI Driver Pod Identity 关联
+    - namespace: kube-system
+      serviceAccountName: ebs-csi-controller-sa
+      wellKnownPolicies:
+        ebsCSIController: true
+      roleName: EBSCSIPodIdentityRole
+    
+    # EFS CSI Driver Pod Identity 关联
+    - namespace: kube-system
+      serviceAccountName: efs-csi-controller-sa
+      wellKnownPolicies:
+        efsCSIController: true
+      roleName: EFSCSIPodIdentityRole
+
+    # Karpenter Pod Identity 关联
+    - namespace: karpenter
+      serviceAccountName: karpenter
       wellKnownPolicies:
         autoScaler: true
-      roleName: KarpenterServiceAccount-eks-karpenter-env
-      roleOnly: true
-    
-    # AWS LoadBalancer Controller 服务账户
+      roleName: KarpenterPodIdentityRole
+
+  serviceAccounts:
+    # Karpenter 服务账户
+    # - metadata:
+    #     name: karpenter
+    #     namespace: karpenter
+    #   wellKnownPolicies:
+    #     autoScaler: true
+    #   roleName: KarpenterServiceAccount-eks-karpenter-env
+    #   roleOnly: true
+
+    # AWS LoadBalancer Controller 服务账户 (v2.13.4 不支持 Pod Identity)
     - metadata:
         name: aws-load-balancer-controller
         namespace: kube-system
       wellKnownPolicies:
         awsLoadBalancerController: true
       roleName: AmazonEKSLoadBalancerControllerRole
-    
-    # S3 CSI Driver 服务账户 (为 addon 提供 IAM 角色)
+
+    # S3 CSI Driver 服务账户 (IRSA)
     - metadata:
         name: s3-csi-driver-sa
         namespace: kube-system
@@ -72,34 +103,34 @@ fargateProfiles:
 
 # 启用必要的插件
 addons:
-  - name: vpc-cni
-    version: latest
   - name: coredns
     version: latest
+    attachPolicyARNs: []  # 禁用IRSA
     configurationValues: |-
       podLabels:
         fargate: enabled
-  - name: kube-proxy
-    version: latest
-  - name: aws-ebs-csi-driver
-    version: latest
-    wellKnownPolicies:
-      ebsCSIController: true
-  - name: aws-efs-csi-driver
-    version: latest
-    wellKnownPolicies:
-      efsCSIController: true
-  - name: eks-pod-identity-agent
-    version: latest
   - name: metrics-server
     version: latest
+    attachPolicyARNs: []
     configurationValues: |-
       podLabels:
         fargate: enabled
+  - name: eks-pod-identity-agent
+    version: latest
+  - name: vpc-cni
+    version: latest
+    attachPolicyARNs: []
+  - name: kube-proxy
+    version: latest
+    attachPolicyARNs: []
+  - name: aws-ebs-csi-driver
+    version: latest
+    attachPolicyARNs: []
+  - name: aws-efs-csi-driver
+    version: latest
+    attachPolicyARNs: []
   - name: aws-mountpoint-s3-csi-driver
     version: latest
-    wellKnownPolicies:
-      s3CSIController: true
 
 # CloudWatch 日志
 cloudWatch:

@@ -137,7 +137,10 @@ spec:
   
   # IAM 角色
   role: "KarpenterNodeInstanceRole-eks-karpenter-env"
-  
+
+  metadataOptions:
+    httpPutResponseHopLimit: 2    # 允许容器访问IMDS
+    
   # 块设备映射 - 为 ML 工作负载提供足够存储
   blockDeviceMappings:
     - deviceName: /dev/xvda

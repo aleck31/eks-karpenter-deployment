@@ -192,6 +192,52 @@ aws eks list-pod-identity-associations \
   --profile lab
 ```
 
+### 3.4 从 IRSA 迁移到 Pod Identity（现有集群）
+
+**注意**：如果是现有集群需要从 IRSA 迁移到 Pod Identity，推荐使用 migrate-to-pod-identity 迁移工具，支持自动发现需要迁移的 addon 和服务账户，自动更新 IAM 角色信任策略。
+
+**迁移步骤**：
+
+1. **预览迁移计划**：
+```bash
+# 查看哪些组件可以迁移
+eksctl utils migrate-to-pod-identity \
+  --cluster eks-karpenter-env \
+  --region ap-southeast-1 \
+  --profile lab
+```
+
+2. **执行迁移**：
+```bash
+# 执行迁移并移除 OIDC 信任关系
+eksctl utils migrate-to-pod-identity \
+  --cluster eks-karpenter-env \
+  --region ap-southeast-1 \
+  --profile lab \
+  --approve \
+  --remove-oidc-provider-trust-relationship
+```
+
+3. **重启相关服务**：
+```bash
+# 重启迁移的组件使其使用新的 Pod Identity
+kubectl rollout restart daemonset/aws-node -n kube-system
+kubectl rollout restart deployment/ebs-csi-controller -n kube-system
+kubectl rollout restart deployment/efs-csi-controller -n kube-system
+```
+
+**验证迁移结果**：
+```bash
+# 检查 Pod Identity 关联
+aws eks list-pod-identity-associations \
+  --cluster-name eks-karpenter-env \
+  --region ap-southeast-1 \
+  --profile lab
+
+# 验证服务账户不再有 IRSA 注解
+kubectl get serviceaccount -n kube-system aws-node -o yaml | grep -i role-arn
+```
+
 ## 4: 存储配置
 
 ### ⚠️ **重要说明：CSI Drivers 已自动安装**
@@ -200,7 +246,6 @@ aws eks list-pod-identity-associations \
 1. **EBS CSI Driver** - 已通过 addon 自动安装，包含 IAM 权限
 2. **EFS CSI Driver** - 已通过 addon 自动安装，包含 IAM 权限
 3. **S3 CSI Driver** - 已通过 addon 自动安装，包含 IAM 权限
-4. **Pod Identity Agent** - 已自动安装，支持 Pod Identity
 
 **CSI Controller 调度策略**：
 - ✅ **CSI Controller** → 自动运行在 EC2 节点（需要特权容器）
