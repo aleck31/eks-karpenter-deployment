@@ -60,6 +60,9 @@ spec:
       containers:
       - name: portainer
         image: portainer/portainer-ce:latest
+        args:
+        - "--trusted-origins"
+        - "YOUR_PORTAINER_DOMAIN"  # Replace with your actual Portainer access domain, e.g: portainer.example.com
         ports:
         - containerPort: 9000
         - containerPort: 8000

@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bitwarden-config
+  namespace: bitwarden
+data:
+  # 基础配置
+  BW_DOMAIN: "bitwarden.yourdomain.com"  # 替换为你的域名
+  BW_DB_PROVIDER: "sqlite"
+  BW_PORT_HTTP: "8080"
+  
+  # Bitwarden 安装凭据 - 从 https://bitwarden.com/host/ 获取
+  BW_INSTALLATION_ID: "your-installation-id-here"
+  BW_INSTALLATION_KEY: "your-installation-key-here"
+  
+  # 服务配置
+  BW_ENABLE_ADMIN: "true"
+  BW_ENABLE_API: "true"
+  BW_ENABLE_EVENTS: "false"
+  BW_ENABLE_ICONS: "true"
+  BW_ENABLE_IDENTITY: "true"
+  BW_ENABLE_NOTIFICATIONS: "true"
+  BW_ENABLE_SCIM: "false"
+  BW_ENABLE_SSO: "false"
+  
+  # SMTP 配置 - 需要根据你的 SMTP 服务器修改
+  globalSettings__mail__replyToEmail: "no-reply@yourdomain.com"  # 替换为你的邮箱
+  globalSettings__mail__smtp__host: "your-smtp-host"         # 替换为你的 SMTP 服务器
+  globalSettings__mail__smtp__port: "587"                    # 替换为你的 SMTP 端口
+  globalSettings__mail__smtp__ssl: "true"                   # 根据 SMTP 服务器设置
+  globalSettings__mail__smtp__username: "your-smtp-username"  # 替换为你的 SMTP 用户名
+  globalSettings__mail__smtp__password: "your-smtp-password"     # 替换为你的 SMTP 密码
+  
+  # 可选配置
+  globalSettings__disableUserRegistration: "true"  # 设为 false 可开启用户注册
+  adminSettings__admins: "admin@yourdomain.com"     # 管理员邮箱

@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: bitwarden-data
+  namespace: bitwarden
+spec:
+  accessModes:
+    - ReadWriteMany  # EFS 支持多 Pod 访问
+  storageClassName: efs-sc  # 使用现有的 EFS 存储类
+  resources:
+    requests:
+      storage: 10Gi  # EFS 按实际使用计费

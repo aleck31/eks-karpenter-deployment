@@ -1,0 +1,122 @@
+# Bitwarden 应用部署 - Deployment + Service + Ingress
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bitwarden
+  namespace: bitwarden
+  labels:
+    app: bitwarden
+spec:
+  replicas: 1  # 单实例部署
+  selector:
+    matchLabels:
+      app: bitwarden
+  template:
+    metadata:
+      labels:
+        app: bitwarden
+    spec:
+      containers:
+      - name: bitwarden
+        image: ghcr.io/bitwarden/self-host:beta
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        
+        # 环境变量从 ConfigMap 加载
+        envFrom:
+        - configMapRef:
+            name: bitwarden-config
+        
+        # 资源限制
+        resources:
+          requests:
+            cpu: 200m
+            memory: 256Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+        
+        # 存储卷挂载
+        volumeMounts:
+        - name: bitwarden-data
+          mountPath: /etc/bitwarden
+        
+        # 健康检查
+        livenessProbe:
+          httpGet:
+            path: /alive
+            port: 8080
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        
+        readinessProbe:
+          httpGet:
+            path: /alive
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+      
+      # 存储卷定义
+      volumes:
+      - name: bitwarden-data
+        persistentVolumeClaim:
+          claimName: bitwarden-data
+      
+      # 节点选择 - 优先 ARM64
+      nodeSelector:
+        arch: arm64
+      
+      # 重启策略
+      restartPolicy: Always
+
+---
+# Service - 服务配置
+apiVersion: v1
+kind: Service
+metadata:
+  name: bitwarden-service
+  namespace: bitwarden
+  labels:
+    app: bitwarden
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: TCP
+    name: http
+  selector:
+    app: bitwarden
+
+---
+# Ingress - ALB 配置
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: bitwarden-ingress
+  namespace: bitwarden
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}]'
+    alb.ingress.kubernetes.io/healthcheck-path: /alive
+spec:
+  ingressClassName: alb
+  rules:
+  - http:  # 接受所有 Host 头
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: bitwarden-service
+            port:
+              number: 80
