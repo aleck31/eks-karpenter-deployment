@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aperf-system
+  labels:
+    name: aperf-system
+    purpose: performance-monitoring

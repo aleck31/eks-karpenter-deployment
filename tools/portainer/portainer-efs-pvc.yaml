@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: portainer-data-pvc
+  namespace: portainer
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: efs-portainer  # 使用专用的 efs-portainer 存储类
+  resources:
+    requests:
+      storage: 5Gi

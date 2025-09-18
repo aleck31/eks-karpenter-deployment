@@ -40,11 +40,23 @@
 │   ├── gpu-deployment-guide.md         # GPU部署指南
 │   ├── nodepool-gpu.yaml               # GPU节点池配置
 │   └── nvidia-device-plugin.yaml       # NVIDIA Device Plugin配置
-├── portainer/                    # Portainer安装文档及配置文件  
-│   ├── portainer-deployment-guide.md   # Portainer部署指南
-│   ├── portainer-deployment.yaml       # Portainer部署配置
-│   ├── portainer-efs-storageclass.yaml # EFS存储类
-│   └── portainer-efs-pvc.yaml          # EFS持久卷声明
+├── tools/                        # 集群管理工具
+│   ├── aperf/                          # APerf性能分析工具（Job模式）
+│   │   ├── aperf-deployment-guide.md   # APerf部署指南
+│   │   ├── aperf-job.yaml              # APerf Job配置
+│   │   ├── aperf-rbac.yaml             # APerf权限配置
+│   │   ├── aperf-efs-pvc.yaml          # APerf存储配置
+│   │   ├── aperf-namespace.yaml        # 命名空间配置
+│   │   └── kustomization.yaml          # Kustomize配置
+│   └── portainer/                      # Portainer容器管理工具
+│       ├── portainer-deployment-guide.md   # Portainer部署指南
+│       ├── portainer-deployment.yaml       # Portainer部署配置
+│       ├── portainer-efs-storageclass.yaml # EFS存储类
+│       └── portainer-efs-pvc.yaml          # EFS持久卷声明
+├── applications/                 # 业务应用
+│   └── hackathon-report/               # Hackathon报告应用
+│       ├── hackathon-report.yaml       # 应用部署配置
+│       └── duckchain-report.yaml       # DuckChain报告配置
 ├── tests/                        # 测试组件   
 │   ├── test-alb-ingress.yaml           # ALB Ingress 测试
 │   ├── test-storage-efs.yaml           # EFS 存储测试
@@ -54,6 +66,8 @@
 │   ├── test-gpu-simple.yaml            # GPU 基础检测测试
 │   ├── test-gpu-pytorch.yaml           # PyTorch GPU 功能测试
 │   └── test-gpu-nvme.yaml              # GPU + NVMe 存储测试
+├── docs/                         # 项目文档
+│   └── karpenter-multi-ebs-best-practices.md  # Karpenter最佳实践文档
 └── README.md                     # 项目说明文档
 ```
 
@@ -77,10 +91,13 @@ karpenter/karpenter-deployment-guide.md
 gpu/gpu-deployment-guide.md
 ```
 
-### 4. 部署 Portainer (可选)
+### 4. 部署集群管理工具 (可选)
 ```bash
-# 已验证详细指南
-portainer/portainer-deployment-guide.md
+# 部署 Portainer 容器管理界面
+tools/portainer/portainer-deployment-guide.md
+
+# 部署 APerf 性能分析工具（Job模式）
+tools/aperf/aperf-deployment-guide.md
 ```
 
 ## 🏛️ EKS 节点调度策略说明

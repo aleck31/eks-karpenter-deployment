@@ -1,0 +1,194 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: aperf-analysis
+  labels:
+    app: aperf-analysis
+spec:
+  template:
+    metadata:
+      labels:
+        app: aperf-analysis
+    spec:
+      serviceAccountName: aperf-monitor
+      hostNetwork: true
+      hostPID: true
+      restartPolicy: Never
+      nodeSelector:
+        performance-monitoring: "enabled"  # Only run on labeled nodes
+      tolerations:
+      - operator: Exists  # Allow running on all nodes
+      containers:
+      - name: aperf
+        image: public.ecr.aws/amazonlinux/amazonlinux:2023
+        securityContext:
+          privileged: true
+          allowPrivilegeEscalation: true
+          readOnlyRootFilesystem: false
+          runAsNonRoot: false
+          runAsUser: 0
+          capabilities:
+            add:
+            - SYS_ADMIN      # System administration capabilities
+            - SYS_PTRACE     # Process tracing capabilities  
+            - SYS_RESOURCE   # Resource limit capabilities
+            - IPC_LOCK       # Memory locking capabilities
+            - NET_ADMIN      # Network administration
+            - DAC_OVERRIDE   # File permission override
+        resources:
+          requests:
+            cpu: 200m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 2Gi
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: ANALYSIS_DURATION
+          value: "60"  # Analysis duration in seconds
+        - name: ANALYSIS_INTERVAL
+          value: "5"   # Sampling interval in seconds
+        command:
+        - /bin/bash
+        - -c
+        - |
+          echo "Starting APerf analysis on node: $NODE_NAME"
+          echo "Pod: $POD_NAME"
+          echo "Duration: ${ANALYSIS_DURATION}s, Interval: ${ANALYSIS_INTERVAL}s"
+          
+          # Install required tools including perf and debugging tools
+          dnf update -y && dnf install -y --allowerasing \
+            wget curl \
+            perf \
+            sysstat \
+            procps-ng \
+            util-linux \
+            strace \
+            tar \
+            gzip
+          
+          # Verify perf installation
+          perf --version 2>/dev/null && echo "perf installed successfully" || echo "perf installation failed"
+          
+          # Detect architecture and download aperf
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "aarch64" ]; then
+            APERF_ARCH="aarch64"
+          else
+            APERF_ARCH="x86_64"
+          fi
+          
+          echo "Detected architecture: $ARCH, downloading aperf for $APERF_ARCH"
+          
+          # Download and install aperf
+          cd /tmp
+          wget https://github.com/aws/aperf/releases/download/v0.1.16-alpha/aperf-v0.1.16-alpha-${APERF_ARCH}.tar.gz
+          tar -xzf aperf-v0.1.16-alpha-${APERF_ARCH}.tar.gz
+          cp aperf-v0.1.16-alpha-${APERF_ARCH}/aperf /usr/local/bin/
+          chmod +x /usr/local/bin/aperf
+          
+          # Set performance optimization and security parameters
+          echo 100 | tee /host/sys/devices/*/perf_event_mux_interval_ms 2>/dev/null || true
+          echo 0 > /proc/sys/kernel/perf_event_paranoid 2>/dev/null || true
+          echo 0 > /proc/sys/kernel/kptr_restrict 2>/dev/null || true
+          
+          # Mount debug filesystems if available
+          mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true
+          mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null || true
+          
+          # Create analysis directory
+          ANALYSIS_DIR="/data/aperf-analysis-$(date +%Y%m%d-%H%M%S)-$NODE_NAME"
+          mkdir -p "$ANALYSIS_DIR"
+          cd "$ANALYSIS_DIR"
+          
+          # Check tools availability
+          echo "=== Tool Availability Check ==="
+          aperf --version
+          perf --version 2>/dev/null || echo "perf not available"
+          echo "Kernel version: $(uname -r)"
+          echo "Available capabilities: $(cat /proc/self/status | grep Cap)"
+          
+          # Run performance analysis
+          echo "Starting performance analysis..."
+          RUN_NAME="node-analysis-$(date +%Y%m%d-%H%M%S)"
+          
+          # Record performance data with profiling
+          aperf record -r "$RUN_NAME" -i "$ANALYSIS_INTERVAL" -p "$ANALYSIS_DURATION" --profile
+          
+          # Generate HTML report
+          REPORT_NAME="report-$(date +%Y%m%d-%H%M%S)"
+          aperf report -r "$RUN_NAME" -n "$REPORT_NAME"
+          
+          # Display results
+          echo "Analysis completed successfully!"
+          echo "Results saved in: $ANALYSIS_DIR"
+          echo "Raw data: ${RUN_NAME}.tar.gz"
+          echo "HTML report: ${REPORT_NAME}.tar.gz"
+          
+          # List generated files
+          ls -la *.tar.gz
+          
+          echo "To download reports:"
+          echo "kubectl cp aperf-system/$POD_NAME:$ANALYSIS_DIR/${REPORT_NAME}.tar.gz ./${REPORT_NAME}.tar.gz"
+          
+          echo "APerf analysis job completed on $NODE_NAME"
+        volumeMounts:
+        - name: data-volume
+          mountPath: /data
+        - name: proc
+          mountPath: /host/proc
+          readOnly: true
+        - name: sys
+          mountPath: /host/sys
+          readOnly: true
+        - name: dev
+          mountPath: /host/dev
+          readOnly: true
+        - name: boot
+          mountPath: /host/boot
+          readOnly: true
+        - name: var-log
+          mountPath: /host/var/log
+          readOnly: true
+        - name: debugfs
+          mountPath: /sys/kernel/debug
+        - name: tracefs
+          mountPath: /sys/kernel/tracing
+        - name: modules
+          mountPath: /lib/modules
+          readOnly: true
+      volumes:
+      - name: data-volume
+        persistentVolumeClaim:
+          claimName: aperf-data
+      - name: proc
+        hostPath:
+          path: /proc
+      - name: sys
+        hostPath:
+          path: /sys
+      - name: dev
+        hostPath:
+          path: /dev
+      - name: boot
+        hostPath:
+          path: /boot
+      - name: var-log
+        hostPath:
+          path: /var/log
+      - name: debugfs
+        hostPath:
+          path: /sys/kernel/debug
+      - name: tracefs
+        hostPath:
+          path: /sys/kernel/tracing
+      - name: modules
+        hostPath:
+          path: /lib/modules
