@@ -1,0 +1,107 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-exporter
+  namespace: monitoring
+  labels:
+    app: node-exporter
+spec:
+  selector:
+    matchLabels:
+      app: node-exporter
+  template:
+    metadata:
+      labels:
+        app: node-exporter
+    spec:
+      hostNetwork: true
+      hostPID: true
+      nodeSelector:
+        kubernetes.io/os: linux
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: eks.amazonaws.com/compute-type
+                operator: NotIn
+                values:
+                - fargate
+      tolerations:
+      - operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: node-exporter
+        image: prom/node-exporter:v1.8.2
+        args:
+          - --path.procfs=/host/proc
+          - --path.sysfs=/host/sys
+          - --path.rootfs=/host/root
+          - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+          - --collector.netclass.ignored-devices=^(veth.*|[a-f0-9]{15})$$
+          - --collector.netdev.device-exclude=^(veth.*|[a-f0-9]{15})$$
+        ports:
+        - containerPort: 9100
+          protocol: TCP
+          name: http-metrics
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 250m
+            memory: 256Mi
+        volumeMounts:
+        - name: proc
+          mountPath: /host/proc
+          readOnly: true
+        - name: sys
+          mountPath: /host/sys
+          readOnly: true
+        - name: root
+          mountPath: /host/root
+          mountPropagation: HostToContainer
+          readOnly: true
+        livenessProbe:
+          httpGet:
+            path: /
+            port: http-metrics
+          initialDelaySeconds: 30
+          timeoutSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /
+            port: http-metrics
+          initialDelaySeconds: 30
+          timeoutSeconds: 30
+      volumes:
+      - name: proc
+        hostPath:
+          path: /proc
+      - name: sys
+        hostPath:
+          path: /sys
+      - name: root
+        hostPath:
+          path: /
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-exporter
+  namespace: monitoring
+  labels:
+    app: node-exporter
+  annotations:
+    prometheus.io/scrape: 'true'
+    prometheus.io/port: '9100'
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app: node-exporter
+  ports:
+  - name: http-metrics
+    port: 9100
+    targetPort: 9100
+    protocol: TCP
