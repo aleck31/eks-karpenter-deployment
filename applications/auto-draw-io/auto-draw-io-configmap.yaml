@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: auto-draw-io-config
+  namespace: hostwo
+data:
+  # AI Provider Configuration
+  AI_PROVIDER: "bedrock"
+  AI_MODEL: "global.anthropic.claude-sonnet-4-5-20250929-v1:0"
+  
+  # AWS Bedrock Configuration
+  AWS_REGION: "us-west-2"
+  
+  # Temperature (Optional)
+  TEMPERATURE: "0"
