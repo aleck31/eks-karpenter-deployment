@@ -101,7 +101,8 @@ spec:
     - tags:
         karpenter.sh/discovery: "eks-karpenter-env"
   
-  instanceProfile: "KarpenterNodeInstanceProfile-eks-karpenter-env"
+  # 统一使用 role 方式
+  role: "KarpenterNodeInstanceRole-eks-karpenter-env"
 
   metadataOptions:
     httpPutResponseHopLimit: 2    # 允许容器访问IMDS
