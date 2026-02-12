@@ -82,8 +82,9 @@ spec:
   
   # 节点终止策略
   disruption:
-    consolidationPolicy: WhenEmpty
-    consolidateAfter: 30s
+    # 生产环境建议设为: WhenEmpty 以避免频繁迁移
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 5m
 
 ---
 apiVersion: karpenter.k8s.aws/v1

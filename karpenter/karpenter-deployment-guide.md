@@ -100,6 +100,31 @@ kubectl get pods -n karpenter
 kubectl logs -f -n karpenter -l app.kubernetes.io/name=karpenter
 ```
 
+### 2.4 配置 Feature Gates
+
+Helm 安装完成后，配置 Karpenter Feature Gates：
+
+```bash
+# 启用 SpotToSpotConsolidation（允许 Spot 节点 right-sizing，如 g4dn.12xlarge → g4dn.xlarge）
+# 注意：Helm chart 1.6.3 的 featureGates values 可能不会正确渲染，需通过 kubectl set env 设置
+# 每次 helm upgrade 后需重新执行
+kubectl set env deployment/karpenter -n karpenter \
+  FEATURE_GATES="ReservedCapacity=true,SpotToSpotConsolidation=true,NodeRepair=false"
+
+# 验证
+kubectl rollout status deployment/karpenter -n karpenter
+kubectl get deployment -n karpenter karpenter \
+  -o jsonpath='{.spec.template.spec.containers[0].env}' | python3 -m json.tool | grep -A2 FEATURE
+```
+
+**Feature Gates 说明：**
+
+| Feature | 默认 | 说明 |
+|---------|------|------|
+| SpotToSpotConsolidation | false | 允许 Spot→Spot 替换（right-sizing），需配合 `WhenEmptyOrUnderutilized` 策略 |
+| ReservedCapacity | true | 支持预留容量 |
+| NodeRepair | false | 自动修复不健康节点 |
+
 ## 3. 配置 NodePool
 
 ### 3.1 应用 NodePool 配置
