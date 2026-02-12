@@ -84,7 +84,7 @@ spec:
   disruption:
     # 生产环境建议设为: WhenEmpty 以避免频繁迁移
     consolidationPolicy: WhenEmptyOrUnderutilized
-    consolidateAfter: 5m
+    consolidateAfter: 30m
 
 ---
 apiVersion: karpenter.k8s.aws/v1
