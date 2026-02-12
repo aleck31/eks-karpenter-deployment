@@ -19,7 +19,7 @@ spec:
     spec:
       containers:
       - name: bitwarden
-        image: ghcr.io/bitwarden/self-host:beta
+        image: ghcr.io/bitwarden/lite:latest
         imagePullPolicy: Always
         ports:
         - containerPort: 8080

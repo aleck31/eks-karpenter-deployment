@@ -1,8 +1,8 @@
-# Bitwarden Unified 部署指南 (EKS)
+# Bitwarden Lite 部署指南 (EKS)
 
 ## 📋 部署概述
 
-本指南使用 Bitwarden unified 统一部署 (单容器) 方式在 EKS 集群中部署密码管理服务。
+本指南介绍如何在 EKS 集群中部署 Bitwarden Lite（原 Bitwarden Unified，于2025年12月正式发布时改名）密码管理服务。
 
 ### 部署特点
 - **单容器部署** - 所有服务打包在一个镜像中
