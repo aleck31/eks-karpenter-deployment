@@ -14,7 +14,7 @@
 ## 📁 部署文件结构
 
 ```
-/bitwarden/
+applications/bitwarden/
 ├── bitwarden-deployment-guide.md     # 本部署指南
 ├── bitwarden-configmap.yaml          # 环境变量配置
 ├── bitwarden-efs-pvc.yaml            # EFS 持久卷声明

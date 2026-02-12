@@ -1,0 +1,28 @@
+# Qwen3 Speech 模型共享存储，避免重复下载模型 - EFS PVC
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: efs-qwen3-speech
+provisioner: efs.csi.aws.com
+parameters:
+  provisioningMode: efs-ap
+  fileSystemId: fs-02ae96a84bc27aae6
+  directoryPerms: "777"
+  basePath: "/qwen3-speech"
+volumeBindingMode: Immediate
+reclaimPolicy: Retain
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: qwen3-models-pvc
+  namespace: hosthree
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: efs-qwen3-speech
+  resources:
+    requests:
+      storage: 20Gi

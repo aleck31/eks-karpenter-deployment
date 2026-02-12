@@ -34,7 +34,7 @@
 ## 📁 部署文件结构
 
 ```
-/auto-draw-io/
+applications/auto-draw-io/
 ├── auto-draw-io-deployment-guide.md     # 本部署指南
 ├── auto-draw-io-configmap.yaml          # 非敏感环境变量配置
 ├── auto-draw-io-secret.yaml             # 敏感信息配置 (AWS 凭据)

@@ -1,0 +1,16 @@
+# NVIDIA GPU Time-Slicing 配置
+# 将每张物理 GPU 虚拟为 2 个 nvidia.com/gpu 资源
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nvidia-device-plugin-config
+  namespace: kube-system
+data:
+  config.yaml: |
+    version: v1
+    sharing:
+      timeSlicing:
+        resources:
+        - name: nvidia.com/gpu
+          replicas: 2

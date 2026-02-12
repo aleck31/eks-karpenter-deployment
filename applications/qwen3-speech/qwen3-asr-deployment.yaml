@@ -1,0 +1,126 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwen3-asr
+  namespace: hosthree
+  labels:
+    app: qwen3-asr
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: qwen3-asr
+  template:
+    metadata:
+      labels:
+        app: qwen3-asr
+    spec:
+      initContainers:
+      - name: model-downloader
+        image: qwenllm/qwen3-asr:latest
+        command:
+        - bash
+        - -c
+        - |
+          MODEL_DIR="/models/Qwen3-ASR-1.7B"
+          # Check all 2 safetensors shards exist
+          if [ -f "$MODEL_DIR/model-00001-of-00002.safetensors" ] && \
+             [ -f "$MODEL_DIR/model-00002-of-00002.safetensors" ] && \
+             [ -f "$MODEL_DIR/config.json" ]; then
+            echo "Model complete, skipping download"
+          else
+            echo "Model incomplete or missing, downloading..."
+            rm -rf "$MODEL_DIR"
+            huggingface-cli download Qwen/Qwen3-ASR-1.7B --local-dir "$MODEL_DIR"
+          fi
+        volumeMounts:
+        - name: models
+          mountPath: /models
+        resources:
+          requests:
+            cpu: 500m
+            memory: 2Gi
+          limits:
+            cpu: 1
+            memory: 4Gi
+
+      containers:
+      - name: asr
+        image: qwenllm/qwen3-asr:latest
+        command:
+        - qwen-asr-serve
+        args:
+        - /models/Qwen3-ASR-1.7B
+        - --gpu-memory-utilization
+        - "0.45"
+        - --max-model-len
+        - "4096"
+        - --host
+        - "0.0.0.0"
+        - --port
+        - "8000"
+        ports:
+        - containerPort: 8000
+          name: http
+        volumeMounts:
+        - name: models
+          mountPath: /models
+          readOnly: true
+        resources:
+          requests:
+            cpu: "1"
+            memory: 6Gi
+            nvidia.com/gpu: 1
+          limits:
+            cpu: "2"
+            memory: 8Gi
+            nvidia.com/gpu: 1
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 120
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 5
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 5
+
+      volumes:
+      - name: models
+        persistentVolumeClaim:
+          claimName: qwen3-models-pvc
+
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+      nodeSelector:
+        node-type: gpu
+
+      restartPolicy: Always
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qwen3-asr-service
+  namespace: hosthree
+  labels:
+    app: qwen3-asr
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 8000
+    protocol: TCP
+    name: http
+  selector:
+    app: qwen3-asr
