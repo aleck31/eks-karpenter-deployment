@@ -19,13 +19,13 @@ applications/qwen3-speech/
 ## 架构
 
 ```
-┌──────────────────────────────────────────────────┐
-│  g4dn.xlarge (Spot) - 1x T4 14.7GB              │
-│  Time-Slicing: 1 物理 GPU → 2 虚拟 GPU           │
-│                                                  │
-│  Pod: qwen3-asr (qwen-asr-serve) → 虚拟 GPU #1  │
-│  Pod: qwen3-tts (FastAPI)        → 虚拟 GPU #2  │
-└──────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────┐
+│  g4dn.xlarge           - 1x T4 16GB            │
+│  Time-Slicing: 1 物理 GPU    →   2 虚拟 GPU     │
+│                                                │
+│  Pod: qwen3-asr                  → 虚拟 GPU #1  │
+│  Pod: qwen3-tts                  → 虚拟 GPU #2  │
+└────────────────────────────────────────────────┘
          │
     EFS PVC (RWX, 共享模型存储)
     ├── /models/Qwen3-ASR-1.7B/          (3.87 GiB 显存)
@@ -51,13 +51,16 @@ applications/qwen3-speech/
 | TTS (FastAPI) | 1 | 6Gi | 1 (虚拟) | TTS_BACKEND=official, TTS_DTYPE=bfloat16 |
 | **总计** | **2 CPU** | **12Gi** | **2 (虚拟 / 1 物理)** | |
 
-g4dn.xlarge 可分配: ~3.9 CPU / ~14.7Gi / 1 GPU (Time-Slicing 虚拟为 2)
+g4dn.xlarge 可分配: ~3.9 CPU / ~14.7Gi 内存 / 1 GPU (Time-Slicing 虚拟为 2)
 
 ## 前置条件
 
 - GPU NodePool 已部署 (`gpu/nodepool-gpu.yaml`)
-- NVIDIA Device Plugin 已运行
+- NVIDIA Device Plugin 已配置 (`gpu/nvidia-device-plugin.yaml`)
 - EFS CSI Driver 已安装
+- ALB Ingress Controller 已安装
+
+详见 `gpu/gpu-deployment-guide.md`。
 
 ## 部署步骤
 
@@ -110,7 +113,7 @@ kubectl get pvc -n hosthree qwen3-models-pvc
 kubectl apply -f qwen3-asr-deployment.yaml
 ```
 
-首次部署：
+首次部署耗时较长：
 - Karpenter 拉起 g4dn.xlarge Spot 实例 (~1-3 分钟)
 - 拉取 qwenllm/qwen3-asr:latest 镜像 (~7 分钟，14.4GB)
 - initContainer 下载模型到 EFS (~3-5 分钟)
@@ -121,6 +124,9 @@ kubectl apply -f qwen3-asr-deployment.yaml
 等 ASR Pod 进入 Running 后再部署 TTS，避免 GPU 资源竞争导致调度到不同节点：
 
 ```bash
+# 确认 ASR 已 Running
+kubectl get pods -n hosthree -l app=qwen3-asr
+
 kubectl apply -f qwen3-tts-deployment.yaml
 ```
 
@@ -143,19 +149,19 @@ kubectl get pods -n hosthree -o wide
 kubectl get node -l node-type=gpu -o jsonpath='{.items[*].status.allocatable.nvidia\.com/gpu}'
 # 预期输出: 2
 
-# 测试 ASR
+# 测试 ASR health
 kubectl port-forward -n hosthree svc/qwen3-asr-service 8000:80 &
 curl -s http://localhost:8000/health
 
-# 测试 TTS
+# 测试 TTS health
 kubectl port-forward -n hosthree svc/qwen3-tts-service 8880:80 &
 curl -s http://localhost:8880/health | python3 -m json.tool
 # 预期: "status": "healthy", "ready": true
 ```
 
-## ALB 调用地址
+## API 使用
 
-```
+```bash
 ALB=<ALB_DNS_NAME>  # kubectl get ingress -n hosthree 查看实际地址
 
 # ASR - 语音识别
@@ -164,13 +170,65 @@ curl http://$ALB:8000/v1/audio/transcriptions \
   -F "model=/models/Qwen3-ASR-1.7B"
 
 # TTS - 语音合成 (model 用 tts-1，不是模型目录名)
+# 基本用法 (自动语言检测)
 curl http://$ALB:8880/v1/audio/speech \
   -H "Content-Type: application/json" \
-  -d '{"model":"tts-1","input":"你好","voice":"alloy"}' \
+  -d '{"model":"tts-1","input":"你好，这是语音合成测试。","voice":"Vivian"}' \
+  -o output.wav
+
+# 指定语言 (强制英文输出)
+curl http://$ALB:8880/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"model":"tts-1-en","input":"Hello, this is a TTS test.","voice":"Ryan"}' \
   -o output.wav
 ```
 
-**TTS 支持的 model 值**: `tts-1`, `tts-1-hd`, `qwen3-tts`, `tts-1-zh`, `tts-1-en` 等
+### TTS 参数说明
+
+**model 参数** (控制输出语言，底层都是同一个模型):
+- `tts-1` / `qwen3-tts` — 自动语言检测
+- `tts-1-{lang}` — 强制输出语言: zh/en/ja/ko/de/fr/es/ru/pt/it
+- `tts-1-hd` / `tts-1-hd-{lang}` — 同上，仅兼容 OpenAI API 命名，无质量区别
+
+**voice 参数** (9 个内置音色):
+
+| Voice | 描述 | 母语 |
+|-------|------|------|
+| Vivian | 明亮、略带锐利的年轻女声 | 中文 |
+| Serena | 温暖、柔和的年轻女声 | 中文 |
+| Sohee | 温暖韩国女声，情感丰富 | 韩文 |
+| Ono_Anna | 活泼日本女声，轻盈灵动 | 日文 |
+| Uncle_Fu | 成熟男声，低沉醇厚 | 中文 |
+| Dylan | 年轻北京男声，清晰自然 | 中文 (北京话) |
+| Eric | 活泼成都男声，略带沙哑 | 中文 (四川话) |
+| Ryan | 有力男声，节奏感强 | 英文 |
+| Aiden | 阳光美式男声，中频清晰 | 英文 |
+
+每个音色可说所有 10 种语言，不限于母语。推荐使用母语获得最佳效果。
+
+**其他参数**:
+- `response_format`: mp3 (默认), opus, aac, flac, wav, pcm
+- `speed`: 0.25 ~ 4.0 (默认 1.0)
+
+**TTS 生成能力**:
+- 最长语音: ~11 分钟 (max_new_tokens=8192, 12Hz)
+- T4 实测 RTF: ~2.16 (生成 1 秒语音需 2.16 秒推理)
+- 短文本 (~30字): ~20 秒推理
+- 长文本 (~1000字): ~10 分钟推理
+
+## 推理镜像信息
+
+### ASR 镜像
+- **镜像**: qwenllm/qwen3-asr:latest (Docker Hub)
+- **来源**: https://github.com/QwenLM/Qwen3-ASR
+- **大小**: ~14.4GB (包含 vLLM 0.14.0 + CUDA + 模型推理依赖)
+- **启动命令**: `qwen-asr-serve /models/Qwen3-ASR-1.7B`
+
+### TTS 镜像
+- **镜像**: <AWS_ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/qwen3-tts:latest
+- **来源**: https://github.com/groxaxo/Qwen3-TTS-Openai-Fastapi
+- **大小**: ~6.2GB
+- **Dockerfile target**: production (official backend)
 
 ## 模型下载说明
 
@@ -181,21 +239,22 @@ curl http://$ALB:8880/v1/audio/speech \
 | ASR | Qwen/Qwen3-ASR-1.7B | /models/Qwen3-ASR-1.7B | ~3.5GB (2 个 safetensors 分片) |
 | TTS | Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice | /models/Qwen3-TTS-CustomVoice | ~3.5GB |
 
-- initContainer 会检查 safetensors 文件完整性，不完整则重新下载
+- initContainer 会检查 safetensors 文件完整性(所有分片 + config.json)，不完整则重新下载
 - Spot 中断恢复时模型已在 EFS，跳过下载，恢复更快
 
 ## 成本说明
 
 - 实例类型: g4dn.xlarge (1x T4, 4 vCPU, 16GB)，Spot ~$0.16/h
 - 两个模型共享单张 GPU (Time-Slicing)，相比双节点节省 50%
-- Karpenter consolidation: 空节点 5 分钟后回收，低利用率节点自动 right-sizing
+- Karpenter consolidation: WhenEmptyOrUnderutilized, 5 分钟后回收/right-sizing
 - Spot 中断处理已启用 (SQS + EventBridge)，提前 10-20 分钟迁移
 
 ## 已知限制
 
-- ASR `--max-model-len 4096`: T4 显存有限 (gpu_memory_utilization=0.45)，KV cache 约 1.32 GiB，支持 ~3 个并发请求
-- T4 不支持 Flash Attention 2 (compute capability 7.5 < 8.0)，ASR 使用 FlashInfer + SDPA 替代
 - Time-Slicing 不提供显存隔离，两个模型可能互相影响
+- T4 不支持 Flash Attention 2 (compute capability 7.5 < 8.0)，ASR 使用 FlashInfer + SDPA 替代，TTS 使用 torch SDPA
+- ASR `--max-model-len 4096`: T4 显存有限 (gpu_memory_utilization=0.45)，KV cache 约 1.32 GiB，支持 ~3 个并发请求
+- TTS 单线程推理 (Python GIL)，长文本推理期间 readiness probe 会失败，ALB 暂时摘流量，推理完成后自动恢复
 
 ## 故障排除
 
@@ -219,17 +278,3 @@ kubectl logs -n hosthree <pod-name> -c model-downloader
 # 检查 GPU 资源
 kubectl describe node -l node-type=gpu | grep -A5 "Allocated resources"
 ```
-
-## 镜像信息
-
-### ASR 镜像
-- **镜像**: qwenllm/qwen3-asr:latest (Docker Hub)
-- **来源**: https://github.com/QwenLM/Qwen3-ASR
-- **大小**: ~14.4GB (包含 vLLM 0.14.0 + CUDA + 模型推理依赖)
-- **启动命令**: `qwen-asr-serve /models/Qwen3-ASR-1.7B`
-
-### TTS 镜像
-- **镜像**: <AWS_ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/qwen3-tts:latest
-- **来源**: https://github.com/groxaxo/Qwen3-TTS-Openai-Fastapi
-- **大小**: ~6.2GB
-- **Dockerfile target**: production (official backend)
