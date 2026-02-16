@@ -44,8 +44,6 @@ spec:
             - g6.4xlarge     # 1x L4, 16 vCPU, 64 GB
             - g6.8xlarge     # 1x L4, 32 vCPU, 128 GB
             - g6.12xlarge    # 4x L4, 48 vCPU, 192 GB
-            - g6.16xlarge    # 1x L4, 64 vCPU, 256 GB
-            - g6.24xlarge    # 4x L4, 96 vCPU, 384 GB
 
             # G5g 系列 - NVIDIA T4g (ARM64) - 成本优化推理
             - g5g.xlarge     # 1x T4g, 4 vCPU, 8 GB
@@ -60,8 +58,6 @@ spec:
             - g5.4xlarge     # 1x A10G, 16 vCPU, 64 GB
             - g5.8xlarge     # 1x A10G, 32 vCPU, 128 GB
             - g5.12xlarge    # 4x A10G, 48 vCPU, 192 GB
-            - g5.24xlarge    # 4x A10G, 96 vCPU, 384 GB
-            - g5.48xlarge    # 8x A10G, 192 vCPU, 768 GB
             
             # G6e 系列 - NVIDIA L40S (x86_64) - 大模型推理
             - g6e.xlarge     # 1x L40S, 4 vCPU, 16 GB
@@ -69,8 +65,7 @@ spec:
             - g6e.4xlarge    # 1x L40S, 16 vCPU, 64 GB
             - g6e.8xlarge    # 1x L40S, 32 vCPU, 128 GB
             - g6e.12xlarge   # 4x L40S, 48 vCPU, 192 GB
-            - g6e.24xlarge   # 4x L40S, 96 vCPU, 384 GB
-            - g6e.48xlarge   # 8x L40S, 192 vCPU, 768 GB
+
         - key: kubernetes.io/arch
           operator: In
           values: ["amd64", "arm64"]  # 支持 x86_64 和 ARM64

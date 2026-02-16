@@ -229,6 +229,17 @@ curl http://$ALB:8880/v1/audio/speech \
 - **来源**: https://github.com/groxaxo/Qwen3-TTS-Openai-Fastapi
 - **大小**: ~6.2GB
 - **Dockerfile target**: production (official backend)
+- **本地 Patch**: `api/backends/official_qwen3_tts.py` — 将 `generate_custom_voice` / `generate_voice_clone` 等同步推理调用包装为 `asyncio.run_in_executor`，避免 GPU 推理阻塞事件循环导致 `/health` 无法响应
+
+**重新构建镜像**:
+```bash
+cd /path/to/Qwen3-TTS-Openai-Fastapi
+# 应用 patch 后构建
+docker build --target production -t <AWS_ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/qwen3-tts:latest .
+# 推送
+aws ecr get-login-password --region <REGION> | docker login --username AWS --password-stdin <AWS_ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com
+docker push <AWS_ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/qwen3-tts:latest
+```
 
 ## 模型下载说明
 
@@ -246,7 +257,7 @@ curl http://$ALB:8880/v1/audio/speech \
 
 - 实例类型: g4dn.xlarge (1x T4, 4 vCPU, 16GB)，Spot ~$0.16/h
 - 两个模型共享单张 GPU (Time-Slicing)，相比双节点节省 50%
-- Karpenter consolidation: WhenEmptyOrUnderutilized, 5 分钟后回收/right-sizing
+- Karpenter consolidation: WhenEmptyOrUnderutilized, 30 分钟后回收/right-sizing (GPU 节点启停代价大，避免频繁整合)
 - Spot 中断处理已启用 (SQS + EventBridge)，提前 10-20 分钟迁移
 
 ## 已知限制
@@ -254,7 +265,7 @@ curl http://$ALB:8880/v1/audio/speech \
 - Time-Slicing 不提供显存隔离，两个模型可能互相影响
 - T4 不支持 Flash Attention 2 (compute capability 7.5 < 8.0)，ASR 使用 FlashInfer + SDPA 替代，TTS 使用 torch SDPA
 - ASR `--max-model-len 4096`: T4 显存有限 (gpu_memory_utilization=0.45)，KV cache 约 1.32 GiB，支持 ~3 个并发请求
-- TTS 单线程推理 (Python GIL)，长文本推理期间 readiness probe 会失败，ALB 暂时摘流量，推理完成后自动恢复
+- TTS 单线程推理 (Python GIL)，建议通过 `run_in_executor` patch 解决事件循环阻塞问题，推理期间 `/health` 可正常响应。如使用未 patch 的上游镜像，长文本推理会导致 readiness probe 失败、ALB 返回 503
 
 ## 故障排除
 
