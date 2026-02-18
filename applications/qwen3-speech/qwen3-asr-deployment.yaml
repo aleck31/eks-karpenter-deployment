@@ -109,6 +109,27 @@ spec:
         effect: NoSchedule
       nodeSelector:
         node-type: gpu
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 50
+            preference:
+              matchExpressions:
+              - key: node.kubernetes.io/instance-type
+                operator: In
+                values: ["g6.xlarge", "g6.2xlarge", "g6.4xlarge"]
+          - weight: 30
+            preference:
+              matchExpressions:
+              - key: node.kubernetes.io/instance-type
+                operator: In
+                values: ["g5.xlarge", "g5.2xlarge", "g5.4xlarge"]
+          - weight: 20
+            preference:
+              matchExpressions:
+              - key: node.kubernetes.io/instance-type
+                operator: In
+                values: ["g4dn.xlarge", "g4dn.2xlarge", "g4dn.4xlarge"]
 
       restartPolicy: Always
 
