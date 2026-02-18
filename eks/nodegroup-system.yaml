@@ -1,0 +1,33 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: eks-karpenter-env
+  region: ap-southeast-1
+  version: "1.35"
+
+managedNodeGroups:
+  - name: system
+    instanceTypes:
+      - m8g.large
+      - m8g.xlarge
+      - m7g.large
+      - m7g.xlarge
+      - c8g.large
+      - c8g.xlarge
+      - c7g.large
+      - c7g.xlarge
+      - r8g.large
+      - r8g.xlarge
+      - r7g.large
+      - r7g.xlarge
+    amiFamily: AmazonLinux2023
+    minSize: 1
+    maxSize: 3
+    desiredCapacity: 2
+    privateNetworking: true
+    spot: true
+    labels:
+      role: system
+    tags:
+      nodegroup-role: system

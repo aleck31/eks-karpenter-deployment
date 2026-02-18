@@ -4,8 +4,8 @@ kind: ClusterConfig
 
 metadata:
   name: eks-karpenter-env
-  region: us-east-1
-  version: "1.33"  # 使用 Kubernetes v1.33
+  region: ap-southeast-1
+  version: "1.35"
 
 # VPC 配置 - 使用 10.1.0.0/16 网段
 vpc:
@@ -44,12 +44,10 @@ iam:
         efsCSIController: true
       roleName: EFSCSIPodIdentityRole
 
-    # Karpenter Pod Identity 关联
-    - namespace: karpenter
-      serviceAccountName: karpenter
-      wellKnownPolicies:
-        autoScaler: true
-      roleName: KarpenterPodIdentityRole
+    # Karpenter 使用 IRSA（非 Pod Identity）
+    # 原因：Karpenter 运行在 Fargate 上，Pod Identity Agent 是 DaemonSet 不支持 Fargate
+    # IRSA role (KarpenterIRSA) 通过 Helm --set serviceAccount.annotations 配置
+    # 详见 karpenter/karpenter-deployment-guide.md
 
   serviceAccounts:
     # Karpenter 服务账户
@@ -105,13 +103,11 @@ fargateProfiles:
 addons:
   - name: coredns
     version: latest
-    attachPolicyARNs: []  # 禁用IRSA
     configurationValues: |-
       podLabels:
         fargate: enabled
   - name: metrics-server
     version: latest
-    attachPolicyARNs: []
     configurationValues: |-
       podLabels:
         fargate: enabled
@@ -119,16 +115,12 @@ addons:
     version: latest
   - name: vpc-cni
     version: latest
-    attachPolicyARNs: []
   - name: kube-proxy
     version: latest
-    attachPolicyARNs: []
   - name: aws-ebs-csi-driver
     version: latest
-    attachPolicyARNs: []
   - name: aws-efs-csi-driver
     version: latest
-    attachPolicyARNs: []
   - name: aws-mountpoint-s3-csi-driver
     version: latest
 

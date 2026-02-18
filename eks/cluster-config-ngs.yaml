@@ -1,0 +1,89 @@
+# cluster-config.yaml - 包含所有必要的服务账户和插件
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: eks-karpenter-env
+  region: ap-southeast-1
+  version: "1.35"
+
+# VPC 配置 - 使用 10.1.0.0/16 网段
+vpc:
+  cidr: "10.1.0.0/16"
+
+# 可用区配置 (新加坡区域 3 个 AZ)
+availabilityZones:
+  - ap-southeast-1a
+  - ap-southeast-1b
+  - ap-southeast-1c
+
+# IAM 配置
+iam:
+  withOIDC: true
+
+  # Pod Identity 关联配置 - 为addon使用Pod Identity
+  podIdentityAssociations:
+    # VPC CNI
+    - namespace: kube-system
+      serviceAccountName: aws-node
+      permissionPolicyARNs:
+        - "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+
+    # EBS CSI Driver
+    - namespace: kube-system
+      serviceAccountName: ebs-csi-controller-sa
+      wellKnownPolicies:
+        ebsCSIController: true
+
+    # EFS CSI Driver
+    - namespace: kube-system
+      serviceAccountName: efs-csi-controller-sa
+      wellKnownPolicies:
+        efsCSIController: true
+
+    # S3 CSI Driver (Mountpoint for Amazon S3)
+    - namespace: kube-system
+      serviceAccountName: s3-csi-driver-sa
+      permissionPolicyARNs:
+        - "arn:aws:iam::aws:policy/AmazonS3FullAccess"
+
+    # AWS Load Balancer Controller
+    - namespace: kube-system
+      serviceAccountName: aws-load-balancer-controller
+      wellKnownPolicies:
+        awsLoadBalancerController: true
+
+    # Karpenter Pod Identity 在部署 Karpenter 时单独配置
+    # 详见 karpenter/karpenter-deployment-guide.md
+# 不创建默认节点组
+managedNodeGroups: []
+# System Node Group 单独管理，详见 eks/nodegroup-system.yaml
+
+# 启用必要的插件
+addons:
+  - name: coredns
+    version: latest
+  - name: metrics-server
+    version: latest
+  - name: eks-pod-identity-agent
+    version: latest
+  - name: vpc-cni
+    version: latest
+  - name: kube-proxy
+    version: latest
+  - name: aws-ebs-csi-driver
+    version: latest
+  - name: aws-efs-csi-driver
+    version: latest
+  - name: aws-mountpoint-s3-csi-driver
+    version: latest
+
+# CloudWatch 日志
+cloudWatch:
+  clusterLogging:
+    enableTypes:
+      - api
+      - audit
+      - authenticator
+      - controllerManager
+      - scheduler

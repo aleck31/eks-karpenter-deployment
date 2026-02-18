@@ -16,6 +16,32 @@
   - 官方 OCI 仓库：`oci://public.ecr.aws/karpenter/karpenter`
   - API 版本：`karpenter.sh/v1` 和 `karpenter.k8s.aws/v1`
 
+## 部署方案选择
+
+本项目提供两种系统组件部署方案，根据需求选择：
+
+| 对比项 | 方案 A: Fargate | 方案 B: NodeGroup |
+|--------|----------------|-------------------|
+| **配置文件** | `cluster-config.yaml` | `cluster-config-ngs.yaml` + `nodegroup-system.yaml` |
+| **系统组件运行位置** | Fargate (无服务器) | Managed NodeGroup (EC2 Spot) |
+| **认证方式** | IRSA (Karpenter 在 Fargate 不支持 Pod Identity) | Pod Identity (全组件统一) |
+| **节点管理** | 无需管理 | 自动伸缩 (1-3 节点) |
+| **调度控制** | 需要 `fargate: enabled` 标签 | 自动调度到 system 节点组 |
+| **实例架构** | N/A (Fargate) | ARM64 Graviton Spot |
+| **适用场景** | 小规模、免运维 | 大规模、成本优化、需要 DaemonSet 支持 |
+
+### 方案 A 特点 (Fargate)
+- 系统组件通过 Fargate Profile + `fargate: enabled` 标签调度
+- Karpenter 运行在 Fargate，需使用 IRSA（Pod Identity Agent 是 DaemonSet，不支持 Fargate）
+- LoadBalancer Controller 使用 IRSA
+- 每个 Pod 独立隔离，安全性高
+
+### 方案 B 特点 (NodeGroup)
+- 系统组件运行在 Managed NodeGroup（Spot 实例，成本低）
+- 所有组件统一使用 Pod Identity，配置更简洁
+- 支持 DaemonSet 类型的系统组件（如 CSI Node、Pod Identity Agent）
+- 节点自动伸缩 1-3 台，多实例类型容错
+
 ## 1: 环境准备
 
 ### 1.1 安装必要工具
@@ -53,21 +79,35 @@ export AWS_DEFAULT_REGION=us-east-1
 
 ## 2: EKS 集群创建
 
-### 2.1 创建 eksctl 配置文件
-
-参考配置文件：`cluster-config.yaml`
-
 **重要说明**：
 - 建议创建之前通过 `eksctl create cluster --dry-run` 进行验证
 - eksctl 不支持自动添加 `karpenter.sh/discovery` 标签
 - 需要在集群创建后手动添加这些标签（见验证步骤）
 
-### 2.2 使用 eksctl 部署集群
+### 方案 A: Fargate 方案部署
+
+配置文件：`cluster-config.yaml`
 
 ```bash
 # 创建集群 (大约需要 15-20 分钟)
 eksctl create cluster -f cluster-config.yaml --profile lab
+```
 
+### 方案 B: NodeGroup 方案部署
+
+配置文件：`cluster-config-ngs.yaml` + `nodegroup-system.yaml`
+
+```bash
+# 第一步：创建集群（不含节点组）
+eksctl create cluster -f cluster-config-ngs.yaml --profile lab
+
+# 第二步：创建 system 节点组
+eksctl create nodegroup -f nodegroup-system.yaml --profile lab
+```
+
+### 集群创建后通用步骤
+
+```bash
 # 验证集群创建
 kubectl get nodes
 kubectl get pods -A
@@ -86,8 +126,12 @@ done
 CLUSTER_SG=$(aws eks describe-cluster --name ${CLUSTER_NAME} --profile lab --query 'cluster.resourcesVpcConfig.clusterSecurityGroupId' --output text)
 echo "添加标签到安全组: $CLUSTER_SG"
 aws ec2 create-tags --resources $CLUSTER_SG --tags Key=karpenter.sh/discovery,Value=${CLUSTER_NAME} --profile lab
+```
 
-# 更新 aws-auth ConfigMap 添加 Karpenter 节点角色
+#### 仅方案 A 需要：更新 aws-auth ConfigMap
+
+```bash
+# Fargate 方案需要手动添加 Karpenter 节点角色到 aws-auth
 FARGATE_ROLE=$(aws iam list-roles --profile lab --query 'Roles[?contains(RoleName, `FargatePodExecutionRole`)].Arn' --output text)
 kubectl patch configmap aws-auth -n kube-system --patch "
 data:
@@ -108,15 +152,15 @@ data:
 
 ## 3: 集群配置
 
-### 3.1 Fargate Profile 配置说明
+### 3.1 系统组件调度配置
 
-**注意**：Fargate Profiles 已在 cluster-config.yaml 中预配置，eksctl 会自动创建以下 Profiles：
+#### 方案 A: Fargate Profile 配置
+
+Fargate Profiles 已在 `cluster-config.yaml` 中预配置，eksctl 会自动创建以下 Profiles：
 
 - **default** - 用于 default 和 kube-system namespace（需要 `fargate: enabled` 标签）
-- **karpenter** - 用于 karpenter namespace（需要 `fargate: enabled` 标签）  
+- **karpenter** - 用于 karpenter namespace（需要 `fargate: enabled` 标签）
 - **portainer** - 用于 portainer namespace（需要 `fargate: enabled` 标签）
-
-### 🎯 **Fargate Profile 最佳实践**
 
 **精确标签控制**：
 - 使用 `fargate: enabled` 标签精确控制哪些 Pod 运行在 Fargate
@@ -136,9 +180,7 @@ aws eks list-fargate-profiles --cluster-name eks-karpenter-env --region us-east-
 aws eks describe-fargate-profile --cluster-name eks-karpenter-env --fargate-profile-name default --region us-east-1 --profile lab
 ```
 
-### 3.2 新 Addon 安装最佳实践
-
-**为新安装的 addon 添加 Fargate 标签的方法：**
+**为 addon 添加 Fargate 标签的方法**：
 
 1. **EKS Addon 配置参数**（推荐）：
 ```bash
@@ -160,20 +202,46 @@ podLabels:
   fargate: enabled
 ```
 
-### 3.3 Pod Identity Associations 配置
+#### 方案 B: NodeGroup 配置
 
-**注意**：Pod Identity 已在 cluster-config.yaml 中预配置，无需手动迁移。
+System NodeGroup 已在 `nodegroup-system.yaml` 中预配置：
+
+- **节点组名称**: `system`
+- **实例类型**: ARM64 Graviton (m8g/m7g/c8g/c7g/r8g/r7g, large/xlarge)
+- **容量**: 最小 1 / 期望 2 / 最大 3
+- **节点标签**: `role: system`
+
+系统组件（CoreDNS、CSI Controllers、Karpenter、LoadBalancer Controller 等）自动调度到 system 节点组，无需额外标签配置。
+
+**验证 NodeGroup**：
+```bash
+eksctl get nodegroup --cluster eks-karpenter-env --profile lab
+kubectl get nodes -l role=system
+```
+
+### 3.2 IAM 认证配置
+
+#### 方案 A: IRSA + Pod Identity 混合
+
+由于 Karpenter 运行在 Fargate，Pod Identity Agent（DaemonSet）无法运行在 Fargate 节点上，因此：
+- **Karpenter** → IRSA（通过 Helm `--set serviceAccount.annotations` 配置）
+- **LoadBalancer Controller** → IRSA
+- **CSI Drivers** → IRSA
+- 详见 `cluster-config.yaml` 中的 `iam.serviceAccounts` 配置
+
+#### 方案 B: Pod Identity 统一
+
+所有组件统一使用 Pod Identity，配置更简洁：
+- **所有 CSI Drivers** → Pod Identity
+- **LoadBalancer Controller** → Pod Identity
+- **Karpenter** → Pod Identity（运行在 EC2 节点，支持 Pod Identity Agent）
+- 详见 `cluster-config-ngs.yaml` 中的 `iam.podIdentityAssociations` 配置
 
 **Pod Identity 优势**（相比传统 IRSA）：
 - ✅ **无需管理 OIDC Provider** - 自动管理
 - ✅ **简化 IAM 信任策略** - 更简洁的权限配置
 - ✅ **更好的跨账户支持** - 企业级权限管理
 - ✅ **未来兼容性保证** - AWS 推荐的现代方式
-
-**已预配置的组件**：
-- `eks-pod-identity-agent` addon - 自动安装
-- 所有服务账户使用 Pod Identity 权限模式
-- OIDC Provider 自动启用
 
 **验证 Pod Identity 配置**：
 ```bash
@@ -185,14 +253,14 @@ aws eks describe-addon \
   --profile lab \
   --query '{Status:status,Version:addonVersion}'
 
-# 查看 Pod Identity Associations（集群创建后）
+# 查看 Pod Identity Associations
 aws eks list-pod-identity-associations \
   --cluster-name eks-karpenter-env \
   --region us-east-1 \
   --profile lab
 ```
 
-### 3.4 从 IRSA 迁移到 Pod Identity（现有集群）
+### 3.3 从 IRSA 迁移到 Pod Identity（现有集群）
 
 **注意**：如果是现有集群需要从 IRSA 迁移到 Pod Identity，推荐使用 migrate-to-pod-identity 迁移工具，支持自动发现需要迁移的 addon 和服务账户，自动更新 IAM 角色信任策略。
 
@@ -240,9 +308,7 @@ kubectl get serviceaccount -n kube-system aws-node -o yaml | grep -i role-arn
 
 ## 4: 存储配置
 
-### ⚠️ **重要说明：CSI Drivers 已自动安装**
-
-**通过 cluster-config.yaml 自动安装的组件**：
+**通过 cluster-config.yaml 自动安装的 CSI Drivers 组件**：
 1. **EBS CSI Driver** - 已通过 addon 自动安装，包含 IAM 权限
 2. **EFS CSI Driver** - 已通过 addon 自动安装，包含 IAM 权限
 3. **S3 CSI Driver** - 已通过 addon 自动安装，包含 IAM 权限
@@ -363,7 +429,7 @@ echo "S3 Bucket: $BUCKET_NAME"
 
 ### 5.1 安装 AWS LoadBalancer Controller
 
-**注意**：服务账户已在 cluster-config.yaml 中自动创建，包含所需的 IAM 权限。
+**注意**：服务账户已在集群配置文件中自动创建，包含所需的 IAM 权限。
 
 ```bash
 # 1. 添加 EKS Helm 仓库
@@ -372,8 +438,11 @@ helm repo update
 
 # 2. 获取 VPC ID
 VPC_ID=$(aws eks describe-cluster --name eks-karpenter-env --query "cluster.resourcesVpcConfig.vpcId" --output text --profile lab)
+```
 
-# 3. 安装 AWS LoadBalancer Controller
+#### 方案 A (Fargate): 需要添加 Fargate 标签
+
+```bash
 helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
   -n kube-system \
   --set clusterName=eks-karpenter-env \
@@ -382,8 +451,23 @@ helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
   --set vpcId=$VPC_ID \
   --set region=us-east-1 \
   --set podLabels.fargate=enabled
+```
 
-# 4. 验证安装
+#### 方案 B (NodeGroup): 无需额外标签
+
+```bash
+helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+  -n kube-system \
+  --set clusterName=eks-karpenter-env \
+  --set serviceAccount.create=false \
+  --set serviceAccount.name=aws-load-balancer-controller \
+  --set vpcId=$VPC_ID \
+  --set region=us-east-1
+```
+
+#### 验证安装
+
+```bash
 kubectl get deployment -n kube-system aws-load-balancer-controller
 kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller
 ```
