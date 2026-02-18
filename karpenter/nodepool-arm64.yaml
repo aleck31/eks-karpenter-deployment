@@ -79,7 +79,7 @@ spec:
             # - t4g.2xlarge    # Graviton2, 8 vCPU, 32 GB
         - key: topology.kubernetes.io/zone
           operator: In
-          values: ["ap-southeast-1a", "ap-southeast-1b", "ap-southeast-1c"]
+          values: ["ap-northeast-1a", "ap-northeast-1c", "ap-northeast-1d"]
   limits:
     cpu: 1000
     memory: 1000Gi
@@ -94,26 +94,22 @@ kind: EC2NodeClass
 metadata:
   name: nodeclass-arm64
 spec:
-  # 使用 Amazon Linux 2023
-  amiFamily: AL2023
+  # AMI 配置 - alias 模式自动选择 EKS-optimized AMI
   amiSelectorTerms:
-    - name: "amazon-eks-node-al2023-arm64-standard-1.33-*"
+    - alias: al2023@latest
   
   instanceStorePolicy: RAID0
-  userData: |
-    #!/bin/bash
-    /usr/bin/nodeadm init --cluster-name eks-karpenter-env
-    
+  
   # 子网和安全组使用 karpenter.sh/discovery 标签
   subnetSelectorTerms:
     - tags:
-        karpenter.sh/discovery: "eks-karpenter-env"
+        karpenter.sh/discovery: "my-eks-env"
   securityGroupSelectorTerms:
     - tags:
-        karpenter.sh/discovery: "eks-karpenter-env"
+        karpenter.sh/discovery: "my-eks-env"
   
   # 统一使用 role 方式  
-  role: "KarpenterNodeInstanceRole-eks-karpenter-env"
+  role: "KarpenterNodeInstanceRole-TKY"
 
   metadataOptions:
     httpPutResponseHopLimit: 2    # 允许容器访问IMDS

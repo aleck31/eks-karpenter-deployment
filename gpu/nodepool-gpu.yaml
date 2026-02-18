@@ -59,7 +59,7 @@ spec:
             - g5.8xlarge     # 1x A10G, 32 vCPU, 128 GB
             - g5.12xlarge    # 4x A10G, 48 vCPU, 192 GB
             
-            # G6e 系列 - NVIDIA L40S (x86_64) - 大模型推理
+            # G6e 系列 - NVIDIA L40S (x86_64) - 高性能推理
             - g6e.xlarge     # 1x L40S, 4 vCPU, 16 GB
             - g6e.2xlarge    # 1x L40S, 8 vCPU, 32 GB
             - g6e.4xlarge    # 1x L40S, 16 vCPU, 64 GB
@@ -87,41 +87,16 @@ kind: EC2NodeClass
 metadata:
   name: nodeclass-gpu
 spec:
-  # AMI 配置 - 使用 AL2023 EKS-optimized NVIDIA AMI
-  amiFamily: AL2023
+  # AMI 配置 - alias 模式自动选择 EKS-optimized AMI
+  # Karpenter 会根据实例类型自动选 nvidia/standard AMI
   amiSelectorTerms:
-    - name: "amazon-eks-node-al2023-x86_64-nvidia-1.33-*"
-      owner: "amazon"
+    - alias: al2023@latest
   
-  # 实例配置 - 本地 NVMe 存储策略
-  instanceStorePolicy: RAID0  # 仅对本地 NVMe 设备做 RAID0
-  
-  # 用户数据 - AL2023 优化配置 + 本地存储挂载
-  userData: |
-    #!/bin/bash
-    /usr/bin/nodeadm init --cluster-name eks-karpenter-env
-    
-    # 确保 kubelet 服务启动
-    systemctl enable kubelet
-    systemctl start kubelet
-    
-    # Configure local NVMe storage mount point
-    mkdir -p /mnt/nvme-cache
-    
-    # Check for local NVMe storage (RAID0 configured by Karpenter)
-    if [ -b /dev/nvme1n1 ]; then
-        # Format and mount local storage for cache
-        mkfs.ext4 /dev/nvme1n1
-        mount /dev/nvme1n1 /mnt/nvme-cache
-        chmod 777 /mnt/nvme-cache
-        
-        # Add to fstab for auto-mount after reboot
-        echo "/dev/nvme1n1 /mnt/nvme-cache ext4 defaults,nofail 0 2" >> /etc/fstab
-        
-        # Create Kubernetes local storage directory
-        mkdir -p /mnt/nvme-cache/k8s-local-storage
-        chmod 777 /mnt/nvme-cache/k8s-local-storage
-    fi
+  # 本地 NVMe 存储策略
+  # AL2023 + RAID0: Karpenter 自动将所有 NVMe instance store 盘组 RAID0
+  # 设备: /dev/md/0, 挂载点: /mnt/k8s-disks/0
+  # 自动成为 kubelet ephemeral-storage，Pod 通过 emptyDir 即可使用 NVMe 高速存储
+  instanceStorePolicy: RAID0
   
   # 安全组和子网
   securityGroupSelectorTerms:

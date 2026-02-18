@@ -23,9 +23,9 @@ spec:
       # 优先级类
       priorityClassName: "system-node-critical"
       containers:
-      - image: nvcr.io/nvidia/k8s-device-plugin:v0.14.5
+      - image: nvcr.io/nvidia/k8s-device-plugin:v0.18.2
         name: nvidia-device-plugin-ctr
-        args: ["--fail-on-init-error=false"]
+        args: ["--fail-on-init-error=false", "--config-file=/etc/nvidia/config.yaml"]
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:
@@ -33,10 +33,18 @@ spec:
         volumeMounts:
           - name: device-plugin
             mountPath: /var/lib/kubelet/device-plugins
+          - name: nvidia-config
+            mountPath: /etc/nvidia
       volumes:
         - name: device-plugin
           hostPath:
             path: /var/lib/kubelet/device-plugins
+        - name: nvidia-config
+          configMap:
+            name: nvidia-device-plugin-config
+            items:
+              - key: config.yaml
+                path: config.yaml
       nodeSelector:
         # 只在有 GPU 的节点上运行
         node-type: gpu
