@@ -68,8 +68,8 @@ spec:
           readOnly: true
         resources:
           requests:
-            cpu: "1"
-            memory: 6Gi
+            cpu: 500m
+            memory: 3Gi
             nvidia.com/gpu: 1
           limits:
             cpu: "2"
@@ -112,18 +112,12 @@ spec:
       affinity:
         nodeAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
-          - weight: 50
+          - weight: 80
             preference:
               matchExpressions:
               - key: node.kubernetes.io/instance-type
                 operator: In
                 values: ["g6.xlarge", "g6.2xlarge", "g6.4xlarge"]
-          - weight: 30
-            preference:
-              matchExpressions:
-              - key: node.kubernetes.io/instance-type
-                operator: In
-                values: ["g5.xlarge", "g5.2xlarge", "g5.4xlarge"]
           - weight: 20
             preference:
               matchExpressions:
