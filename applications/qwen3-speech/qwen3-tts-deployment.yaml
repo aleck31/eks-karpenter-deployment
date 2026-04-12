@@ -24,13 +24,13 @@ spec:
         - bash
         - -c
         - |
-          MODEL_DIR="/models/Qwen3-TTS-CustomVoice"
+          MODEL_DIR="/models/Qwen3-TTS-06B-CustomVoice"
           if ls "$MODEL_DIR"/*.safetensors 1>/dev/null 2>&1 && [ -f "$MODEL_DIR/config.json" ]; then
             echo "Model complete, skipping download"
           else
             echo "Model incomplete or missing, downloading..."
             rm -rf "$MODEL_DIR"
-            huggingface-cli download Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --local-dir "$MODEL_DIR"
+            huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice --local-dir "$MODEL_DIR"
           fi
         volumeMounts:
         - name: models
@@ -50,7 +50,7 @@ spec:
         - name: TTS_BACKEND
           value: "official"
         - name: TTS_MODEL_ID
-          value: "/models/Qwen3-TTS-CustomVoice"
+          value: "/models/Qwen3-TTS-06B-CustomVoice"
         - name: TTS_DEVICE
           value: "auto"
         - name: TTS_DTYPE

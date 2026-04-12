@@ -19,7 +19,7 @@ spec:
     spec:
       containers:
       - name: auto-draw-io
-        image: 222829864634.dkr.ecr.ap-southeast-1.amazonaws.com/auto-draw-io:latest
+        image: 123456789012.dkr.ecr.ap-southeast-1.amazonaws.com/auto-draw-io:latest
         imagePullPolicy: Always
         ports:
         - containerPort: 3000

@@ -28,7 +28,7 @@ EC2 事件 → EventBridge Rules → SQS Queue → Karpenter 轮询
 |------|-----|
 | 集群 | eks-karpenter-env |
 | 区域 | ap-southeast-1 |
-| Account | 222829864634 |
+| Account | 123456789012 |
 | Karpenter 版本 | v1.6.3 (Helm) |
 | Karpenter IAM Role | KarpenterServiceAccount-eks-karpenter-env |
 | 认证方式 | IRSA（Karpenter 跑在 Fargate，不支持 Pod Identity） |
@@ -41,7 +41,7 @@ EC2 事件 → EventBridge Rules → SQS Queue → Karpenter 轮询
 ```bash
 export CLUSTER_NAME=eks-karpenter-env
 export AWS_DEFAULT_REGION=ap-southeast-1
-export AWS_ACCOUNT_ID=222829864634
+export AWS_ACCOUNT_ID=123456789012
 export QUEUE_NAME=karpenter-${CLUSTER_NAME}
 export PROFILE=me
 ```
