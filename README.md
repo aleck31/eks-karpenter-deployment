@@ -10,15 +10,17 @@
 - S3 挂载 (Mountpoint for Amazon S3)
 - Portainer Web 管理界面
 - Pod Identity 认证机制
+- GPU 推理工作负载 (NVIDIA Time-Slicing)
 
 ## 🔧 技术栈
 
-- **AWS EKS**: 托管 Kubernetes 服务 (v1.33)
-- **节点调度**: Fargate Profile + Karpenter v1.6.3
+- **AWS EKS**: 托管 Kubernetes 服务 (v1.35)
+- **节点调度**: EC2 System Node Group (Spot) + Karpenter v1.9.0
 - **认证**: Pod Identity
 - **存储**: EBS GP3, EFS, S3
-- **网络**: ALB + Fargate
+- **网络**: ALB
 - **管理**: Portainer CE
+- **GPU**: NVIDIA Device Plugin + Time-Slicing
 
 ## 📁 文件结构
 
@@ -27,47 +29,47 @@
 ├── eks/                          # EKS集群部署文档及配置文件
 │   ├── create-eks-cluster-guide.md     # 集群创建指南
 │   ├── cluster-config.yaml             # 集群配置
+│   ├── cluster-config-ngs.yaml         # Node Group 配置
+│   ├── nodegroup-system.yaml           # System Node Group 配置
 │   ├── general-storageclasses.yaml     # 通用存储类配置
 │   ├── iam_policy.json                 # LoadBalancer Controller策略
 │   └── fix-eks-web-console-access.md   # Web控制台访问修复
 ├── karpenter/                    # Karpenter部署文档及配置文件
 │   ├── karpenter-deployment-guide.md   # Karpenter部署指南
+│   ├── karpenter-interruption-handling-guide.md  # Spot中断处理指南
 │   ├── karpenter-policy.json           # Karpenter权限策略
 │   ├── karpenter-node-role-trust-policy.json
+│   ├── karpenter-irsa-trust-policy.json
 │   ├── nodepool-arm64.yaml             # ARM64节点池配置
 │   └── nodepool-amd64.yaml             # x86-64节点池配置
 ├── gpu/                          # GPU支持部署文档及配置文件
 │   ├── gpu-deployment-guide.md         # GPU部署指南
 │   ├── nodepool-gpu.yaml               # GPU节点池配置
-│   └── nvidia-device-plugin.yaml       # NVIDIA Device Plugin配置
+│   ├── nvidia-device-plugin.yaml       # NVIDIA Device Plugin配置
+│   ├── nvidia-time-slicing-config.yaml # GPU Time-Slicing配置
+│   └── local-storage-class.yaml        # 本地存储类
 ├── tools/                        # 集群管理工具
 │   ├── aperf/                          # APerf性能分析工具（Job模式）
-│   │   ├── aperf-deployment-guide.md   # APerf部署指南
-│   │   ├── aperf-job.yaml              # APerf Job配置
-│   │   ├── aperf-rbac.yaml             # APerf权限配置
-│   │   ├── aperf-efs-pvc.yaml          # APerf存储配置
-│   │   ├── aperf-namespace.yaml        # 命名空间配置
-│   │   └── kustomization.yaml          # Kustomize配置
-│   └── portainer/                      # Portainer容器管理工具
-│       ├── portainer-deployment-guide.md   # Portainer部署指南
-│       ├── portainer-deployment.yaml       # Portainer部署配置
-│       ├── portainer-efs-storageclass.yaml # EFS存储类
-│       └── portainer-efs-pvc.yaml          # EFS持久卷声明
+│   ├── portainer/                      # Portainer容器管理工具
+│   └── monitoring/                     # Prometheus监控
 ├── applications/                 # 业务应用
-│   └── hackathon-report/               # Hackathon报告应用
-│       ├── hackathon-report.yaml       # 应用部署配置
-│       └── duckchain-report.yaml       # DuckChain报告配置
-├── tests/                        # 测试组件   
+│   ├── qwen3-speech/                   # Qwen3 ASR 语音识别
+│   ├── voxcpm2-tts/                    # VoxCPM2 TTS 语音合成 (OpenAI兼容)
+│   ├── bitwarden/                      # Bitwarden密码管理
+│   ├── convertx/                       # ConvertX文件转换
+│   └── auto-draw-io/                   # Auto-Draw-IO
+├── tests/                        # 测试组件
 │   ├── test-alb-ingress.yaml           # ALB Ingress 测试
 │   ├── test-storage-efs.yaml           # EFS 存储测试
 │   ├── test-storage-s3.yaml            # S3 存储测试
-│   ├── test-storage-gp3.yaml           # GP3 存储测试
+│   ├── test-storage-gp3.yaml          # GP3 存储测试
 │   ├── test-karpenter-simple.yaml      # Karpenter 简单测试
 │   ├── test-gpu-simple.yaml            # GPU 基础检测测试
 │   ├── test-gpu-pytorch.yaml           # PyTorch GPU 功能测试
 │   └── test-gpu-nvme.yaml              # GPU + NVMe 存储测试
 ├── docs/                         # 项目文档
-│   └── karpenter-multi-ebs-best-practices.md  # Karpenter最佳实践文档
+│   ├── karpenter-multi-ebs-best-practices.md  # Karpenter最佳实践
+│   └── oss-tts-model-latency-benchmark.md     # TTS模型延迟对比
 └── README.md                     # 项目说明文档
 ```
 
@@ -100,9 +102,18 @@ tools/portainer/portainer-deployment-guide.md
 tools/aperf/aperf-deployment-guide.md
 ```
 
+### 5. 部署 AI 推理服务 (可选)
+```bash
+# Qwen3 ASR 语音识别
+applications/qwen3-speech/qwen3-speech-deployment-guide.md
+
+# VoxCPM2 TTS 语音合成 (OpenAI兼容接口)
+applications/voxcpm2-tts/README.md
+```
+
 ## 🏛️ EKS 节点调度策略说明
 
-本项目采用 **Fargate + Karpenter 混合架构**，根据工作负载特性选择最适合的调度方式：
+本项目采用 **EC2 Spot + Karpenter 混合架构**，根据工作负载特性选择最适合的调度方式：
 
 ### Fargate Profile vs Karpenter 对比
 
@@ -118,77 +129,64 @@ tools/aperf/aperf-deployment-guide.md
 | **成本效率** | 小规模高效 | 大规模高效 |
 | **管理复杂度** | 低 | 中等 |
 
+> 注: eks-karpenter-env 已从 Fargate 迁移至 EC2 Spot System Node Group，成本降低约 85%。
+
 ### 集群部署架构设计原则
 
-1. **管理组件** → Fargate (稳定、安全)
+1. **系统组件** → EC2 Spot Node Group (稳定、经济)
 2. **数据平面** → Karpenter (灵活、经济)
-3. **存储控制器** → EC2 (特权要求)
+3. **GPU 推理** → Karpenter GPU NodePool (Spot, Time-Slicing)
 4. **应用负载** → 混合 (按需选择)
 
 ### 场景选择指南
 
-#### **🎯 Fargate Profile 适用场景**：
+#### **🎯 EC2 System Node Group 适用场景**：
 - **系统组件** - Karpenter Controller, LoadBalancer Controller
 - **管理工具** - Portainer, 监控组件
-- **间歇性任务** - CI/CD Jobs, 定时任务
-- **安全敏感** - 需要强隔离的应用
-- **不想管理节点** - 无服务器体验
+- **CSI 驱动** - EBS/EFS/S3 CSI Controller
 
 #### **🚀 Karpenter 适用场景**：
 - **应用工作负载** - Web 服务, API 服务
 - **批处理任务** - 数据处理, 机器学习
+- **GPU 推理** - ASR, TTS 等 AI 服务
 - **成本敏感** - 需要 Spot 实例的场景
 - **高密度部署** - 微服务集群
 - **特殊节点配置** - 自定义 AMI, 实例类型
 
-### 调度决策流程
+### Fargate on EKS
+
+**调度决策流程**
 
 ```mermaid
 graph TD
-    A[Pod 调度请求] --> B{ fargate: enabled 标签？}
-    B -->|是| C[Fargate Profile 调度]
-    B -->|否| D[Karpenter 调度]
-    C --> E[Fargate 节点创建<br/>30-60秒]
-    D --> F[EC2 节点创建<br/>1-3分钟]
-    E --> G[按 Pod 资源计费]
-    F --> H[按实例类型计费]
+    A[Pod 调度请求] --> B{匹配 Fargate Profile?}
+    B -->|是| C[Fargate 调度]
+    B -->|否| D{匹配 System Node Group?}
+    D -->|是| E[EC2 Managed Node]
+    D -->|否| F[Karpenter 调度]
+    C --> G[Fargate 节点 30-60秒]
+    E --> H[已有 EC2 节点]
+    F --> I[EC2 Spot 节点 1-3分钟]
 ```
 
-### 标签控制示例
+**标签控制示例**
 
 ```yaml
-# Fargate 调度 - 系统组件
-apiVersion: apps/v1
-kind: Deployment
+# Fargate 调度 (inference-env 系统组件)
 metadata:
-  name: karpenter
-  namespace: karpenter
-spec:
-  template:
-    metadata:
-      labels:
-        fargate: enabled  # 触发 Fargate Profile
-    spec:
-      containers:
-      - name: controller
-        # ...
+  labels:
+    fargate: enabled  # 匹配 Fargate Profile
 
----
-# Karpenter 调度 - 应用负载
-apiVersion: apps/v1  
-kind: Deployment
-metadata:
-  name: web-app
+# Karpenter 调度 (GPU 推理)
 spec:
-  template:
-    spec:
-      # 无 fargate 标签，由 Karpenter 调度到 EC2
-      containers:
-      - name: nginx
-        # ...
+  nodeSelector:
+    node-type: gpu    # 匹配 GPU NodePool
+  tolerations:
+  - key: nvidia.com/gpu
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
 ```
-
-### Fargate on EKS
 
 **Fargate 特性说明**
 
