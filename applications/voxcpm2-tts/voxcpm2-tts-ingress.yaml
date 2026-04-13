@@ -1,0 +1,27 @@
+# VoxCPM2 TTS ALB Ingress - 共享 qwen3-speech ALB
+# :8880 → VoxCPM2 TTS (OpenAI 兼容接口 /v1/audio/speech)
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: voxcpm2-tts-ingress
+  namespace: hosthree
+  annotations:
+    alb.ingress.kubernetes.io/group.name: qwen3-speech
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":8880}]'
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=1800
+spec:
+  ingressClassName: alb
+  rules:
+  - http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: voxcpm2-tts-service
+            port:
+              number: 80

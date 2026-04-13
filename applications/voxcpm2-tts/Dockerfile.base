@@ -1,0 +1,58 @@
+# Nano-vLLM-VoxCPM 基础镜像构建文件
+# 基于官方 nanovllm-voxcpm 仓库，使用预编译 flash-attn wheel 避免源码编译
+#
+# 构建步骤:
+#   1. git clone --depth 1 https://github.com/a710128/nanovllm-voxcpm.git
+#   2. 用此文件替换 deployment/Dockerfile
+#   3. docker build -f deployment/Dockerfile -t nano-vllm-voxcpm-deployment:latest .
+
+ARG CUDA_IMAGE=nvidia/cuda:13.0.2-runtime-ubuntu24.04
+
+FROM ${CUDA_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV UV_NO_PROGRESS=1
+ENV UV_SKIP_WHEEL_FILENAME_CHECK=1
+
+WORKDIR /app
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      build-essential \
+      git \
+      python3-dev \
+      python3-pip \
+      pkg-config \
+      ffmpeg \
+      libsndfile1-dev \
+ && rm -rf /var/lib/apt/lists/* \
+ && rm -f /usr/lib/python3.12/EXTERNALLY-MANAGED
+
+RUN python3 -m pip install --no-cache-dir --break-system-packages uv
+
+# Download flash-attn prebuilt wheel (avoid 30min+ source compilation)
+RUN mkdir -p /tmp/wheels && \
+    python3 -c "import urllib.request; urllib.request.urlretrieve( \
+      'https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn-2.8.3%2Bcu130torch2.11-cp312-cp312-linux_x86_64.whl', \
+      '/tmp/wheels/flash_attn-2.8.3-cp312-cp312-linux_x86_64.whl')"
+
+ENV NANOVLLM_CACHE_DIR=/var/cache/nanovllm
+RUN useradd -m -u 10001 appuser \
+ && mkdir -p "$NANOVLLM_CACHE_DIR" \
+ && chown -R appuser:appuser "$NANOVLLM_CACHE_DIR" \
+ && chown -R appuser:appuser /app \
+ && chown -R appuser:appuser /tmp/wheels
+
+USER appuser
+
+COPY --chown=appuser:appuser . .
+
+# Install all packages, using prebuilt flash-attn wheel (no source build)
+RUN uv sync --all-packages --no-dev -v --compile-bytecode --no-cache --no-editable \
+    --find-links /tmp/wheels \
+    --no-build-package flash-attn
+
+EXPOSE 8000
+
+CMD ["uv", "run", "--no-sync", "fastapi", "run", "deployment/app/main.py", "--host", "0.0.0.0", "--port", "8000"]

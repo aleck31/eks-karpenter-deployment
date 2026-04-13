@@ -1,0 +1,145 @@
+# VoxCPM2 TTS 部署配置 (单容器: Nano-vLLM :8000 + OpenAI Adapter :8880)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: voxcpm2-tts
+  namespace: hosthree
+  labels:
+    app: voxcpm2-tts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: voxcpm2-tts
+  template:
+    metadata:
+      labels:
+        app: voxcpm2-tts
+    spec:
+      initContainers:
+      - name: model-downloader
+        image: 123456789012.dkr.ecr.us-west-2.amazonaws.com/voxcpm2-tts:latest
+        securityContext:
+          runAsUser: 0
+        command:
+        - bash
+        - -c
+        - |
+          MODEL_DIR="/models/VoxCPM2"
+          if [ -f "$MODEL_DIR/config.json" ] && ls "$MODEL_DIR"/*.safetensors 1>/dev/null 2>&1; then
+            echo "Model complete, skipping download"
+          else
+            echo "Downloading VoxCPM2..."
+            rm -rf "$MODEL_DIR"
+            /app/.venv/bin/python -c "from huggingface_hub import snapshot_download; snapshot_download('openbmb/VoxCPM2', local_dir='$MODEL_DIR'); print('Download complete')"
+          fi
+        volumeMounts:
+        - name: models
+          mountPath: /models
+        resources:
+          requests:
+            cpu: 500m
+            memory: 2Gi
+          limits:
+            cpu: 1
+            memory: 4Gi
+
+      containers:
+      - name: voxcpm2-tts
+        image: 123456789012.dkr.ecr.us-west-2.amazonaws.com/voxcpm2-tts:latest
+        env:
+        - name: NANOVLLM_MODEL_PATH
+          value: "/models/VoxCPM2"
+        - name: NANOVLLM_SERVERPOOL_GPU_MEMORY_UTILIZATION
+          value: "0.45"
+        - name: NANOVLLM_SERVERPOOL_DEVICES
+          value: "0"
+        - name: VOXCPM_BACKEND_URL
+          value: "http://localhost:8000"
+        ports:
+        - containerPort: 8880
+          name: http
+        - containerPort: 8000
+          name: backend
+        volumeMounts:
+        - name: models
+          mountPath: /models
+          readOnly: true
+        resources:
+          requests:
+            cpu: 500m
+            memory: 3Gi
+            nvidia.com/gpu: 1
+          limits:
+            cpu: "2"
+            memory: 8Gi
+            nvidia.com/gpu: 1
+        startupProbe:
+          httpGet:
+            path: /ready
+            port: 8880
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8880
+          periodSeconds: 30
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8880
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+
+      volumes:
+      - name: models
+        persistentVolumeClaim:
+          claimName: qwen3-models-pvc
+
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+      nodeSelector:
+        node-type: gpu
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 50
+            preference:
+              matchExpressions:
+              - key: node.kubernetes.io/instance-type
+                operator: In
+                values: ["g6.xlarge", "g6.2xlarge", "g6.4xlarge"]
+          - weight: 30
+            preference:
+              matchExpressions:
+              - key: node.kubernetes.io/instance-type
+                operator: In
+                values: ["g5.xlarge", "g5.2xlarge", "g5.4xlarge"]
+
+      restartPolicy: Always
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: voxcpm2-tts-service
+  namespace: hosthree
+  labels:
+    app: voxcpm2-tts
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 8880
+    protocol: TCP
+    name: http
+  selector:
+    app: voxcpm2-tts
