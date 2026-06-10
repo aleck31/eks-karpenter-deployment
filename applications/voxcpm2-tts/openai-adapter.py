@@ -3,8 +3,7 @@
 import io
 import os
 import httpx
-from fastapi import FastAPI, Request, Response, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, Response, HTTPException
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
 
@@ -45,6 +44,36 @@ CONTENT_TYPES = {
 }
 
 
+def _convert_audio(audio_bytes: bytes, target_format: str) -> bytes:
+    """Convert MP3 audio bytes to target format."""
+    audio = AudioSegment.from_mp3(io.BytesIO(audio_bytes))
+    buf = io.BytesIO()
+    if target_format == "opus":
+        audio.export(buf, format="opus", codec="libopus", bitrate="64k", parameters=["-ar", "48000"])
+    elif target_format == "wav":
+        audio.export(buf, format="wav")
+    elif target_format == "flac":
+        audio.export(buf, format="flac")
+    elif target_format == "aac":
+        audio.export(buf, format="adts", codec="aac")
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported format: {target_format}")
+    return buf.getvalue()
+
+
+async def _call_backend(payload: dict, timeout: float = 180.0) -> bytes:
+    """Call Nano-vLLM /generate endpoint."""
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        try:
+            resp = await client.post(f"{BACKEND_URL}/generate", json=payload)
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(status_code=e.response.status_code, detail=str(e))
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=502, detail=f"Backend error: {e}")
+    return resp.content
+
+
 class SpeechRequest(BaseModel):
     model: str = "tts-1"
     input: str
@@ -55,45 +84,45 @@ class SpeechRequest(BaseModel):
 
 @app.post("/v1/audio/speech")
 async def create_speech(req: SpeechRequest):
-    # Build voice design prefix if voice is mapped
     voice_desc = VOICE_MAP.get(req.voice, req.voice)
     target_text = f"({voice_desc}){req.input}"
 
-    payload = {"target_text": target_text}
+    audio_bytes = await _call_backend({"target_text": target_text})
 
-    async with httpx.AsyncClient(timeout=180.0) as client:
-        try:
-            resp = await client.post(f"{BACKEND_URL}/generate", json=payload)
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=str(e))
-        except httpx.RequestError as e:
-            raise HTTPException(status_code=502, detail=f"Backend error: {e}")
-
-    audio_bytes = resp.content  # MP3 from backend
-
-    # Convert format if needed
-    if req.response_format == "mp3":
-        out_bytes = audio_bytes
-    else:
-        audio = AudioSegment.from_mp3(io.BytesIO(audio_bytes))
-        buf = io.BytesIO()
-        export_params = {}
-        if req.response_format == "opus":
-            export_params = {"codec": "libopus", "bitrate": "64k", "parameters": ["-ar", "48000"]}
-            audio.export(buf, format="opus", **export_params)
-        elif req.response_format == "wav":
-            audio.export(buf, format="wav")
-        elif req.response_format == "flac":
-            audio.export(buf, format="flac")
-        elif req.response_format == "aac":
-            audio.export(buf, format="adts", codec="aac")
-        else:
-            raise HTTPException(status_code=400, detail=f"Unsupported format: {req.response_format}")
-        out_bytes = buf.getvalue()
+    if req.response_format != "mp3":
+        audio_bytes = _convert_audio(audio_bytes, req.response_format)
 
     content_type = CONTENT_TYPES.get(req.response_format, "application/octet-stream")
-    return Response(content=out_bytes, media_type=content_type)
+    return Response(content=audio_bytes, media_type=content_type)
+
+
+class CloneRequest(BaseModel):
+    input: str
+    reference_audio: str  # base64 encoded audio
+    reference_format: str = "wav"  # wav, mp3, flac
+    prompt_text: str | None = None  # 提供则启用续写模式 (输出含参考音频+新内容)
+    response_format: str = "mp3"
+
+
+@app.post("/v1/audio/clone")
+async def clone_speech(req: CloneRequest):
+    payload = {
+        "target_text": req.input,
+        "ref_audio_wav_base64": req.reference_audio,
+        "ref_audio_wav_format": req.reference_format,
+    }
+    if req.prompt_text:
+        payload["prompt_wav_base64"] = req.reference_audio
+        payload["prompt_wav_format"] = req.reference_format
+        payload["prompt_text"] = req.prompt_text
+
+    audio_bytes = await _call_backend(payload, timeout=300.0)
+
+    if req.response_format != "mp3":
+        audio_bytes = _convert_audio(audio_bytes, req.response_format)
+
+    content_type = CONTENT_TYPES.get(req.response_format, "application/octet-stream")
+    return Response(content=audio_bytes, media_type=content_type)
 
 
 @app.get("/health")

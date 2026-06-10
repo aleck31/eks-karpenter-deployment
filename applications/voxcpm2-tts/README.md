@@ -1,6 +1,6 @@
 # VoxCPM2 TTS - OpenAI 兼容 TTS 服务
 
-基于 VoxCPM2 + Nano-vLLM 推理引擎，通过 OpenAI 兼容 adapter 对外提供 `/v1/audio/speech` 接口。
+基于 VoxCPM2 + Nano-vLLM 推理引擎，通过 OpenAI 兼容 adapter 对外提供 `/v1/audio/speech` 和 `/v1/audio/clone` 接口。
 
 ## 架构
 
@@ -75,6 +75,20 @@ curl -X POST http://<service>/v1/audio/speech \
     "response_format": "mp3"
   }' \
   --output speech.mp3
+```
+
+### 声音克隆
+
+```bash
+curl -X POST http://<service>/v1/audio/clone \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": "用克隆的声音说这段话",
+    "reference_audio": "<base64 encoded audio>",
+    "reference_format": "wav",
+    "response_format": "mp3"
+  }' \
+  --output cloned.mp3
 ```
 
 ## 硬件要求
