@@ -289,3 +289,38 @@ kubectl logs -n hosthree <pod-name> -c model-downloader
 # 检查 GPU 资源
 kubectl describe node -l node-type=gpu | grep -A5 "Allocated resources"
 ```
+
+## API 接口
+
+### ASR 非流式 (HTTP)
+
+上传完整音频文件，返回转录文本：
+
+```bash
+curl -X POST http://<ALB>:8000/v1/audio/transcriptions \
+  -F "file=@audio.wav"
+```
+
+响应：
+```json
+{"text": "language English<asr_text>Hello world.", "usage": {"type": "duration", "seconds": 2}}
+```
+
+### ASR 流式 (WebSocket Realtime)
+
+边录边识别，逐词返回：
+
+```
+端点: ws://<ALB>:8000/v1/realtime
+
+协议:
+1. 连接后收到 session.created
+2. 发送 session.update: {"type": "session.update", "model": "/models/Qwen3-ASR-1.7B"}
+3. 发送 commit 开启音频流: {"type": "input_audio_buffer.commit"}
+4. 持续发送音频块: {"type": "input_audio_buffer.append", "audio": "<base64 PCM16 16kHz mono>"}
+5. 实时收到 transcription.delta (逐词)
+6. 发送 commit 结束音频流: {"type": "input_audio_buffer.commit", "final": true}
+7. 收到 transcription.done (完整文本)
+```
+
+音频格式要求：PCM16, 16kHz, mono, base64 编码，建议每块 4KB。

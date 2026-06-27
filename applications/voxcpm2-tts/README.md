@@ -65,11 +65,12 @@ kubectl apply -f voxcpm2-tts-deployment.yaml
 
 ## API 调用示例
 
+### 文本转语音 (非流式)
+
 ```bash
-curl -X POST http://<service>/v1/audio/speech \
+curl -X POST http://<ALB>:8880/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "tts-1",
     "input": "你好，欢迎使用 VoxCPM2 语音合成服务！",
     "voice": "nova",
     "response_format": "mp3"
@@ -77,10 +78,27 @@ curl -X POST http://<service>/v1/audio/speech \
   --output speech.mp3
 ```
 
+### 文本转语音 (流式)
+
+客户端可以边接收边播放，TTFB ~0.37s：
+
+```bash
+curl -X POST http://<ALB>:8880/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": "流式模式下客户端能更快开始播放",
+    "voice": "nova",
+    "stream": true
+  }' \
+  --output speech.mp3
+```
+
+注意: 流式模式仅输出 MP3，不支持格式转码。
+
 ### 声音克隆
 
 ```bash
-curl -X POST http://<service>/v1/audio/clone \
+curl -X POST http://<ALB>:8880/v1/audio/clone \
   -H "Content-Type: application/json" \
   -d '{
     "input": "用克隆的声音说这段话",
@@ -95,5 +113,5 @@ curl -X POST http://<service>/v1/audio/clone \
 
 - GPU: NVIDIA L4 / T4 / A10G (至少 22GB 显存，与 ASR 共享)
 - 模型显存: ~8GB，gpu_memory_utilization 设为 0.45 (~10GB)
-- 与 Qwen3-ASR 共享同一 GPU (time-slicing)，各 0.45，留余量给 CUDA context
-- 推理延迟: 短文本 ~1.5s, 中等文本 ~6s (L4, 非流式)
+- 与 Qwen3-ASR 共享同一 GPU (time-slicing)，ASR 0.35 + TTS 0.45
+- 推理延迟: 短文本 ~1.5s, 中等文本 ~6s (L4, 非流式); 流式 TTFB ~0.37s
