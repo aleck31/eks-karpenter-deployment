@@ -4,6 +4,7 @@ import io
 import os
 import httpx
 from fastapi import FastAPI, Response, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
 
@@ -74,18 +75,40 @@ async def _call_backend(payload: dict, timeout: float = 180.0) -> bytes:
     return resp.content
 
 
+async def _stream_backend(payload: dict) -> StreamingResponse:
+    """Stream MP3 from Nano-vLLM /generate endpoint."""
+    client = httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0))
+
+    async def generate():
+        try:
+            async with client.stream("POST", f"{BACKEND_URL}/generate", json=payload) as resp:
+                if resp.status_code != 200:
+                    raise HTTPException(status_code=resp.status_code, detail="Backend error")
+                async for chunk in resp.aiter_bytes(chunk_size=4096):
+                    yield chunk
+        finally:
+            await client.aclose()
+
+    return StreamingResponse(generate(), media_type="audio/mpeg")
+
+
 class SpeechRequest(BaseModel):
     model: str = "tts-1"
     input: str
     voice: str = "alloy"
     response_format: str = Field(default="mp3")
     speed: float = Field(default=1.0, ge=0.25, le=4.0)
+    stream: bool = Field(default=False)
 
 
 @app.post("/v1/audio/speech")
 async def create_speech(req: SpeechRequest):
     voice_desc = VOICE_MAP.get(req.voice, req.voice)
     target_text = f"({voice_desc}){req.input}"
+
+    if req.stream:
+        # 流式: 透传后端 MP3 流，不支持格式转码
+        return await _stream_backend({"target_text": target_text})
 
     audio_bytes = await _call_backend({"target_text": target_text})
 
