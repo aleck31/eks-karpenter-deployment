@@ -26,7 +26,7 @@ spec:
         - bash
         - -c
         - |
-          MODEL_DIR="/models/VoxCPM2"
+          MODEL_DIR="/shared/VoxCPM2"
           if [ -f "$MODEL_DIR/config.json" ] && ls "$MODEL_DIR"/*.safetensors 1>/dev/null 2>&1; then
             echo "Model complete, skipping download"
           else
@@ -34,9 +34,10 @@ spec:
             rm -rf "$MODEL_DIR"
             /app/.venv/bin/python -c "from huggingface_hub import snapshot_download; snapshot_download('openbmb/VoxCPM2', local_dir='$MODEL_DIR'); print('Download complete')"
           fi
+          mkdir -p /shared/voices
         volumeMounts:
         - name: models
-          mountPath: /models
+          mountPath: /shared
         resources:
           requests:
             cpu: 500m
@@ -50,7 +51,7 @@ spec:
         image: 123456789012.dkr.ecr.us-west-2.amazonaws.com/voxcpm2-tts:latest
         env:
         - name: NANOVLLM_MODEL_PATH
-          value: "/models/VoxCPM2"
+          value: "/shared/VoxCPM2"
         - name: NANOVLLM_SERVERPOOL_GPU_MEMORY_UTILIZATION
           value: "0.45"
         - name: NANOVLLM_SERVERPOOL_MAX_MODEL_LEN
@@ -59,6 +60,8 @@ spec:
           value: "0"
         - name: VOXCPM_BACKEND_URL
           value: "http://localhost:8000"
+        - name: VOICES_DIR
+          value: "/shared/voices"
         ports:
         - containerPort: 8880
           name: http
@@ -66,8 +69,7 @@ spec:
           name: backend
         volumeMounts:
         - name: models
-          mountPath: /models
-          readOnly: true
+          mountPath: /shared
         resources:
           requests:
             cpu: 500m
