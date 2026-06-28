@@ -53,6 +53,8 @@ spec:
           value: "/models/VoxCPM2"
         - name: NANOVLLM_SERVERPOOL_GPU_MEMORY_UTILIZATION
           value: "0.45"
+        - name: NANOVLLM_SERVERPOOL_MAX_MODEL_LEN
+          value: "8192"
         - name: NANOVLLM_SERVERPOOL_DEVICES
           value: "0"
         - name: VOXCPM_BACKEND_URL
