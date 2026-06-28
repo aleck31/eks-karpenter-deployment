@@ -52,7 +52,7 @@ spec:
         - --gpu-memory-utilization
         - "0.35"
         - --max-model-len
-        - "4096"
+        - "16384"
         - --host
         - "0.0.0.0"
         - --port
@@ -61,7 +61,7 @@ spec:
         - --hf-overrides
         - '{"architectures": ["Qwen3ASRRealtimeGeneration"]}'
         ports:
-        - containerPort: 8000
+        - containerPort: 8001
           name: http
         volumeMounts:
         - name: models
@@ -79,21 +79,21 @@ spec:
         startupProbe:
           httpGet:
             path: /health
-            port: 8000
+            port: 8001
           periodSeconds: 10
           timeoutSeconds: 5
           failureThreshold: 60
         livenessProbe:
           httpGet:
             path: /health
-            port: 8000
+            port: 8001
           periodSeconds: 30
           timeoutSeconds: 10
           failureThreshold: 3
         readinessProbe:
           httpGet:
             path: /health
-            port: 8000
+            port: 8001
           periodSeconds: 10
           timeoutSeconds: 5
           failureThreshold: 3
@@ -140,7 +140,7 @@ spec:
   type: ClusterIP
   ports:
   - port: 80
-    targetPort: 8000
+    targetPort: 8001
     protocol: TCP
     name: http
   selector:
