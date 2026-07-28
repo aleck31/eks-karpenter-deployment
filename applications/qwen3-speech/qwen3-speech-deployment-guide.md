@@ -303,24 +303,138 @@ curl -X POST http://<ALB>:8000/v1/audio/transcriptions \
 
 响应：
 ```json
-{"text": "language English<asr_text>Hello world.", "usage": {"type": "duration", "seconds": 2}}
+{"text": "Hello world.", "language": "english", "duration": 2.5}
 ```
 
 ### ASR 流式 (WebSocket Realtime)
 
-边录边识别，逐词返回：
+实时语音识别，边录边转录。
+
+**端点**: `ws://<ALB>:8000/v1/realtime`
+
+**音频格式**: PCM16, 16kHz, mono, base64 编码，建议每块 4KB
+
+#### 协议说明
+
+每个转录段由三步组成：
+
+1. **`commit`**（不带 final）— 开始一个新的转录段，初始化 buffer
+2. **`append`**（可多次）— 持续发送音频数据
+3. **`commit {final: true}`** — 结束当前段，触发转录，**buffer 自动清空**
+
+| 事件 | 方向 | 说明 |
+|------|------|------|
+| `session.created` | ← Server | 连接建立确认 |
+| `session.update` | → Client | 验证模型（必须） |
+| `input_audio_buffer.commit` | → Client | 开始新段 |
+| `input_audio_buffer.append` | → Client | 发送音频块 |
+| `input_audio_buffer.commit {final:true}` | → Client | 结束段，触发转录 |
+| `transcription.delta` | ← Server | 流式 token 片段 |
+| `transcription.done` | ← Server | 段最终结果（只发 1 次） |
+
+#### 关键行为（实测验证）
+
+- **buffer 不累积**：每次 `commit {final: true}` 后 buffer 自动清空，下一段从零开始
+- **必须有初始 commit**：append 之前必须先发一个不带 final 的 commit，否则音频不被处理
+- **单连接可复用**：不需要每段重连，在同一连接中循环 commit→append→final 即可
+- **每段只有 1 个 done**：收到 `transcription.done` 即表示本段结束
+- **无 VAD**：服务端不会自动断句，分段完全由客户端决定
+- **没有 `input_audio_buffer.clear`**：不需要手动清空，final 自动处理
+
+#### 完整调用示例：连续 3 句话，得到 3 条独立结果
 
 ```
-端点: ws://<ALB>:8000/v1/realtime
+→ [建立 WebSocket 连接]
+← {"type": "session.created", "id": "sess-xxx"}
 
-协议:
-1. 连接后收到 session.created
-2. 发送 session.update: {"type": "session.update", "model": "/models/Qwen3-ASR-1.7B"}
-3. 发送 commit 开启音频流: {"type": "input_audio_buffer.commit"}
-4. 持续发送音频块: {"type": "input_audio_buffer.append", "audio": "<base64 PCM16 16kHz mono>"}
-5. 实时收到 transcription.delta (逐词)
-6. 发送 commit 结束音频流: {"type": "input_audio_buffer.commit", "final": true}
-7. 收到 transcription.done (完整文本)
+→ {"type": "session.update", "model": "/models/Qwen3-ASR-1.7B"}
+
+=== 句子 1 ===
+→ {"type": "input_audio_buffer.commit"}
+→ {"type": "input_audio_buffer.append", "audio": "<base64>"}
+→ {"type": "input_audio_buffer.append", "audio": "<base64>"}
+→ {"type": "input_audio_buffer.commit", "final": true}
+← {"type": "conversation.item.input_audio_transcription.delta", "delta": "你"}
+← {"type": "conversation.item.input_audio_transcription.delta", "delta": "好"}
+← {"type": "conversation.item.input_audio_transcription.completed", "transcript": "你好", "language": "chinese"}
+
+=== 句子 2（buffer 已自动清空）===
+→ {"type": "input_audio_buffer.commit"}
+→ {"type": "input_audio_buffer.append", "audio": "<base64>"}
+→ {"type": "input_audio_buffer.commit", "final": true}
+← {"type": "conversation.item.input_audio_transcription.delta", "delta": "谢谢"}
+← {"type": "conversation.item.input_audio_transcription.completed", "transcript": "谢谢", "language": "chinese"}
+
+=== 句子 3 ===
+→ {"type": "input_audio_buffer.commit"}
+→ {"type": "input_audio_buffer.append", "audio": "<base64>"}
+→ {"type": "input_audio_buffer.commit", "final": true}
+← {"type": "conversation.item.input_audio_transcription.delta", "delta": "再见"}
+← {"type": "conversation.item.input_audio_transcription.completed", "transcript": "再见", "language": "chinese"}
 ```
 
-音频格式要求：PCM16, 16kHz, mono, base64 编码，建议每块 4KB。
+> 注：通过 adapter 时，事件名为 OpenAI 格式（`conversation.item.input_audio_transcription.*`）。
+> 直连 vLLM 后端时为原始格式（`transcription.delta` / `transcription.done`）。
+
+#### 常见错误
+
+| 错误用法 | 现象 | 原因 |
+|----------|------|------|
+| 没发初始 commit 直接 append | timeout 无响应 | buffer 未初始化 |
+| commit 不带 final | timeout 无响应 | 不带 final 不触发转录 |
+| final 后直接 append（不重新 commit） | timeout 或结果异常 | buffer 已清空但未重新初始化 |
+
+#### 单段长度限制
+
+- max-model-len: 16384 tokens
+- 约可处理 5-6 分钟连续音频/段
+- 建议每段 30 秒 - 2 分钟，用客户端 VAD 检测静音切分
+
+#### Python 客户端示例
+
+```python
+import asyncio
+import base64
+import json
+import websockets
+import numpy as np
+
+async def transcribe_segments(audio_segments: list[bytes], server_url: str):
+    """
+    audio_segments: list of PCM16 16kHz mono bytes
+    """
+    async with websockets.connect(server_url) as ws:
+        await ws.recv()  # session.created
+        await ws.send(json.dumps({
+            "type": "session.update",
+            "model": "/models/Qwen3-ASR-1.7B"
+        }))
+
+        results = []
+        for seg in audio_segments:
+            # 开始段
+            await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+
+            # 分块发送 (4KB/块)
+            for i in range(0, len(seg), 4096):
+                chunk = base64.b64encode(seg[i:i+4096]).decode()
+                await ws.send(json.dumps({
+                    "type": "input_audio_buffer.append",
+                    "audio": chunk
+                }))
+
+            # 结束段
+            await ws.send(json.dumps({
+                "type": "input_audio_buffer.commit",
+                "final": True
+            }))
+
+            # 等待结果
+            async for msg in ws:
+                data = json.loads(msg)
+                if data["type"] == "transcription.done":
+                    results.append(data["text"])
+                    break
+
+        return results
+```

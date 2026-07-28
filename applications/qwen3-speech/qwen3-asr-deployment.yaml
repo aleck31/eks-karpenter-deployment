@@ -112,6 +112,14 @@ spec:
         node-type: gpu
       affinity:
         nodeAffinity:
+          # 硬约束: 仅调度到 24GB 显存 GPU (L4/A10G)
+          # g4dn 保留给其他小模型 GPU 应用使用
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node.kubernetes.io/instance-type
+                operator: In
+                values: ["g6.xlarge", "g6.2xlarge", "g6.4xlarge", "g5.xlarge", "g5.2xlarge", "g5.4xlarge"]
           preferredDuringSchedulingIgnoredDuringExecution:
           - weight: 80
             preference:
@@ -119,12 +127,6 @@ spec:
               - key: node.kubernetes.io/instance-type
                 operator: In
                 values: ["g6.xlarge", "g6.2xlarge", "g6.4xlarge"]
-          - weight: 20
-            preference:
-              matchExpressions:
-              - key: node.kubernetes.io/instance-type
-                operator: In
-                values: ["g4dn.xlarge", "g4dn.2xlarge", "g4dn.4xlarge"]
 
       restartPolicy: Always
 
