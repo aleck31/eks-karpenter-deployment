@@ -21,6 +21,7 @@
 - **网络**: ALB
 - **管理**: Portainer CE
 - **GPU**: NVIDIA Device Plugin + Time-Slicing
+- **可观测性**: Prometheus (指标) + Loki (日志) + Amazon Managed Grafana (可视化)
 
 ## 📁 文件结构
 
@@ -51,7 +52,8 @@
 ├── tools/                        # 集群管理工具
 │   ├── aperf/                          # APerf性能分析工具（Job模式）
 │   ├── portainer/                      # Portainer容器管理工具
-│   └── monitoring/                     # Prometheus监控
+│   ├── monitoring/                     # Prometheus 指标采集
+│   └── logging/                        # Alloy + Loki 日志聚合
 ├── applications/                 # 业务应用
 │   ├── qwen3-speech/                   # Qwen3 ASR 语音识别
 │   ├── voxcpm2-tts/                    # VoxCPM2 TTS 语音合成 (OpenAI兼容)
@@ -100,6 +102,12 @@ tools/portainer/portainer-deployment-guide.md
 
 # 部署 APerf 性能分析工具（Job模式）
 tools/aperf/aperf-deployment-guide.md
+
+# 部署 Prometheus 指标采集
+tools/monitoring/monitoring-deployment-guide.md
+
+# 部署 Alloy + Loki 日志聚合
+tools/logging/logging-deployment-guide.md
 ```
 
 ### 5. 部署 AI 推理服务 (可选)
@@ -110,6 +118,59 @@ applications/qwen3-speech/qwen3-speech-deployment-guide.md
 # VoxCPM2 TTS 语音合成 (OpenAI兼容接口)
 applications/voxcpm2-tts/README.md
 ```
+
+## 📊 可观测性架构
+
+指标与日志各自独立采集，统一在 Amazon Managed Grafana 中查询。
+
+```mermaid
+graph LR
+    subgraph 节点
+        A["容器 stdout/stderr<br/>/var/log/pods/"]
+        B["节点 journal<br/>kubelet / containerd"]
+        C[node-exporter]
+    end
+
+    subgraph 集群内
+        D["Alloy<br/>(DaemonSet)"]
+        E["Loki<br/>(SingleBinary)"]
+        F["Prometheus"]
+    end
+
+    subgraph AWS
+        G[("S3<br/>chunk + index")]
+        H[("EFS<br/>WAL")]
+        I["Amazon Managed<br/>Grafana"]
+        J[("CloudWatch Logs<br/>控制平面")]
+    end
+
+    A -->|读文件| D
+    B -->|读 journal| D
+    D -->|push| E
+    E --> G
+    E --- H
+    C -->|scrape| F
+    E -->|LogQL| I
+    F -->|PromQL| I
+    J -->|数据源| I
+```
+
+**分工说明**
+
+| 数据 | 采集方 | 存储 | 保留期 |
+|------|--------|------|--------|
+| 容器 stdout/stderr | Alloy (读 hostPath 文件) | S3 | 30 天 |
+| 节点 journal | Alloy | S3 | 30 天 |
+| 节点/集群指标 | Prometheus (scrape) | EBS PVC | 按 PVC 容量 |
+| EKS 控制平面日志 | AWS 托管 | CloudWatch Logs | 30 天 |
+
+**几个关键设计**
+
+- **Alloy 直接读 `/var/log/pods/` 文件**，不走 `loki.source.kubernetes`。后者经 Kubernetes API 转发至 kubelet:10250，该链路不通时（新节点 bootstrap、安全组变更）会丢失整个节点的日志。
+- **Loki 的 chunk 存 S3，WAL 存 EFS**。集群节点全为 Spot，Pod 重建可能换 AZ，EBS 卷有 AZ 亲和性会导致挂载失败。
+- **保留期由 Loki compactor 执行**，不用 S3 生命周期。后者按对象时间删除会造成 index 引用已删除的 chunk。
+- **Grafana 不部署在集群内**，使用 AMG 托管；经 VPC 连通性 + internal ALB 访问集群内的 Loki 与 Prometheus。
+- **应用写在容器内文件的日志采集不到**，需改为输出 stdout。
 
 ## 🏛️ EKS 节点调度策略说明
 

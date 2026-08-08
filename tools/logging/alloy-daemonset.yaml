@@ -1,0 +1,115 @@
+# Alloy DaemonSet + RBAC，每节点采集容器日志与 journal
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: alloy
+  namespace: logging
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: alloy
+rules:
+  # 仅需 Pod 元数据用于推导日志路径；日志读 hostPath 文件，不经 API
+  - apiGroups: [""]
+    resources: ["nodes", "pods"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: alloy
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: alloy
+subjects:
+  - kind: ServiceAccount
+    name: alloy
+    namespace: logging
+
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: alloy
+  namespace: logging
+  labels:
+    app: alloy
+spec:
+  selector:
+    matchLabels:
+      app: alloy
+  template:
+    metadata:
+      labels:
+        app: alloy
+      annotations:
+        prometheus.io/scrape: 'true'
+        prometheus.io/port: '12345'
+        prometheus.io/path: '/metrics'
+    spec:
+      serviceAccountName: alloy
+      # 日志采集属于节点基础设施，与 node-exporter / kube-proxy 同级。
+      # 小节点内存吃紧时需抢占低优先级 Pod，否则该节点日志全部丢失。
+      priorityClassName: system-node-critical
+      securityContext:
+        runAsUser: 0
+      containers:
+        - name: alloy
+          image: grafana/alloy:v1.18.1
+          args:
+            - run
+            - /etc/alloy/config.alloy
+            - --storage.path=/var/lib/alloy
+            - --server.http.listen-addr=0.0.0.0:12345
+          env:
+            # 用于 discovery.kubernetes 的 field selector，只发现本节点 Pod
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - name: http
+              containerPort: 12345
+          volumeMounts:
+            - name: config
+              mountPath: /etc/alloy
+            - name: varlog
+              mountPath: /var/log
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/alloy
+          resources:
+            requests:
+              # 实测用量 66-73Mi
+              cpu: 50m
+              memory: 80Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: 12345
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: config
+          configMap:
+            name: alloy-config
+        # 含 pods/（容器日志）与 journal/（节点日志）
+        - name: varlog
+          hostPath:
+            path: /var/log
+        # 位置记录存节点本地，Pod 重启后可续读，避免丢失重启间隔的日志
+        - name: data
+          hostPath:
+            path: /var/lib/alloy
+            type: DirectoryOrCreate
+      tolerations:
+        # 覆盖所有节点，含带 taint 的专用节点
+        - operator: Exists

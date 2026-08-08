@@ -1,0 +1,131 @@
+# Alloy 采集配置：容器 stdout/stderr（读 /var/log/pods 文件）+ 节点 journal
+#
+# 不用 loki.source.kubernetes：它经 API 转发至 kubelet:10250，
+# 该链路不通时（新节点 bootstrap、安全组变更）会丢失整个节点的日志。
+#
+# 应用写在容器内文件的日志采集不到，需改为输出 stdout
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alloy-config
+  namespace: logging
+data:
+  config.alloy: |
+    // ---------- 容器日志 ----------
+
+    // 只发现本节点 Pod
+    discovery.kubernetes "pods" {
+      role = "pod"
+
+      selectors {
+        role  = "pod"
+        field = "spec.nodeName=" + sys.env("NODE_NAME")
+      }
+    }
+
+    // 由 Pod 元数据推导日志路径并构造标签，只保留低基数字段
+    discovery.relabel "pods" {
+      targets = discovery.kubernetes.pods.targets
+
+      // /var/log/pods/<ns>_<pod>_<uid>/<container>/*.log，前缀用 * 通配
+      rule {
+        source_labels = ["__meta_kubernetes_pod_uid", "__meta_kubernetes_pod_container_name"]
+        separator     = "/"
+        action        = "replace"
+        replacement   = "/var/log/pods/*$1/*.log"
+        target_label  = "__path__"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_namespace"]
+        target_label  = "namespace"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_name"]
+        target_label  = "pod"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_container_name"]
+        target_label  = "container"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_label_app"]
+        target_label  = "app"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_node_name"]
+        target_label  = "node"
+      }
+      rule {
+        replacement  = "container"
+        target_label = "job"
+      }
+    }
+
+    local.file_match "pods" {
+      path_targets = discovery.relabel.pods.output
+    }
+
+    loki.source.file "pods" {
+      targets    = local.file_match.pods.targets
+      forward_to = [loki.process.pods.receiver]
+      // 无位置记录时从文件末尾开始。
+      // 否则会重放历史日志，被 Loki 以 "entry too far behind" 拒收
+      // （乱序窗口 = max_chunk_age / 2）
+      tail_from_end = true
+    }
+
+    // 容器日志为 CRI 格式（<时间戳> <stream> <flag> <内容>），须用 stage.cri 解析
+    loki.process "pods" {
+      forward_to = [loki.write.default.receiver]
+
+      stage.cri {}
+
+      // 丢弃空行
+      stage.drop {
+        expression = "^\\s*$"
+      }
+
+      // filename 是高基数标签，会膨胀索引
+      stage.label_drop {
+        values = ["filename"]
+      }
+    }
+
+    // ---------- 节点 journal ----------
+
+    discovery.relabel "journal" {
+      targets = []
+
+      rule {
+        source_labels = ["__journal__systemd_unit"]
+        target_label  = "unit"
+      }
+      rule {
+        source_labels = ["__journal__hostname"]
+        target_label  = "node"
+      }
+    }
+
+    // journal 非 CRI 格式，不走 loki.process.pods
+    loki.source.journal "node" {
+      // 须 <= Loki 乱序窗口（max_chunk_age / 2），否则历史条目被拒收
+      max_age       = "1h"
+      path          = "/var/log/journal"
+      relabel_rules = discovery.relabel.journal.rules
+      forward_to    = [loki.write.default.receiver]
+      labels        = {
+        job = "journal",
+      }
+    }
+
+    // ---------- 写入 ----------
+
+    loki.write "default" {
+      endpoint {
+        url = "http://loki.logging.svc.cluster.local:3100/loki/api/v1/push"
+      }
+      external_labels = {
+        cluster = "eks-karpenter-env",
+      }
+    }
