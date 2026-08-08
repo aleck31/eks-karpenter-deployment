@@ -121,6 +121,16 @@ addons:
     version: latest
   - name: aws-efs-csi-driver
     version: latest
+    # controller 有 3 个容器，resources 会统一套用到每个容器上
+    configurationValues: |-
+      controller:
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
   - name: aws-mountpoint-s3-csi-driver
     version: latest
 

@@ -105,9 +105,9 @@ aws iam put-role-policy --role-name "KarpenterIRSA-${ROLE_SUFFIX}" \
 ### 2.3 使用 Helm 安装 Karpenter
 
 ```bash
-# 安装 Karpenter v1.9.0（IRSA 模式，Fargate 调度）
+# 安装 Karpenter（版本请对照上游最新稳定版）
 helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter \
-  --version "1.9.0" \
+  --version "1.9.2" \
   --namespace "karpenter" \
   --create-namespace \
   --set "settings.clusterName=${CLUSTER_NAME}" \
@@ -117,10 +117,18 @@ helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter \
   --set "serviceAccount.name=karpenter" \
   --set "serviceAccount.annotations.eks\.amazonaws\.com/role-arn=arn:aws:iam::${AWS_ACCOUNT_ID}:role/KarpenterIRSA-${ROLE_SUFFIX}" \
   --set "podLabels.fargate=enabled" \
-  --set controller.resources.requests.cpu=1 \
-  --set controller.resources.requests.memory=1Gi \
+  --set controller.resources.requests.cpu=200m \
+  --set controller.resources.requests.memory=512Mi \
   --set controller.resources.limits.cpu=1 \
   --set controller.resources.limits.memory=1Gi
+```
+
+> **resources 说明**：上游默认 `cpu: 1 / memory: 1Gi` 根据集群规模进行调整。
+>
+> CPU 可压缩，request 仅决定争抢时的保底份额，突发可用至 limit；
+> 内存不可压缩，超 request 会被优先驱逐、超 limit 会 OOMKill，且用量随集群规模增长。
+>
+> 集群规模增长后需重新核对：`kubectl top pod -n karpenter`。
 
 # 验证安装（Fargate 调度需 30-60s）
 sleep 60 && kubectl get pods -n karpenter
