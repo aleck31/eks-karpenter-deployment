@@ -29,12 +29,14 @@ EC2 事件 → EventBridge Rules → SQS Queue → Karpenter 轮询
 | 集群 | eks-karpenter-env |
 | 区域 | ap-southeast-1 |
 | Account | 123456789012 |
-| Karpenter 版本 | v1.6.3 (Helm) |
-| Karpenter IAM Role | KarpenterServiceAccount-eks-karpenter-env |
-| 认证方式 | IRSA（Karpenter 跑在 Fargate，不支持 Pod Identity） |
+| Karpenter 版本 | v1.9.0 (Helm) |
+| Karpenter IAM Role | eksctl 生成的 Pod Identity Role（名称动态，见下方查询命令） |
+| 认证方式 | Pod Identity |
 | AWS Profile | me |
 
-> **注意**：Karpenter 部署在 Fargate 上，Fargate 目前不支持 Pod Identity（[roadmap #2274](https://github.com/aws/containers-roadmap/issues/2274)），因此 SQS 权限通过 IRSA Role 的内联策略添加。
+> **注意**：若 Karpenter 运行在 Fargate 上，Fargate 不支持 Pod Identity
+> （[roadmap #2274](https://github.com/aws/containers-roadmap/issues/2274)），
+> 需改用 IRSA Role 并相应调整下方角色查询方式。
 
 ## 1. 设置环境变量
 
@@ -44,6 +46,18 @@ export AWS_DEFAULT_REGION=ap-southeast-1
 export AWS_ACCOUNT_ID=123456789012
 export QUEUE_NAME=karpenter-${CLUSTER_NAME}
 export PROFILE=me
+
+# 查询 Karpenter 的 Pod Identity 角色（名称由 eksctl 生成，非固定）
+ASSOC_ID=$(aws eks list-pod-identity-associations \
+  --cluster-name ${CLUSTER_NAME} --region ${AWS_DEFAULT_REGION} --profile ${PROFILE} \
+  --query "associations[?serviceAccount=='karpenter'].associationId" --output text)
+
+export KARPENTER_ROLE=$(aws eks describe-pod-identity-association \
+  --cluster-name ${CLUSTER_NAME} --association-id ${ASSOC_ID} \
+  --region ${AWS_DEFAULT_REGION} --profile ${PROFILE} \
+  --query 'association.roleArn' --output text | awk -F/ '{print $NF}')
+
+echo "Karpenter Role: ${KARPENTER_ROLE}"
 ```
 
 ## 2. 创建 SQS 队列
@@ -140,35 +154,36 @@ done
 
 ## 4. 添加 SQS 权限到 Karpenter IAM Role
 
+SQS 权限已包含在仓库的 `karpenter/karpenter-policy.json` 中（`SQSInterruptionHandling` 语句，
+资源通配 `arn:aws:sqs:*:*:karpenter-*` 以匹配 `karpenter-${CLUSTER_NAME}` 命名约定）。
+
+**新建集群**：按 `karpenter-deployment-guide.md` 创建 KarpenterControllerPolicy 时已自动包含，无需额外操作。
+
+**已有集群**：为托管策略创建新版本使其生效。
+
 ```bash
-aws iam put-role-policy \
-  --role-name "KarpenterServiceAccount-${CLUSTER_NAME}" \
-  --policy-name KarpenterSQSInterruptionPolicy \
-  --policy-document '{
-    "Version": "2012-10-17",
-    "Statement": [
-      {
-        "Sid": "SQSInterruptionHandling",
-        "Effect": "Allow",
-        "Action": [
-          "sqs:DeleteMessage",
-          "sqs:GetQueueUrl",
-          "sqs:ReceiveMessage"
-        ],
-        "Resource": "arn:aws:sqs:'${AWS_DEFAULT_REGION}':'${AWS_ACCOUNT_ID}':'${QUEUE_NAME}'"
-      }
-    ]
-  }' \
+POLICY_ARN=$(aws iam list-attached-role-policies --role-name ${KARPENTER_ROLE} \
+  --profile ${PROFILE} --query "AttachedPolicies[?PolicyName=='KarpenterControllerPolicy'].PolicyArn" \
+  --output text)
+
+aws iam create-policy-version \
+  --policy-arn ${POLICY_ARN} \
+  --policy-document file://karpenter/karpenter-policy.json \
+  --set-as-default \
   --profile ${PROFILE}
 ```
+
+> IAM 托管策略最多保留 5 个版本，超限时需先删除旧版本：
+> `aws iam delete-policy-version --policy-arn ${POLICY_ARN} --version-id vN --profile ${PROFILE}`
 
 验证：
 
 ```bash
-aws iam get-role-policy \
-  --role-name "KarpenterServiceAccount-${CLUSTER_NAME}" \
-  --policy-name KarpenterSQSInterruptionPolicy \
-  --profile ${PROFILE}
+V=$(aws iam get-policy --policy-arn ${POLICY_ARN} --profile ${PROFILE} \
+  --query 'Policy.DefaultVersionId' --output text)
+
+aws iam get-policy-version --policy-arn ${POLICY_ARN} --version-id ${V} --profile ${PROFILE} \
+  --query 'PolicyVersion.Document.Statement[?Sid==`SQSInterruptionHandling`]' --output json
 ```
 
 ## 5. 更新 Karpenter Helm 配置
@@ -177,12 +192,30 @@ aws iam get-role-policy \
 # 登录 ECR Public（token 可能过期）
 aws ecr-public get-login-password --region us-east-1 --profile ${PROFILE} | helm registry login --username AWS --password-stdin public.ecr.aws
 
+# 动态读取当前已部署版本，避免本次操作意外触发版本升级
+# （版本升级应作为独立变更执行，不要和配置调整混在一起）
+CHART_VER=$(helm list -n karpenter -o json | python3 -c \
+  "import sys,json;print([r['chart'] for r in json.load(sys.stdin) if r['name']=='karpenter'][0].rsplit('-',1)[1])")
+echo "当前 chart 版本: ${CHART_VER}"
+
 helm upgrade karpenter oci://public.ecr.aws/karpenter/karpenter \
-  --version "1.6.3" \
+  --version "${CHART_VER}" \
   --namespace karpenter \
-  --reuse-values \
+  --reset-then-reuse-values \
   --set "settings.interruptionQueue=${QUEUE_NAME}"
 ```
+
+> **重要**：使用 `--reset-then-reuse-values`（helm ≥ 3.14），不要用 `--reuse-values`。
+> `--reuse-values` 复用的是上一个 release 的**全部计算后 values**，其中包含旧 chart 的默认镜像 tag/digest。
+> 这会导致 chart 版本号更新了、controller 镜像却仍停留在旧版本（`helm list` 显示新版本，
+> 但 `kubectl get deployment karpenter -o jsonpath='{...image}'` 仍是旧 tag）。
+> `--reset-then-reuse-values` 会重置为新 chart 默认值，再叠加用户显式设定的值，行为符合预期。
+>
+> 升级后务必核对实际镜像：
+> ```bash
+> kubectl get deployment karpenter -n karpenter \
+>   -o jsonpath='{.spec.template.spec.containers[0].image}'
+> ```
 
 验证 Karpenter 重启并加载配置：
 
@@ -218,8 +251,10 @@ aws sqs get-queue-attributes \
 
 ```bash
 # 1. 移除 Helm 中断队列配置
+CHART_VER=$(helm list -n karpenter -o json | python3 -c \
+  "import sys,json;print([r['chart'] for r in json.load(sys.stdin) if r['name']=='karpenter'][0].rsplit('-',1)[1])")
 helm upgrade karpenter oci://public.ecr.aws/karpenter/karpenter \
-  --version "1.6.3" --namespace karpenter --reuse-values \
+  --version "${CHART_VER}" --namespace karpenter --reset-then-reuse-values \
   --set "settings.interruptionQueue="
 
 # 2. 删除 EventBridge 规则
@@ -233,10 +268,12 @@ aws sqs delete-queue \
   --queue-url "https://sqs.${AWS_DEFAULT_REGION}.amazonaws.com/${AWS_ACCOUNT_ID}/${QUEUE_NAME}" \
   --region ${AWS_DEFAULT_REGION} --profile ${PROFILE}
 
-# 4. 删除 IAM 内联策略
-aws iam delete-role-policy \
-  --role-name "KarpenterServiceAccount-${CLUSTER_NAME}" \
-  --policy-name KarpenterSQSInterruptionPolicy \
+# 4. 回退 IAM 策略版本（如需移除 SQS 权限）
+#    先从 karpenter-policy.json 中删除 SQSInterruptionHandling 语句，再创建新版本
+aws iam create-policy-version \
+  --policy-arn ${POLICY_ARN} \
+  --policy-document file://karpenter/karpenter-policy.json \
+  --set-as-default \
   --profile ${PROFILE}
 ```
 
@@ -244,11 +281,15 @@ aws iam delete-role-policy \
 
 ### Karpenter 日志报 SQS 权限错误
 ```bash
-# 确认 IAM 策略已附加
-aws iam get-role-policy \
-  --role-name "KarpenterServiceAccount-${CLUSTER_NAME}" \
-  --policy-name KarpenterSQSInterruptionPolicy \
-  --profile ${PROFILE}
+# 确认托管策略当前版本含 SQS 权限
+V=$(aws iam get-policy --policy-arn ${POLICY_ARN} --profile ${PROFILE} \
+  --query 'Policy.DefaultVersionId' --output text)
+aws iam get-policy-version --policy-arn ${POLICY_ARN} --version-id ${V} --profile ${PROFILE} \
+  --query 'PolicyVersion.Document.Statement[?Sid==`SQSInterruptionHandling`]' --output json
+
+# 确认 Pod Identity 关联生效（Karpenter 需重启才会拿到新凭证）
+aws eks list-pod-identity-associations --cluster-name ${CLUSTER_NAME} \
+  --region ${AWS_DEFAULT_REGION} --profile ${PROFILE} --output table
 
 # 确认队列存在
 aws sqs get-queue-url --queue-name ${QUEUE_NAME} --region ${AWS_DEFAULT_REGION} --profile ${PROFILE}
