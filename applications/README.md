@@ -14,6 +14,17 @@
 │   ├── bitwarden-configmap.yaml
 │   ├── bitwarden-deployment.yaml
 │   └── bitwarden-efs-pvc.yaml
+├── firecrawl/                   # Firecrawl 网页抓取 API (多组件栈)
+│   ├── firecrawl-deployment-guide.md
+│   ├── firecrawl-configmap.yaml
+│   ├── firecrawl-secret.yaml.example   # 凭据模板，复制后填值
+│   ├── firecrawl-infra.yaml            # Redis + PostgreSQL + RabbitMQ
+│   ├── firecrawl-deployment.yaml       # api + worker + playwright
+│   ├── firecrawl-extract-worker.yaml
+│   ├── firecrawl-ingress.yaml
+│   ├── firecrawl-ebs-pvc.yaml
+│   ├── deploy.sh
+│   └── verify.sh
 └── [future-apps]/               # 未来的应用部署
 ```
 

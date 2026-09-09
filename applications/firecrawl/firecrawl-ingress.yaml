@@ -1,0 +1,32 @@
+# 可选，deploy.sh 需 --with-ingress 才部署。
+#
+# API 无鉴权，能访问者可让集群抓任意 URL，也可借此探测 VPC 内部地址。
+# 故只开 internal ALB，不要像 convertx / portainer 那样挂 CloudFront 到公网
+# （那些应用自带登录，Firecrawl 没有）。
+# 集群内消费者直接用 http://api.firecrawl.svc.cluster.local:3002，无需 Ingress。
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: firecrawl
+  namespace: firecrawl
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/healthcheck-path: /v0/health/readiness
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    # ALB 默认 60s 空闲超时会截断跑满 60s 的抓取请求
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=120
+    alb.ingress.kubernetes.io/inbound-cidrs: 10.1.0.0/16
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 3002

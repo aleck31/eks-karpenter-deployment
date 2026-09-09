@@ -1,0 +1,66 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: firecrawl-config
+  namespace: firecrawl
+data:
+  HOST: "0.0.0.0"
+  PORT: "3002"
+  WORKER_PORT: "3005"
+  NUQ_WORKER_PORT: "3006"
+  NUQ_PREFETCH_WORKER_PORT: "3011"
+  EXTRACT_WORKER_PORT: "3004"
+
+  REDIS_URL: "redis://redis:6379"
+  REDIS_RATE_LIMIT_URL: "redis://redis:6379"
+  # 末尾 /scrape 必需。cluster-install 示例漏了，compose 与 helm 默认值都有
+  PLAYWRIGHT_MICROSERVICE_URL: "http://playwright-service:3000/scrape"
+  NUQ_RABBITMQ_URL: "amqp://rabbitmq:5672"
+
+  IS_KUBERNETES: "true"
+  ENV: "production"
+  LOGGING_LEVEL: "INFO"
+
+  # 无鉴权。改 true 需配套 DB schema，单改此值不生效
+  USE_DB_AUTHENTICATION: "false"
+
+  NUM_WORKERS_PER_QUEUE: "8"
+  # 必须等于 nuq-worker 的 replicas
+  NUQ_WORKER_COUNT: "2"
+
+  FIRECRAWL_APP_SCHEME: "http"
+  FIRECRAWL_APP_HOST: "api"
+  FIRECRAWL_APP_PORT: "3002"
+
+  # 仅 json / summary / extract 需要，其余 format 留空即可
+  # 模型要求：OpenAI 兼容 /v1 + 支持 strict json_schema 结构化输出
+  # 输入被硬编码截到 120k token，模型上下文更大也无收益
+  # Bedrock 原生提供兼容端点，无需网关（认证走 API key，非 SigV4，Pod Identity 用不上）:
+  #   OPENAI_BASE_URL=https://bedrock-runtime.us-west-2.amazonaws.com/openai/v1
+  #   MODEL_NAME=us.openai.gpt-5.6-luna
+  OPENAI_BASE_URL: ""
+  MODEL_NAME: ""
+  MODEL_EMBEDDING_NAME: ""
+  # 抽取路径硬编码 openai provider，此值不生效；接 Ollama 用 OPENAI_BASE_URL
+  OLLAMA_BASE_URL: ""
+
+  PROXY_SERVER: ""
+  PROXY_USERNAME: ""
+  # 留空则 search 落到 DuckDuckGo 兜底，可用；配此项为质量/配额升级
+  SEARXNG_ENDPOINT: ""
+  SEARXNG_ENGINES: ""
+  SEARXNG_CATEGORIES: ""
+  SELF_HOSTED_WEBHOOK_URL: ""
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: playwright-service-config
+  namespace: firecrawl
+data:
+  PORT: "3000"
+  # 禁止回调集群内网地址
+  ALLOW_LOCAL_WEBHOOKS: "false"
+  BLOCK_MEDIA: "true"
+  MAX_CONCURRENT_PAGES: "6"

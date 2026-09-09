@@ -1,0 +1,73 @@
+# 可选。仅 /v2/extract 端点需要（消费独立的 extract-queue）。
+# scrape 的 json / summary / deterministicJson format 不需要本组件 ——
+# 它们在 transformerStack 里由 nuq-worker 执行，只需配好 LLM provider。
+# 前置：firecrawl-secret.OPENAI_API_KEY + firecrawl-config.OPENAI_BASE_URL/MODEL_NAME
+#      模型须支持 strict json_schema 结构化输出
+# 部署：kubectl apply -f firecrawl-extract-worker.yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: extract-worker
+  namespace: firecrawl
+  labels:
+    app: extract-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: extract-worker
+  template:
+    metadata:
+      labels:
+        app: extract-worker
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: extract-worker
+          image: ghcr.io/firecrawl/firecrawl:2.11.209@sha256:cebde741a0e6e8711f6714da0aab507f1285d3a083594728df23a31e19eeb7fb
+          imagePullPolicy: IfNotPresent
+          command: ["node"]
+          args: ["--max-old-space-size=1280", "dist/src/services/extract-worker.js"]
+          ports:
+            - containerPort: 3004
+              name: http
+          env:
+            - name: FLY_PROCESS_GROUP
+              value: "extract-worker"
+            - name: NUQ_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          envFrom:
+            - configMapRef:
+                name: firecrawl-config
+            - secretRef:
+                name: firecrawl-secret
+            - secretRef:
+                name: firecrawl-db
+          resources:
+            requests:
+              cpu: 200m
+              memory: 768Mi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
+          livenessProbe:
+            httpGet:
+              path: /liveness
+              port: 3004
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3004
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3

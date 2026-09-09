@@ -1,0 +1,241 @@
+# Redis / RabbitMQ / NuQ PostgreSQL
+# RabbitMQ 上游 cluster-install 示例缺失，但 API 通过 NUQ_RABBITMQ_URL 依赖它
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: firecrawl
+  labels:
+    app: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      containers:
+        - name: redis
+          image: redis:8.2-alpine
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              if [ -n "$REDIS_PASSWORD" ]; then
+                exec redis-server --bind 0.0.0.0 --requirepass "$REDIS_PASSWORD" --maxmemory 384mb --maxmemory-policy allkeys-lru
+              else
+                exec redis-server --bind 0.0.0.0 --maxmemory 384mb --maxmemory-policy allkeys-lru
+              fi
+          ports:
+            - containerPort: 6379
+              name: redis
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: firecrawl-secret
+                  key: REDIS_PASSWORD
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          readinessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: firecrawl
+  labels:
+    app: redis
+spec:
+  type: ClusterIP
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      protocol: TCP
+      port: 6379
+      targetPort: 6379
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rabbitmq
+  namespace: firecrawl
+  labels:
+    app: rabbitmq
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rabbitmq
+  template:
+    metadata:
+      labels:
+        app: rabbitmq
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      containers:
+        - name: rabbitmq
+          # 上游用 3-management；此处去掉管理插件省内存。若 4.x 出兼容问题回退该标签
+          image: rabbitmq:4.1-alpine
+          ports:
+            - containerPort: 5672
+              name: amqp
+          env:
+            - name: RABBITMQ_VM_MEMORY_HIGH_WATERMARK
+              value: "0.6"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+          livenessProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "-q", "check_running"]
+            initialDelaySeconds: 40
+            periodSeconds: 30
+            timeoutSeconds: 15
+            failureThreshold: 4
+          readinessProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 6
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq
+  namespace: firecrawl
+  labels:
+    app: rabbitmq
+spec:
+  type: ClusterIP
+  selector:
+    app: rabbitmq
+  ports:
+    - name: amqp
+      protocol: TCP
+      port: 5672
+      targetPort: 5672
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nuq-postgres
+  namespace: firecrawl
+  labels:
+    app: nuq-postgres
+spec:
+  replicas: 1
+  # RWO PVC 无法被新旧 Pod 同时挂载，滚动更新会死锁
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: nuq-postgres
+  template:
+    metadata:
+      labels:
+        app: nuq-postgres
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      containers:
+        - name: nuq-postgres
+          # 仅有 latest 标签，用 digest 固定
+          image: ghcr.io/firecrawl/nuq-postgres:latest@sha256:aed86f62858f29bd971abddcdeb301c12888098d2cf5d33c1ba42b053bc460f6
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POSTGRES_USER
+              value: "postgres"
+            - name: POSTGRES_DB
+              # 镜像内置 pg_cron 配置指向该库，不可改
+              value: "postgres"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: firecrawl-db
+                  key: POSTGRES_PASSWORD
+            # gp3 是 ext4，卷根有 lost+found，initdb 判定目录非空后跳过并启动失败
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+              name: postgres
+          volumeMounts:
+            - name: postgres-storage
+              mountPath: /var/lib/postgresql/data
+              subPath: pgdata
+          resources:
+            requests:
+              cpu: 100m
+              memory: 384Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres", "-d", "postgres"]
+            initialDelaySeconds: 40
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 4
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres", "-d", "postgres"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+      volumes:
+        - name: postgres-storage
+          persistentVolumeClaim:
+            claimName: firecrawl-nuq-postgres-pvc
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nuq-postgres
+  namespace: firecrawl
+  labels:
+    app: nuq-postgres
+spec:
+  type: ClusterIP
+  selector:
+    app: nuq-postgres
+  ports:
+    - name: postgres
+      protocol: TCP
+      port: 5432
+      targetPort: 5432
