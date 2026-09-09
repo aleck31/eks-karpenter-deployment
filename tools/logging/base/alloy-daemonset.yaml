@@ -66,6 +66,10 @@ spec:
             - /etc/alloy/config.alloy
             - --storage.path=/var/lib/alloy
             - --server.http.listen-addr=0.0.0.0:12345
+          envFrom:
+            # 由 overlay 的 configMapGenerator 提供（CLUSTER_NAME 等）
+            - configMapRef:
+                name: logging-env
           env:
             # 用于 discovery.kubernetes 的 field selector，只发现本节点 Pod
             - name: NODE_NAME

@@ -3,3 +3,8 @@
 *.info
 *secret.yaml
 tmp
+
+# Kustomize 真实环境 overlay（含集群名、桶名等环境相关取值）
+# 结构见 overlays/example/，复制后填入真实值
+tools/*/overlays/*-env/
+applications/*/overlays/*-env/

@@ -25,8 +25,9 @@ data:
     # 不配 access_key，凭证由 Pod Identity 提供
     storage_config:
       aws:
-        bucketnames: eks-env-logs-xxxx-ap-southeast-1
-        region: ap-southeast-1
+        # 由 overlay 通过 ConfigMap 注入，Loki 以 -config.expand-env=true 展开
+        bucketnames: ${LOKI_S3_BUCKET}
+        region: ${AWS_REGION}
         s3forcepathstyle: false
       tsdb_shipper:
         active_index_directory: /loki/tsdb-index

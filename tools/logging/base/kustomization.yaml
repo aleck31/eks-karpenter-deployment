@@ -1,10 +1,8 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-# 统一 namespace。若需改用其他 namespace，改这一处即可
-# （注意：Pod Identity 关联也须使用相同 namespace）
-namespace: logging
-
+# base 只描述结构，不含任何环境相关取值。
+# namespace、S3 桶名、集群名等由 overlays/<env>/ 注入。
 resources:
   - logging-namespace.yaml
   - loki-config.yaml

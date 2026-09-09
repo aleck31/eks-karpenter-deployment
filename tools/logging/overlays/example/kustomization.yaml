@@ -1,0 +1,23 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 示例 overlay：展示需要按环境提供哪些值。
+# 用法：复制本目录为 overlays/<你的集群名>/，填入真实值。
+# 真实 overlay 不入库（.gitignore 覆盖 overlays/*-env/）。
+
+namespace: logging
+
+resources:
+  - ../../base
+
+# 环境相关取值集中在此，base 通过 envFrom 读取
+configMapGenerator:
+  - name: logging-env
+    literals:
+      - CLUSTER_NAME=my-cluster
+      - AWS_REGION=ap-southeast-1
+      - LOKI_S3_BUCKET=my-loki-bucket
+
+# 内容变化时不追加 hash 后缀，避免每次 apply 都滚动重启
+generatorOptions:
+  disableNameSuffixHash: true

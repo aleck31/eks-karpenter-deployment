@@ -27,7 +27,7 @@ Logs Insights 另按扫描量 $0.005/GB 计费；Loki + S3 存储约 $0.023/GB �
 | Account | 123456789012 |
 | 节点架构 | arm64 (Graviton) — 所有镜像须支持 arm64 |
 | 容量类型 | 全部 Spot |
-| S3 桶 | eks-env-logs-xxxx-ap-southeast-1 (Loki 专用) |
+| S3 桶 | Loki 专用，实际值见 overlays/<env>/kustomization.yaml |
 | 保留期 | 30 天 |
 | Loki 版本 | 3.6.15 |
 | Alloy 版本 | v1.18.1 |
@@ -78,7 +78,7 @@ S3 生命周期仅用于清理未完成的分片上传（卫生项）。
 export CLUSTER_NAME=eks-karpenter-env
 export AWS_DEFAULT_REGION=ap-southeast-1
 export AWS_ACCOUNT_ID=123456789012
-export BUCKET=eks-env-logs-xxxx-ap-southeast-1
+export BUCKET=<你的 Loki 专用桶名>
 export PROFILE=me
 ```
 
@@ -196,34 +196,37 @@ aws eks list-pod-identity-associations --cluster-name ${CLUSTER_NAME} \
 
 ## 4. 部署 Loki 与 Alloy
 
-> **注意**：仓库中的桶名与 Account ID 已脱敏（`xxxx` / `123456789012`），
-> 部署时需替换为实际值，否则 Loki 会指向不存在的桶。
+采用 kustomize base + overlay：`base/` 只含通用结构，环境相关取值（集群名、区域、S3 桶名）
+由 `overlays/<env>/` 通过 ConfigMap 注入，Loki 以 `-config.expand-env=true` 展开，
+Alloy 以 `sys.env()` 读取。仓库中不含真实取值，无需部署前手工替换。
 
 ```bash
-sed "s/eks-env-logs-xxxx-ap-southeast-1/${BUCKET}/g" tools/logging/loki-config.yaml \
-  | kubectl apply -f -
-kubectl apply -k tools/logging/ --prune=false 2>/dev/null || true
+# 首次：复制示例 overlay 并填入真实值
+cp -r tools/logging/overlays/example tools/logging/overlays/${CLUSTER_NAME}
+# 编辑 kustomization.yaml 中的 CLUSTER_NAME / AWS_REGION / LOKI_S3_BUCKET
+
+kubectl apply -k tools/logging/overlays/${CLUSTER_NAME}
 ```
 
-或先用 kustomize 渲染再整体替换：
+> 真实 overlay 目录由 `.gitignore` 排除（`tools/*/overlays/*-env/`），不会误提交。
 
-```bash
-kubectl kustomize tools/logging/ \
-  | sed "s/eks-env-logs-xxxx-ap-southeast-1/${BUCKET}/g" \
-  | kubectl apply -f -
+目录结构：
+
+```
+tools/logging/
+├── base/                        # 入库：通用清单，无环境相关取值
+│   ├── kustomization.yaml
+│   ├── logging-namespace.yaml
+│   ├── loki-config.yaml         # 桶名/区域用 ${LOKI_S3_BUCKET} / ${AWS_REGION}
+│   ├── loki-deployment.yaml     # Deployment + Service + SA + WAL PVC (efs-sc)
+│   ├── loki-ingress.yaml        # internal ALB Ingress（供 AMG 访问）
+│   ├── alloy-config.yaml        # 容器日志 + 节点 journal 采集
+│   └── alloy-daemonset.yaml     # DaemonSet + RBAC
+└── overlays/
+    ├── example/                 # 入库：示例取值，供复制
+    └── <cluster-name>/          # 不入库：真实取值
 ```
 
-清单文件说明：
-
-| 文件 | 内容 |
-|------|------|
-| `logging-namespace.yaml` | namespace `logging` |
-| `loki-config.yaml` | Loki 配置 ConfigMap（S3 后端、30 天保留、compactor） |
-| `loki-deployment.yaml` | Loki Deployment + Service + ServiceAccount + WAL PVC (efs-sc) |
-| `loki-ingress.yaml` | internal ALB Ingress（供 AMG 访问） |
-| `alloy-config.yaml` | Alloy 配置 ConfigMap（容器日志 + 节点 journal） |
-| `alloy-daemonset.yaml` | Alloy DaemonSet + RBAC + ServiceAccount |
-| `kustomization.yaml` | kustomize 编排 |
 
 ## 5. 验证部署
 
