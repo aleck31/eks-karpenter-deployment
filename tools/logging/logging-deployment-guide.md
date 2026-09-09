@@ -201,14 +201,26 @@ aws eks list-pod-identity-associations --cluster-name ${CLUSTER_NAME} \
 Alloy 以 `sys.env()` 读取。仓库中不含真实取值，无需部署前手工替换。
 
 ```bash
-# 首次：复制示例 overlay 并填入真实值
-cp -r tools/logging/overlays/example tools/logging/overlays/${CLUSTER_NAME}
-# 编辑 kustomization.yaml 中的 CLUSTER_NAME / AWS_REGION / LOKI_S3_BUCKET
+# 1. 复制示例 overlay，目录名建议用语义化环境名（如 general-env / inference-env）
+cp -r tools/logging/overlays/example tools/logging/overlays/<env-name>
 
-kubectl apply -k tools/logging/overlays/${CLUSTER_NAME}
+# 2. 编辑三个取值
+#    CLUSTER_NAME    实际集群名，会成为 Loki 的 cluster 标签
+#    AWS_REGION      桶所在区域
+#    LOKI_S3_BUCKET  第 2 节创建的桶名
+vi tools/logging/overlays/<env-name>/kustomization.yaml
+
+# 3. 部署（先确认 kubectl context 指向对应集群）
+kubectl config current-context
+kubectl apply -k tools/logging/overlays/<env-name>
 ```
 
-> 真实 overlay 目录由 `.gitignore` 排除（`tools/*/overlays/*-env/`），不会误提交。
+> `.gitignore` 默认忽略 `overlays/` 下的全部目录、仅放行 `example/`，
+> 因此无论目录取什么名字，填入的真实取值都不会被误提交。
+
+> **注意**：overlay 不决定部署到哪个集群，`kubectl` 的当前 context 才决定。
+> 若 context 与 overlay 不匹配，命令仍会成功，但会在错误的集群里写入另一个环境的
+> `cluster` 标签和 S3 桶。部署前务必核对 context。
 
 目录结构：
 
@@ -224,8 +236,11 @@ tools/logging/
 │   └── alloy-daemonset.yaml     # DaemonSet + RBAC
 └── overlays/
     ├── example/                 # 入库：示例取值，供复制
-    └── <cluster-name>/          # 不入库：真实取值
+    └── <env-name>/              # 不入库：真实取值（如 general-env）
 ```
+
+> `base/` 不能单独部署——`${LOKI_S3_BUCKET}` 不会被展开，且缺少 `logging-env` ConfigMap。
+> 这是有意设计，以排除"用占位符值部署成功"的可能。验证渲染可用 `overlays/example/`。
 
 
 ## 5. 验证部署

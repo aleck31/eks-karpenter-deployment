@@ -4,7 +4,10 @@
 *secret.yaml
 tmp
 
-# Kustomize 真实环境 overlay（含集群名、桶名等环境相关取值）
-# 结构见 overlays/example/，复制后填入真实值
-tools/*/overlays/*-env/
-applications/*/overlays/*-env/
+# Kustomize overlay：默认忽略全部环境目录，仅放行 example
+# 环境 overlay 含集群名、桶名等真实取值，不入库
+# 用法：cp -r overlays/example overlays/<你的集群名>，填入真实值
+tools/*/overlays/*
+!tools/*/overlays/example/
+applications/*/overlays/*
+!applications/*/overlays/example/
