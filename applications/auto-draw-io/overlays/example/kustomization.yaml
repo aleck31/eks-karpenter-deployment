@@ -1,0 +1,27 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 示例 overlay：展示需要按环境提供哪些值。
+# 用法：复制本目录为 overlays/<环境名>/（如 general-env），填入真实值。
+
+namespace: your-namespace
+
+resources:
+  - ../../base
+
+# 合并进 base 的 ConfigMap，只覆盖随环境变化的键
+configMapGenerator:
+  - name: auto-draw-io-config
+    behavior: merge
+    literals:
+      - APP_BASE_URL=https://autodraw.yourdomain.com
+      - AWS_REGION=us-west-2
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+# 替换镜像仓库为实际 ECR
+images:
+  - name: 123456789012.dkr.ecr.ap-southeast-1.amazonaws.com/auto-draw-io
+    newName: <your-account-id>.dkr.ecr.<your-region>.amazonaws.com/auto-draw-io
+    newTag: latest

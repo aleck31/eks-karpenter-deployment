@@ -107,22 +107,41 @@ stringData:
 
 ## 🚀 部署步骤
 
-### 步骤 1: 部署配置
-```bash
-# 创建 ConfigMap
-kubectl apply -f auto-draw-io-configmap.yaml
+采用 kustomize base + overlay：`base/` 只含通用结构与环境无关配置，
+域名、区域、ECR 账号、namespace 由 `overlays/<env>/` 注入，仓库中不含真实取值。
 
-# 创建 Secret
-kubectl apply -f auto-draw-io-secret.yaml
+### 步骤 1: 创建 Secret
+
+Secret 含真实凭据（Bedrock token、访问码、Tavily API key），不纳入 kustomize 管理，
+需单独创建。模块根目录的 `auto-draw-io-secret.yaml` 由 `.gitignore` 排除。
+
+```bash
+kubectl create secret generic auto-draw-io-secret -n <namespace> \
+  --from-literal=AWS_BEARER_TOKEN_BEDROCK='<your-token>' \
+  --from-literal=ACCESS_CODE='<your-access-code>' \
+  --from-literal=TAVILY_API_KEY='<your-tavily-key>'
 ```
 
-### 步骤 2: 部署应用
+### 步骤 2: 准备 overlay
+
 ```bash
-# 部署应用 (Deployment + Service + Internal Ingress)
-kubectl apply -f auto-draw-io-deployment.yaml
+# 复制示例，目录名用语义化环境名（如 general-env）
+cp -r overlays/example overlays/<env-name>
+
+# 编辑四项取值：namespace / APP_BASE_URL / AWS_REGION / ECR 镜像地址
+vi overlays/<env-name>/kustomization.yaml
 ```
 
-### 步骤 3: 验证内网部署
+> `.gitignore` 默认忽略 `overlays/` 下全部目录、仅放行 `example/`，真实取值不会误提交。
+
+### 步骤 3: 部署
+
+```bash
+kubectl config current-context          # 先确认目标集群
+kubectl apply -k overlays/<env-name>
+```
+
+### 步骤 4: 验证内网部署
 ```bash
 # 检查 Pod 状态
 kubectl get pods -n hostwo -l app=auto-draw-io

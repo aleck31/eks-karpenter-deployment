@@ -2,14 +2,9 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: auto-draw-io-config
-  namespace: hostwo
 data:
-  # AI Provider Configuration
+  # 以下为环境无关配置。
+  # APP_BASE_URL / AWS_REGION 由 overlays/<env>/ 以 behavior: merge 注入
   AI_PROVIDER: "bedrock"
   AI_MODELS: "global.anthropic.claude-sonnet-5,global.anthropic.claude-opus-5,global.anthropic.claude-opus-4-8"
-  
-  # AWS Bedrock Configuration
-  AWS_REGION: "us-west-2"
-  
-  # Temperature (Optional)
   TEMPERATURE: "0"
