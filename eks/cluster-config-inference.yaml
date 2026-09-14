@@ -1,0 +1,56 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+# inference-env 的 Pod Identity 关联与 addon 配置。
+#
+# 该集群原先系统组件跑在 Fargate 上，而 Pod Identity Agent 是 DaemonSet、不支持 Fargate，
+# 因此只能用 IRSA。系统组件迁至 EC2 托管节点组后，此限制解除。
+#
+# 本文件采用 roleARN 复用现有 IRSA 角色，而非让 eksctl 新建角色：
+#   - 策略零改动，不存在权限遗漏风险（Karpenter 角色含自定义策略 + SQS 内联策略）
+#   - 信任策略中保留原 OIDC 语句，可随时回退
+# 迁移验证稳定后，再从信任策略移除 OIDC 语句并清理 SA 上的 role-arn 注解。
+#
+# 执行：
+#   eksctl create podidentityassociation -f eks/cluster-config-inference.yaml
+#   eksctl update addon -f eks/cluster-config-inference.yaml
+#
+# 前置：角色信任策略需先允许 pods.eks.amazonaws.com，见 eks/pod-identity-trust-policy.json
+
+metadata:
+  name: inference-env
+  region: us-west-2
+
+iam:
+  podIdentityAssociations:
+    # VPC CNI
+    - namespace: kube-system
+      serviceAccountName: aws-node
+      roleARN: arn:aws:iam::123456789012:role/eksctl-inference-env-addon-vpc-cni-Role1-EXAMPLE
+
+    # EBS CSI Driver
+    - namespace: kube-system
+      serviceAccountName: ebs-csi-controller-sa
+      roleARN: arn:aws:iam::123456789012:role/eksctl-inference-env-addon-aws-ebs-csi-driver-Role1-EXAMPLE
+
+    # AWS Load Balancer Controller
+    - namespace: kube-system
+      serviceAccountName: aws-load-balancer-controller
+      roleARN: arn:aws:iam::123456789012:role/AmazonEKSLoadBalancerControllerRole-usw2
+
+    # Karpenter（角色含 KarpenterControllerPolicy + KarpenterSQSInterruptionPolicy）
+    - namespace: karpenter
+      serviceAccountName: karpenter
+      roleARN: arn:aws:iam::123456789012:role/KarpenterIRSA-inference-env
+
+addons:
+  # Pod Identity Agent：DaemonSet，为同节点 Pod 提供凭据
+  - name: eks-pod-identity-agent
+    version: latest
+
+  # 以下 addon 原带 podLabels.fargate=enabled 以匹配 Fargate Profile，
+  # 迁至 EC2 后移除该标签（configurationValues 置空即恢复默认）
+  - name: coredns
+    version: latest
+  - name: metrics-server
+    version: latest

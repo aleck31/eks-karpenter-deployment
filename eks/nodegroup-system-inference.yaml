@@ -1,0 +1,64 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+# inference-env 的系统组件节点组。
+# 用途：承载系统组件（Karpenter, ALB Controller, CoreDNS, CSI Controllers, metrics-server），
+# 取代原先的 Fargate Profile。
+#
+# 为何需要托管节点组而非交给 Karpenter：Karpenter 自身也要跑在节点上，
+# 若其节点由自己管理则形成循环依赖。托管节点组由 EKS ASG 直接管理，不依赖集群内组件。
+metadata:
+  name: inference-env
+  region: us-west-2
+  version: "1.35"
+
+# 该集群的 eksctl-inference-env-cluster 栈状态为 IMPORT_COMPLETE（资源导入而非正常创建），
+# eksctl 因此判定为非自身管理的集群，要求显式声明 VPC。
+# 新加坡集群 eks/nodegroup-system.yaml 无需此段，因其集群栈为正常 CREATE_COMPLETE。
+#
+# 注意：该栈仍在管理 VPC、集群、Fargate Pod 执行角色等资源，
+# 不要手动删除这些资源，否则造成栈漂移。
+#
+# 以下为占位符，执行前替换为实际值：
+#   VPC_ID=$(aws eks describe-cluster --name inference-env --region us-west-2 \
+#     --query 'cluster.resourcesVpcConfig.vpcId' --output text)
+#   SG_ID=$(aws eks describe-cluster --name inference-env --region us-west-2 \
+#     --query 'cluster.resourcesVpcConfig.clusterSecurityGroupId' --output text)
+#   私有子网：aws ec2 describe-subnets --filters Name=vpc-id,Values=$VPC_ID \
+#     Name=map-public-ip-on-launch,Values=false
+vpc:
+  id: vpc-xxxxxxxxxxxxxxxxx
+  securityGroup: sg-xxxxxxxxxxxxxxxxx
+  subnets:
+    private:
+      us-west-2a: { id: subnet-xxxxxxxxxxxxxxxxa }
+      us-west-2b: { id: subnet-xxxxxxxxxxxxxxxxb }
+      us-west-2c: { id: subnet-xxxxxxxxxxxxxxxxc }
+
+managedNodeGroups:
+  - name: system
+    # 机型池放宽以提高 Spot 可得性；均为 ARM64 Graviton，成本低于同规格 x86
+    instanceTypes:
+      - m8g.large
+      - m8g.xlarge
+      - m7g.large
+      - m7g.xlarge
+      - c8g.large
+      - c8g.xlarge
+      - c7g.large
+      - c7g.xlarge
+      - r8g.large
+      - r8g.xlarge
+      - r7g.large
+      - r7g.xlarge
+    amiFamily: AmazonLinux2023
+    # 最少保留 1 台，避免 Spot 中断时系统组件全部无处调度
+    minSize: 1
+    maxSize: 3
+    desiredCapacity: 2
+    privateNetworking: true
+    spot: true
+    labels:
+      role: system
+    tags:
+      nodegroup-role: system
