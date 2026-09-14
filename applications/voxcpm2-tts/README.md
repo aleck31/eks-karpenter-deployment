@@ -19,12 +19,20 @@
 
 ### 两种模式
 
-1. **Controllable Cloning**（已注册 voice）— 使用参考音频克隆音色，声音一致性高
-2. **Voice Design**（未注册 voice）— 使用文字描述生成声音，每次可能略有差异
+1. **Controllable Cloning**（已注册 voice）— 使用参考音频克隆音色，音色一致
+2. **Voice Design**（voice 值为文字描述）— 按描述生成声音，音色每次不同
 
-已注册的 voice 优先走 Cloning 模式。当 voice ID 不在注册表中时，fallback 到 Voice Design。
+传入的 `voice` 值命中注册表时走 Cloning，否则整个字符串被当作描述走 Voice Design。
+
+注意 Cloning 保证的是**音色一致**，不是逐字节可复现 —— VoxCPM2 是 diffusion 模型，同一参考音频同一文本两次调用的输出字节不同，但音色相同。
+
+已注册 voice 的参考音频若丢失，`/v1/audio/speech` 返回 **503** 而非退化到 Voice Design。同一个 voice ID 返回不同音色属于违背契约，因此宁可失败。
 
 ### 预置 Voice
+
+13 个预置 voice 均已配置真实参考音频（非文字描述），走 Cloning 模式，音色稳定。
+
+它们在 API 中标记为 `type: builtin`，**不可删除、不可替换参考音频**（返回 403）。这些录音是从 42 个候选样本中逐个试听筛选出的，模型输出不可复现，覆盖后无法还原。修改 `name` / `description` 允许。
 
 | Voice | 特点 | 适合场景 |
 |-------|------|---------|
@@ -45,27 +53,72 @@
 ### Voice 管理 API
 
 ```bash
-# 列出所有 voice
+# 列出所有 voice（摘要：voice_id / name / description / type / builtin）
 GET /v1/audio/voices
 
 # 注册新 voice（上传参考音频，自动归一化为 16kHz mono -16 LUFS）
 POST /v1/audio/voices
   Form: voice_id, name, description, audio(file)
+  → 403 若 voice_id 是预置 voice
 
-# 查询单个 voice
+# 查询单个 voice（含音频元数据与服务端质量判定，见下）
 GET /v1/audio/voices/{voice_id}
 
-# 更新 voice（替换音频或修改信息）
+# 更新 voice
 PUT /v1/audio/voices/{voice_id}
+  Form: name, description, audio(file)
+  → 403 若对预置 voice 传 audio；仅改 name/description 允许
 
 # 删除 voice
 DELETE /v1/audio/voices/{voice_id}
+  → 403 若为预置 voice
 
-# 试听参考音频
+# 试听参考音频（audio/wav）
 GET /v1/audio/voices/{voice_id}/preview
+  → 404 若参考音频缺失
 ```
 
-参考音频要求：3-10 秒，干净无噪音，自然说话即可。上传时自动归一化。
+**list 与 detail 的区别**：list 返回摘要，detail 额外返回 `created_at`（预置为 `null`）、音频元数据、以及 `reference_audio` 与 `warnings`。
+
+detail 响应示例：
+
+```json
+{
+  "voice_id": "cedar",
+  "name": "Cedar",
+  "description": "Steady, mature male mentor",
+  "created_at": null,
+  "type": "builtin",
+  "builtin": true,
+  "reference_audio": "present",
+  "duration_seconds": 5.3,
+  "sample_rate": 16000,
+  "channels": 1,
+  "codec": "pcm_s16le",
+  "size_bytes": 169806,
+  "warnings": []
+}
+```
+
+**`warnings` 由服务端判定，不要在客户端硬编码阈值**。当前会给出的判定：
+
+| 情况 | 含义 |
+|------|------|
+| 时长 < 3s 或 > 10s | 偏离模型克隆效果最佳区间 |
+| 采样率 ≠ 16000Hz | 该录音未经 API 归一化 |
+| 声道 ≠ 1 | 同上 |
+| `reference_audio: missing` | 录音已丢失，此 voice 无法用于合成 |
+
+`reference_audio` 为 `missing` 时，音频元数据字段全部返回 `null`（不返回注册时的历史值），且该 voice 调用 `/v1/audio/speech` 会得到 503。
+
+`POST` 注册成功时也会在响应里返回 `warnings`，便于在还持有原始素材时立即重录：
+
+```json
+{"voice_id": "my-voice", "status": "created",
+ "warnings": ["duration 30.0s exceeds the 3-10s recommended range; ..."]}
+```
+
+参考音频要求：3-10 秒，干净无噪音，自然说话即可。任意格式上传，服务端统一归一化为 16kHz mono -16 LUFS。
 
 ## 支持的输出格式
 
@@ -148,11 +201,86 @@ curl -X POST http://<ALB>:8880/v1/audio/voices \
 
 注册后即可在 `/v1/audio/speech` 中使用 `"voice": "my_voice"`。
 
+### 声音克隆完整对接流程
+
+下游接入自助声纹克隆的推荐顺序：
+
+```bash
+ALB=http://<ALB>:8880
+
+# 1. 注册声纹，检查响应里的 warnings
+curl -sX POST $ALB/v1/audio/voices \
+  -F "voice_id=user-1024" -F "name=User 1024" \
+  -F "audio=@recording.m4a"
+# {"voice_id":"user-1024","status":"created","warnings":[]}
+#   warnings 非空说明录音偏离推荐条件，建议提示用户重录
+
+# 2. 试听确认音色
+curl -s $ALB/v1/audio/voices/user-1024/preview -o preview.wav
+
+# 3. 合成
+curl -sX POST $ALB/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"input":"要合成的文本","voice":"user-1024","response_format":"mp3"}' \
+  -o out.mp3
+
+# 4. 不再需要时删除
+curl -sX DELETE $ALB/v1/audio/voices/user-1024
+```
+
+一次性克隆（不注册、不落盘）用 `/v1/audio/clone`，见上方「声音克隆」章节。适合临时试听或不需要复用的场景。
+
+### 错误码
+
+| 状态码 | 场景 | 客户端应对 |
+|--------|------|-----------|
+| 403 | 对预置 voice 执行 DELETE、或 PUT/POST 替换其参考音频 | 换一个 `voice_id`；UI 应对 `builtin: true` 的条目禁用删除与替换 |
+| 404 | voice 不存在；或 `/preview` 的参考音频缺失 | 检查 `voice_id` |
+| 503 | 已注册 voice 的参考音频缺失，拒绝退化到 Voice Design | 调 detail 确认 `reference_audio` 状态，重新注册 |
+| 400 | 不支持的 `response_format` | 见「支持的输出格式」 |
+
+### 命名约定
+
+`voice_id` 是全局扁平命名空间，没有租户隔离 —— 任何调用方都能覆盖或删除他人注册的自定义声纹（预置 voice 除外，有 403 保护）。多用户场景建议自行加前缀，如 `tenant-{id}-{name}`。
+
 ## 存储
 
 - 模型: EFS `/shared/VoxCPM2/`
 - Voice 参考音频: EFS `/shared/voices/{voice_id}/ref.wav`
 - Voice 注册表: EFS `/shared/voices/registry.json`
+- 注册表 schema 版本: EFS `/shared/voices/.schema`
+
+存储目录须归属容器运行用户（uid 10001）。目录属 root 时读操作正常但 POST/PUT/DELETE 会因
+`PermissionError` 返回 500，表现为「能查不能写」：
+
+```bash
+chown -R 10001:10001 /shared/voices
+find /shared/voices -type d -exec chmod 775 {} \;
+find /shared/voices -type f -exec chmod 664 {} \;
+```
+
+`registry.json` 条目结构：
+
+```json
+{
+  "cedar": {
+    "file": "ref.wav",
+    "name": "Cedar",
+    "description": "Steady, mature male mentor",
+    "builtin": true,
+    "audio": {"duration_seconds": 5.3, "sample_rate": 16000,
+              "channels": 1, "codec": "pcm_s16le", "size_bytes": 169806}
+  }
+}
+```
+
+- `builtin: true` 是预置 voice 的保护标记，缺失则 DELETE/PUT 不会被拦截。手工铺入预置 voice 时必须写入
+- `audio` 在注册时探测并存下，detail 读取时不再跑 ffprobe
+- 通过 API 注册的条目还带 `created_at`；预置 voice 无此字段
+
+`.schema` 记录已执行的迁移版本。启动时的回填逻辑据此判断是否需要运行，**不依赖字段是否存在** ——
+早期版本用「无 `created_at` 即预置」推断 `builtin`，该推断仅对预置那批数据成立；若每次启动都重跑，
+任何因写入中断而缺 `created_at` 的用户声纹都会被永久标为预置并锁进 403。
 
 > 模型存储复用 qwen3-speech 模块的 `qwen3-models-pvc`，
 > 需先部署 `applications/qwen3-speech/base/shared/`（EFS StorageClass + PVC）。
