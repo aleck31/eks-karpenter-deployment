@@ -1,4 +1,8 @@
-FROM 123456789012.dkr.ecr.us-west-2.amazonaws.com/qwen3-asr:latest
+# 基础镜像为 vllm/vllm-openai + soundfile/av，已推送至私有 ECR。
+# 构建时传入实际仓库地址，避免账号 ID 硬编码：
+#   docker build --build-arg BASE_IMAGE=<account>.dkr.ecr.<region>.amazonaws.com/qwen3-asr:latest .
+ARG BASE_IMAGE=qwen3-asr:latest
+FROM ${BASE_IMAGE}
 
 RUN pip install websockets python-multipart --no-cache-dir
 

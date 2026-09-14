@@ -7,12 +7,26 @@
 
 ## 部署文件结构
 
+采用 kustomize base + overlay。三个服务（ASR、TTS CustomVoice、TTS Base）地位对等，
+在 `base/` 下各自独立成目录；`base/shared/` 提供它们共用的模型存储。
+环境相关取值（namespace、ECR 账号、EFS 文件系统 ID）不入库，由 `overlays/<env>/` 注入，
+并在其 `resources` 中选择要部署哪些服务。
+
 ```
 applications/qwen3-speech/
-├── qwen3-asr-deployment.yaml        # ASR Deployment + Service
-├── qwen3-tts-deployment.yaml        # TTS Deployment + Service
-├── qwen3-speech-ingress.yaml        # 共享 ALB Ingress (group: qwen3-speech)
-├── qwen3-speech-efs-pvc.yaml        # EFS StorageClass + PVC
+├── base/
+│   ├── shared/                      # EFS StorageClass + PVC（各服务共用）
+│   ├── asr/                         # ASR Deployment + Service + Ingress
+│   ├── tts/                         # Qwen3-TTS CustomVoice Deployment + Service
+│   └── tts-base/                    # Qwen3-TTS Base Deployment + Service（声音克隆）
+├── overlays/
+│   ├── example/                     # 入库：示例取值，供复制
+│   │   ├── kustomization.yaml
+│   │   └── efs-patch.yaml
+│   └── <env-name>/                  # 不入库：真实取值
+├── Dockerfile                       # ASR 镜像（vLLM + adapter）
+├── asr-adapter.py
+├── entrypoint.sh
 └── qwen3-speech-deployment-guide.md  # 本文档
 ```
 
@@ -97,49 +111,46 @@ kubectl get node -l node-type=gpu -o jsonpath='{.items[*].status.allocatable.nvi
 kubectl create namespace hosthree
 ```
 
-### 3. 创建 EFS 存储
+### 3. 准备 overlay
 
 ```bash
-kubectl apply -f qwen3-speech-efs-pvc.yaml
+# 复制示例，目录名用语义化环境名（如 inference-env）
+cp -r overlays/example overlays/<env-name>
 
-# 验证
-kubectl get pvc -n hosthree qwen3-models-pvc
-# 预期: Bound
+# 编辑取值：
+#   kustomization.yaml  namespace、要部署哪些服务、ECR 镜像地址
+#   efs-patch.yaml      EFS 文件系统 ID
+vi overlays/<env-name>/kustomization.yaml
+vi overlays/<env-name>/efs-patch.yaml
 ```
 
-### 4. 部署 ASR
+`resources` 中按需增删服务。例如仅部署 ASR：
+
+```yaml
+resources:
+  - ../../base/shared
+  - ../../base/asr
+```
+
+> `.gitignore` 默认忽略 `overlays/` 下全部目录、仅放行 `example/`，真实取值不会误提交。
+
+### 4. 部署
 
 ```bash
-kubectl apply -f qwen3-asr-deployment.yaml
+kubectl config current-context          # 先确认目标集群
+kubectl apply -k overlays/<env-name>
 ```
 
 首次部署耗时较长：
-- Karpenter 拉起 g4dn.xlarge Spot 实例 (~1-3 分钟)
-- 拉取 qwenllm/qwen3-asr:latest 镜像 (~7 分钟，14.4GB)
+- Karpenter 拉起 GPU Spot 实例 (~1-3 分钟)
+- 拉取 ECR 镜像
 - initContainer 下载模型到 EFS (~3-5 分钟)
-- 主容器加载模型 + CUDA graph 编译 (~3-5 分钟)
+- 主容器加载模型
 
-### 5. 部署 TTS
+同时部署多个服务时，它们通过 GPU Time-Slicing 共享同一张卡，
+需确认显存总量足够（见「资源分配」一节）。
 
-等 ASR Pod 进入 Running 后再部署 TTS，避免 GPU 资源竞争导致调度到不同节点：
-
-```bash
-# 确认 ASR 已 Running
-kubectl get pods -n hosthree -l app=qwen3-asr
-
-kubectl apply -f qwen3-tts-deployment.yaml
-```
-
-### 6. 部署 Ingress
-
-```bash
-kubectl apply -f qwen3-speech-ingress.yaml
-
-# 验证 ALB 地址
-kubectl get ingress -n hosthree
-```
-
-### 7. 验证部署
+### 5. 验证部署
 
 ```bash
 # 查看 Pod 状态（两个都应 1/1 Running，同一节点）
