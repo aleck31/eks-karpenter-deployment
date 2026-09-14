@@ -94,6 +94,21 @@ def _get_voice_audio_b64(voice_id: str) -> str | None:
     return base64.b64encode(audio_path.read_bytes()).decode()
 
 
+def _assert_not_builtin(registry: dict, voice_id: str, action: str):
+    """Reject destructive actions on built-in preset voices.
+
+    Built-in voices are curated reference recordings that cannot be regenerated
+    identically (VoxCPM2 output is non-deterministic), so overwriting or
+    deleting them is irreversible.
+    """
+    if registry.get(voice_id, {}).get("builtin"):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Voice '{voice_id}' is a built-in preset; {action} is not allowed. "
+                   "Register a new voice with a different voice_id instead.",
+        )
+
+
 # --- Audio helpers ---
 
 def _convert_audio(audio_bytes: bytes, target_format: str) -> bytes:
@@ -228,6 +243,8 @@ async def list_voices():
         voices.append({
             "voice_id": vid, "name": meta.get("name", vid),
             "description": meta.get("description", ""),
+            "type": "builtin" if meta.get("builtin") else "custom",
+            "builtin": bool(meta.get("builtin")),
         })
     # Also include design-only voices not yet registered
     for vid in VOICE_DESIGN:
@@ -245,6 +262,9 @@ async def create_voice(
 ):
     registry = _load_registry()
 
+    # Guard: never let a POST silently overwrite a built-in preset
+    _assert_not_builtin(registry, voice_id, "overwriting via registration")
+
     audio_bytes = await audio.read()
     fmt = audio.filename.rsplit(".", 1)[-1].lower() if audio.filename else "wav"
     normalized = _normalize_audio(audio_bytes, fmt)
@@ -258,6 +278,7 @@ async def create_voice(
         "file": "ref.wav",
         "name": name or voice_id,
         "description": description or "",
+        "builtin": False,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     _save_registry(registry)
@@ -276,6 +297,8 @@ async def update_voice(
         raise HTTPException(status_code=404, detail=f"Voice '{voice_id}' not found")
 
     if audio:
+        # Built-in presets: metadata is editable, reference audio is not
+        _assert_not_builtin(registry, voice_id, "replacing the reference audio")
         audio_bytes = await audio.read()
         fmt = audio.filename.rsplit(".", 1)[-1].lower() if audio.filename else "wav"
         normalized = _normalize_audio(audio_bytes, fmt)
@@ -300,7 +323,9 @@ async def get_voice(voice_id: str):
         raise HTTPException(status_code=404, detail=f"Voice '{voice_id}' not found")
     meta = registry[voice_id]
     return {"voice_id": voice_id, "name": meta.get("name"), "description": meta.get("description"),
-            "created_at": meta.get("created_at")}
+            "created_at": meta.get("created_at"),
+            "type": "builtin" if meta.get("builtin") else "custom",
+            "builtin": bool(meta.get("builtin"))}
 
 
 @app.delete("/v1/audio/voices/{voice_id}")
@@ -308,6 +333,7 @@ async def delete_voice(voice_id: str):
     registry = _load_registry()
     if voice_id not in registry:
         raise HTTPException(status_code=404, detail=f"Voice '{voice_id}' not found")
+    _assert_not_builtin(registry, voice_id, "deletion")
     voice_dir = VOICES_DIR / voice_id
     if voice_dir.exists():
         import shutil
