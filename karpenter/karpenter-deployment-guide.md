@@ -18,9 +18,10 @@ aws eks describe-fargate-profile --cluster-name ${CLUSTER_NAME} --fargate-profil
 aws eks describe-cluster --name ${CLUSTER_NAME} --query "cluster.identity.oidc.issuer" --output text --profile ${AWS_PROFILE}
 ```
 
-### 1.2 Fargate 上的 Karpenter 必须使用 IRSA
+### 1.2 认证方式：Pod Identity（Fargate 上则必须用 IRSA）
 
-Karpenter 通过 Fargate Profile 调度（`podLabels.fargate=enabled`），而 **EKS Pod Identity 不支持 Fargate**：
+Karpenter 运行在 EC2 节点上时使用 Pod Identity。**仅当 Karpenter 被调度到 Fargate 时**
+才必须改用 IRSA，因为 Pod Identity 不支持 Fargate：
 
 - Pod Identity Agent 以 DaemonSet 方式运行，Fargate 不支持 DaemonSet
 - 当 Pod Identity Association 存在时，EKS 会优先注入 Pod Identity 凭证（`169.254.170.23`），覆盖 IRSA
@@ -28,9 +29,16 @@ Karpenter 通过 Fargate Profile 调度（`podLabels.fargate=enabled`），而 *
 - 参考：[GitHub Issue #2274 - Enable EKS Pod Identities on EKS Fargate](https://github.com/aws/containers-roadmap/issues/2274)
 
 **因此**：
-1. Karpenter 的 ServiceAccount 必须使用 IRSA 注解（`eks.amazonaws.com/role-arn`）
-2. 不能为 `karpenter:karpenter` 创建 Pod Identity Association（如 eksctl 自动创建了需删除）
-3. 其他运行在 EC2 节点上的组件（VPC CNI、EBS CSI 等）可以正常使用 Pod Identity
+1. 系统组件跑在 EC2 节点组上（本项目两个集群均如此）→ 用 Pod Identity，
+   ServiceAccount 上**不要**保留 `eks.amazonaws.com/role-arn` 注解
+2. 若因特殊原因 Karpenter 仍在 Fargate 上 → 用 IRSA 注解，且不能创建 Pod Identity Association
+3. 判断当前用的是哪种：Pod 内有 `AWS_CONTAINER_CREDENTIALS_FULL_URI` 环境变量即为 Pod Identity
+
+```bash
+# 确认凭据方式
+kubectl get pod -n karpenter -l app.kubernetes.io/name=karpenter \
+  -o jsonpath='{.items[0].spec.containers[0].env[?(@.name=="AWS_CONTAINER_CREDENTIALS_FULL_URI")].name}'
+```
 
 
 ### 1.3 设置环境变量
@@ -115,13 +123,19 @@ helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter \
   --set "settings.featureGates.spotToSpotConsolidation=true" \
   --set "serviceAccount.create=true" \
   --set "serviceAccount.name=karpenter" \
-  --set "serviceAccount.annotations.eks\.amazonaws\.com/role-arn=arn:aws:iam::${AWS_ACCOUNT_ID}:role/KarpenterIRSA-${ROLE_SUFFIX}" \
-  --set "podLabels.fargate=enabled" \
-  --set controller.resources.requests.cpu=200m \
+  --set controller.resources.requests.cpu=100m \
   --set controller.resources.requests.memory=512Mi \
   --set controller.resources.limits.cpu=1 \
   --set controller.resources.limits.memory=1Gi
 ```
+
+> 不设 `serviceAccount.annotations`：认证走 Pod Identity，由 Pod Identity Association 提供凭据。
+> 残留的 IRSA 注解不会报错（凭据链中 container credentials 优先于 web identity），
+> 但会指向可能已删除的角色，属误导性配置，应清除。
+>
+> 不设 `podLabels.fargate`：系统组件已在 EC2 节点组上，该标签用于匹配 Fargate Profile。
+>
+> requests 取 `100m/512Mi` 为实测值（稳态约 38m / 190Mi）。
 
 > **resources 说明**：上游默认 `cpu: 1 / memory: 1Gi` 根据集群规模进行调整。
 >

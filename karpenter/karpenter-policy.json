@@ -30,11 +30,20 @@
             "Resource": "*"
         },
         {
+            "Sid": "PassNodeRole",
             "Effect": "Allow",
             "Action": [
                 "iam:PassRole"
             ],
-            "Resource": "arn:aws:iam::*:role/KarpenterNodeInstanceRole-*"
+            "Resource": [
+                "arn:aws:iam::*:role/KarpenterNodeInstanceRole-*",
+                "arn:aws:iam::*:role/KarpenterNodeRole-*"
+            ],
+            "Condition": {
+                "StringEquals": {
+                    "iam:PassedToService": "ec2.amazonaws.com"
+                }
+            }
         },
         {
             "Effect": "Allow",

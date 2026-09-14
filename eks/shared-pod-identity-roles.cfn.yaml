@@ -1,0 +1,91 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 跨集群共用的 Pod Identity 角色
+
+# Pod Identity 的信任主体是 pods.eks.amazonaws.com，与集群无关（IRSA 的信任策略必须写死
+# 集群专属的 OIDC provider URL，因此角色天然无法跨集群复用）。迁到 Pod Identity 后，
+# 权限与集群无关的组件可以共用一个角色，减少角色与策略数量。
+#
+# 适用判断：
+#   可共用   VPC CNI、EBS CSI —— 仅挂 AWS 托管策略，两集群完全相同
+#            ALB Controller  —— 80 个 action 及 Resource/Condition 完全相同
+#   不可共用 Loki / S3 CSI   —— 策略限定具体 S3 桶
+#            EFS CSI        —— 限定文件系统
+#            Karpenter      —— 策略含 cluster tag 条件与集群专属节点角色，
+#                              共用需放宽作用域、牺牲集群间隔离，不划算
+#
+# 部署（ALB 策略从 eks/iam_policy.json 创建，保持单一数据源，
+#       不在本模板重复那 80 个 action）：
+#   ALB_POLICY_ARN=$(aws iam create-policy --policy-name SharedALBControllerPolicy \
+#     --policy-document file://eks/iam_policy.json --query 'Policy.Arn' --output text)
+#   aws cloudformation deploy --template-file eks/shared-pod-identity-roles.cfn.yaml \
+#     --stack-name eks-shared-pod-identity-roles --capabilities CAPABILITY_NAMED_IAM \
+#     --parameter-overrides ALBControllerPolicyArn=$ALB_POLICY_ARN
+#
+# 关联到集群：见 eks/cluster-config-inference.yaml 的 podIdentityAssociations
+
+Parameters:
+  ALBControllerPolicyArn:
+    Type: String
+    Description: ARN of SharedALBControllerPolicy (source eks/iam_policy.json)
+
+Resources:
+
+  SharedVPCCNIRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SharedPodIdentity-VPCCNI
+      Description: Shared across clusters - VPC CNI (aws-node)
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: pods.eks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+
+  SharedEBSCSIRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SharedPodIdentity-EBSCSI
+      Description: Shared across clusters - EBS CSI Driver (ebs-csi-controller-sa)
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: pods.eks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy
+
+  # 原先两集群各有一份内容完全相同的内联策略，此处合并为一个客户托管策略
+  SharedALBControllerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SharedPodIdentity-ALBController
+      Description: Shared across clusters - AWS Load Balancer Controller
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: pods.eks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+      ManagedPolicyArns:
+        - !Ref ALBControllerPolicyArn
+
+Outputs:
+  VPCCNIRoleArn:
+    Value: !GetAtt SharedVPCCNIRole.Arn
+  EBSCSIRoleArn:
+    Value: !GetAtt SharedEBSCSIRole.Arn
+  ALBControllerRoleArn:
+    Value: !GetAtt SharedALBControllerRole.Arn

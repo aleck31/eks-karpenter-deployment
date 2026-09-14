@@ -6,16 +6,21 @@ kind: ClusterConfig
 # 该集群原先系统组件跑在 Fargate 上，而 Pod Identity Agent 是 DaemonSet、不支持 Fargate，
 # 因此只能用 IRSA。系统组件迁至 EC2 托管节点组后，此限制解除。
 #
-# 本文件采用 roleARN 复用现有 IRSA 角色，而非让 eksctl 新建角色：
-#   - 策略零改动，不存在权限遗漏风险（Karpenter 角色含自定义策略 + SQS 内联策略）
-#   - 信任策略中保留原 OIDC 语句，可随时回退
-# 迁移验证稳定后，再从信任策略移除 OIDC 语句并清理 SA 上的 role-arn 注解。
+# 本文件的 Pod Identity 关联指向 eks/shared-pod-identity-roles.cfn.yaml 创建的跨集群共用角色。
+# 迁移过程中曾用 roleARN 复用各集群自有的 IRSA 角色，待验证稳定后已合并为共用角色，
+# 原集群专属角色及其 CloudFormation 栈已删除。
+#
+# 变更角色前务必用 eks/compare-role-permissions.py 校验权限一致性：
+# 仅比对 action 名称不够，Resource 与 Condition 决定实际作用域。
 #
 # 执行：
 #   eksctl create podidentityassociation -f eks/cluster-config-inference.yaml
 #   eksctl update addon -f eks/cluster-config-inference.yaml
 #
-# 前置：角色信任策略需先允许 pods.eks.amazonaws.com，见 eks/pod-identity-trust-policy.json
+# 注意：vpc-cni 与 aws-ebs-csi-driver 的关联改由 addon 自身管理，
+# 这样 addon 的 serviceAccountRoleArn 会被清空、ServiceAccount 上不再留 IRSA 注解：
+#   aws eks update-addon --cluster-name <cluster> --addon-name vpc-cni \
+#     --pod-identity-associations serviceAccount=aws-node,roleArn=<SharedPodIdentity-VPCCNI ARN>
 
 metadata:
   name: inference-env
@@ -23,22 +28,21 @@ metadata:
 
 iam:
   podIdentityAssociations:
-    # VPC CNI
+    # 以下三个为跨集群共用角色（两个集群共用同一角色）
     - namespace: kube-system
       serviceAccountName: aws-node
-      roleARN: arn:aws:iam::123456789012:role/eksctl-inference-env-addon-vpc-cni-Role1-EXAMPLE
+      roleARN: arn:aws:iam::123456789012:role/SharedPodIdentity-VPCCNI
 
-    # EBS CSI Driver
     - namespace: kube-system
       serviceAccountName: ebs-csi-controller-sa
-      roleARN: arn:aws:iam::123456789012:role/eksctl-inference-env-addon-aws-ebs-csi-driver-Role1-EXAMPLE
+      roleARN: arn:aws:iam::123456789012:role/SharedPodIdentity-EBSCSI
 
-    # AWS Load Balancer Controller
     - namespace: kube-system
       serviceAccountName: aws-load-balancer-controller
-      roleARN: arn:aws:iam::123456789012:role/AmazonEKSLoadBalancerControllerRole-usw2
+      roleARN: arn:aws:iam::123456789012:role/SharedPodIdentity-ALBController
 
-    # Karpenter（角色含 KarpenterControllerPolicy + KarpenterSQSInterruptionPolicy）
+    # Karpenter 不共用：策略含 cluster tag 条件与集群专属节点角色名，
+    # 共用需放宽到通配符、牺牲集群间隔离。各集群保留自己的角色。
     - namespace: karpenter
       serviceAccountName: karpenter
       roleARN: arn:aws:iam::123456789012:role/KarpenterIRSA-inference-env
