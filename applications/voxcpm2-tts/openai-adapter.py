@@ -43,6 +43,11 @@ REF_MAX_SECONDS = 10.0
 REGISTRY_SCHEMA = 2
 
 # Voice Design fallback descriptions (used when no reference audio registered)
+# Descriptions for Voice Design, used when the caller passes a description
+# instead of a registered voice_id. All 13 names below also exist as registered
+# voiceprints, so their timbre comes from the stored recording, not from these
+# strings -- they remain only so that a bare name still resolves to something
+# sensible if it is ever unregistered.
 VOICE_DESIGN: dict[str, str] = {
     "alloy": "Female voice. A young woman in her mid-20s with a clear, balanced, and versatile voice. Speaks with natural confidence and a neutral American accent, suitable for narration and general conversation",
     "ash": "Male voice. A young man in his late 20s with a confident, direct voice. Slightly husky tone with assertive delivery, like a tech podcast host",
@@ -315,14 +320,25 @@ async def create_speech(req: SpeechRequest):
     ref_b64 = _get_voice_audio_b64(req.voice)
 
     if ref_b64:
-        # Controllable Cloning mode
+        # Controllable Cloning: timbre anchored to a stored recording
         payload = {
             "target_text": req.input,
             "ref_audio_wav_base64": ref_b64,
             "ref_audio_wav_format": "wav",
         }
     else:
-        # Voice Design mode (fallback to description)
+        # Voice Design: the voice value is treated as a description. Reached
+        # either because the caller passed a description instead of a
+        # registered voice_id, or because a registered voice lost its
+        # recording -- the latter silently changes timbre, so refuse it when
+        # the entry exists but its audio does not.
+        if req.voice in _load_registry():
+            raise HTTPException(
+                status_code=503,
+                detail=f"Voice '{req.voice}' is registered but its reference audio is "
+                       "unavailable. Refusing to fall back to Voice Design, which would "
+                       "return a different timbre under the same voice id.",
+            )
         voice_desc = VOICE_DESIGN.get(req.voice, req.voice)
         payload = {"target_text": f"({voice_desc}){req.input}"}
 
@@ -388,10 +404,6 @@ async def list_voices():
             "type": "builtin" if meta.get("builtin") else "custom",
             "builtin": bool(meta.get("builtin")),
         })
-    # Also include design-only voices not yet registered
-    for vid in VOICE_DESIGN:
-        if vid not in registry:
-            voices.append({"voice_id": vid, "name": vid, "description": VOICE_DESIGN[vid], "type": "design_only"})
     return {"voices": voices}
 
 
@@ -465,13 +477,13 @@ async def update_voice(
 async def get_voice(voice_id: str):
     registry = _load_registry()
     if voice_id not in registry:
-        if voice_id in VOICE_DESIGN:
-            # Usable via /v1/audio/speech through Voice Design, but has no
-            # reference recording, so there is nothing else to report.
-            return {"voice_id": voice_id, "type": "design_only", "description": VOICE_DESIGN[voice_id]}
         raise HTTPException(status_code=404, detail=f"Voice '{voice_id}' not found")
     meta = registry[voice_id]
     audio = meta.get("audio") or {}
+    # Audio metadata is captured at registration time, so a recording lost
+    # afterwards would keep being reported as present. Checking here keeps this
+    # response consistent with what /preview and synthesis actually do.
+    reference_present = (VOICES_DIR / voice_id / meta.get("file", "ref.wav")).exists()
     return {
         "voice_id": voice_id,
         "name": meta.get("name"),
@@ -479,12 +491,16 @@ async def get_voice(voice_id: str):
         "created_at": meta.get("created_at"),
         "type": "builtin" if meta.get("builtin") else "custom",
         "builtin": bool(meta.get("builtin")),
-        "duration_seconds": audio.get("duration_seconds"),
-        "sample_rate": audio.get("sample_rate"),
-        "channels": audio.get("channels"),
-        "codec": audio.get("codec"),
-        "size_bytes": audio.get("size_bytes"),
-        "warnings": _audio_warnings(audio),
+        "reference_audio": "present" if reference_present else "missing",
+        "duration_seconds": audio.get("duration_seconds") if reference_present else None,
+        "sample_rate": audio.get("sample_rate") if reference_present else None,
+        "channels": audio.get("channels") if reference_present else None,
+        "codec": audio.get("codec") if reference_present else None,
+        "size_bytes": audio.get("size_bytes") if reference_present else None,
+        "warnings": _audio_warnings(audio) if reference_present else [
+            "reference audio is missing; the stored duration and sample rate no "
+            "longer describe anything on disk and cloning cannot use this voice"
+        ],
     }
 
 
