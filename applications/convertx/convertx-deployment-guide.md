@@ -32,24 +32,36 @@ Internet → CloudFront → Internal ALB → ConvertX Pod (ARM64)
 
 ### 1. 创建命名空间
 ```bash
-kubectl create namespace convertx
+kubectl create namespace <namespace>
 ```
 
-### 2. 部署存储和配置
+### 2. 创建 Secret
+
+Secret 含真实凭据，不纳入 kustomize 管理。模块根目录的 `convertx-secret.yaml`
+由 `.gitignore` 排除。
+
 ```bash
-kubectl apply -f convertx-ebs-pvc.yaml
-kubectl apply -f convertx-secret.yaml
-kubectl apply -f convertx-configmap.yaml
+kubectl apply -f convertx-secret.yaml -n <namespace>
 ```
 
-### 3. 部署 ConfigMap
+### 3. 准备 overlay
+
+采用 kustomize base + overlay，namespace 不入库，由 overlay 注入。
+
 ```bash
-kubectl apply -f convertx-configmap.yaml
+cp -r overlays/example overlays/<env-name>
+vi overlays/<env-name>/kustomization.yaml     # 改 namespace
 ```
 
-### 4. 部署应用
+> `.gitignore` 默认忽略 `overlays/` 下全部目录、仅放行 `example/`。
+
+### 4. 部署
+
+一次性创建 PVC、ConfigMap、Deployment、Service、Ingress：
+
 ```bash
-kubectl apply -f convertx-deployment.yaml
+kubectl config current-context          # 先确认目标集群
+kubectl apply -k overlays/<env-name>
 ```
 
 ### 5. 验证部署
