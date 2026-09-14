@@ -1,4 +1,11 @@
-# cluster-config.yaml - 包含所有必要的服务账户和插件
+# cluster-config.yaml - 集群、IAM 与插件配置
+#
+# 注意 vpc-cni 与 aws-ebs-csi-driver 的 Pod Identity 关联由 addon 自身管理，
+# 这样 addon 的 serviceAccountRoleArn 会被清空、ServiceAccount 上不留 IRSA 注解。
+# 对已存在的集群直接执行 eksctl create podidentityassociation 会因关联已存在而报 409，
+# 这两个应改用：
+#   aws eks update-addon --cluster-name <cluster> --addon-name vpc-cni \
+#     --pod-identity-associations serviceAccount=aws-node,roleArn=<role-arn>
 apiVersion: eksctl.io/v1alpha5
 kind: ClusterConfig
 
@@ -20,99 +27,58 @@ availabilityZones:
 # IAM 配置
 iam:
   withOIDC: true
-  
-  # Pod Identity 关联配置 - 为addon使用Pod Identity
+
+  # Pod Identity 关联。前三个使用跨集群共用角色，
+  # 由 eks/shared-pod-identity-roles.cfn.yaml 创建，两个集群共用同一角色。
+  # 变更角色前用 eks/compare-role-permissions.py 校验权限一致性。
   podIdentityAssociations:
-    # VPC CNI Pod Identity 关联
     - namespace: kube-system
       serviceAccountName: aws-node
-      permissionPolicyARNs:
-        - "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
-      roleName: VPCCNIPodIdentityRole
-    
-    # EBS CSI Driver Pod Identity 关联
+      roleARN: arn:aws:iam::123456789012:role/SharedPodIdentity-VPCCNI
+
     - namespace: kube-system
       serviceAccountName: ebs-csi-controller-sa
-      wellKnownPolicies:
-        ebsCSIController: true
-      roleName: EBSCSIPodIdentityRole
-    
-    # EFS CSI Driver Pod Identity 关联
+      roleARN: arn:aws:iam::123456789012:role/SharedPodIdentity-EBSCSI
+
+    - namespace: kube-system
+      serviceAccountName: aws-load-balancer-controller
+      roleARN: arn:aws:iam::123456789012:role/SharedPodIdentity-ALBController
+
+    # EFS CSI 与 S3 CSI 的策略限定具体文件系统与桶，不跨集群共用。
+    # 角色为 eksctl 创建 addon 时生成，名称含随机后缀，此处以占位符表示实际 ARN。
     - namespace: kube-system
       serviceAccountName: efs-csi-controller-sa
-      wellKnownPolicies:
-        efsCSIController: true
-      roleName: EFSCSIPodIdentityRole
+      roleARN: arn:aws:iam::123456789012:role/eksctl-CLUSTER-addon-aws-efs-csi-dr-Role1-EXAMPLE
 
-    # Karpenter 使用 IRSA（非 Pod Identity）
-    # 原因：Karpenter 运行在 Fargate 上，Pod Identity Agent 是 DaemonSet 不支持 Fargate
-    # IRSA role (KarpenterIRSA) 通过 Helm --set serviceAccount.annotations 配置
-    # 详见 karpenter/karpenter-deployment-guide.md
+    - namespace: kube-system
+      serviceAccountName: s3-csi-driver-sa
+      roleARN: arn:aws:iam::123456789012:role/eksctl-CLUSTER-addon-aws-mountpoint-Role1-EXAMPLE
 
-  serviceAccounts:
-    # Karpenter 服务账户
-    # - metadata:
-    #     name: karpenter
-    #     namespace: karpenter
-    #   wellKnownPolicies:
-    #     autoScaler: true
-    #   roleName: KarpenterServiceAccount-eks-karpenter-env
-    #   roleOnly: true
+    # Loki 需读写自己的 S3 桶，策略含桶名，不共用
+    - namespace: logging
+      serviceAccountName: loki
+      roleARN: arn:aws:iam::123456789012:role/LokiS3Role-CLUSTER
 
-      # AWS LoadBalancer Controller 服务账户（IRSA）
-      # ALB Controller 自 v2.13.4 起实测可用 Pod Identity，v3.x 官方示例即采用该方式。
-      # 迁移到 Pod Identity 后本段可移除，改由 eks create-pod-identity-association 配置。
-    - metadata:
-        name: aws-load-balancer-controller
-        namespace: kube-system
-      wellKnownPolicies:
-        awsLoadBalancerController: true
-      roleName: AmazonEKSLoadBalancerControllerRole
+    # Karpenter 亦使用 Pod Identity。其策略含 cluster tag 条件与集群专属节点角色，
+    # 不与其他集群共用，由 karpenter/apply-karpenter-policy.sh 按集群渲染。
+    - namespace: karpenter
+      serviceAccountName: karpenter
+      roleARN: arn:aws:iam::123456789012:role/eksctl-CLUSTER-podidentityrole-karp-Role1-EXAMPLE
 
-    # S3 CSI Driver 服务账户 (IRSA)
-    - metadata:
-        name: s3-csi-driver-sa
-        namespace: kube-system
-      attachPolicyARNs:
-        - "arn:aws:iam::aws:policy/AmazonS3FullAccess"
-      roleName: AmazonEKS_S3_CSI_DriverRole
-
-# 不创建默认节点组
+# 节点组独立声明，见 eks/nodegroup-system.yaml
 managedNodeGroups: []
 
-# Fargate Profile 用于运行系统组件和 Karpenter 等组件
-fargateProfiles:
-  - name: default
-    selectors:
-      - namespace: default
-        labels:
-          fargate: enabled
-      - namespace: kube-system
-        labels:
-          fargate: enabled
-  - name: karpenter
-    selectors:
-      - namespace: karpenter
-        labels:
-          fargate: enabled
-  - name: portainer
-    selectors:
-      - namespace: portainer
-        labels:
-          fargate: enabled
+# 无 Fargate Profile：系统组件已迁至 EC2 Spot 托管节点组，
+# 成本更低且 Pod Identity 不支持 Fargate。历史配置见 git 记录。
 
 # 启用必要的插件
 addons:
+  # coredns 与 metrics-server 原带 podLabels.fargate=enabled 以匹配 Fargate Profile，
+  # 迁至 EC2 节点组后不再需要
   - name: coredns
     version: latest
-    configurationValues: |-
-      podLabels:
-        fargate: enabled
   - name: metrics-server
     version: latest
-    configurationValues: |-
-      podLabels:
-        fargate: enabled
   - name: eks-pod-identity-agent
     version: latest
   - name: vpc-cni

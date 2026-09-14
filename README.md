@@ -5,7 +5,7 @@
 本项目帮助 AWS 用户快速从零开始部署一套基于 Karpenter 的 EKS 集群环境，支持：
 - eksctl 工具脚本化创建集群
 - 跨多个 AZ 的节点调度
-- 混合节点类型 (Fargate, Spot, On-Demand)
+- 混合节点类型 (EC2 Spot, On-Demand)
 - EBS, EFS, S3 持久化存储
 - S3 挂载 (Mountpoint for Amazon S3)
 - Portainer Web 管理界面
@@ -227,7 +227,9 @@ graph LR
 | **成本效率** | 小规模高效 | 大规模高效 |
 | **管理复杂度** | 低 | 中等 |
 
-> 注: eks-karpenter-env 已从 Fargate 迁移至 EC2 Spot System Node Group，成本降低约 85%。
+> 注: 两个集群均已从 Fargate 迁移至 EC2 Spot System Node Group。
+> eks-karpenter-env 成本降低约 85%；inference-env 从约 $144/月降至约 $56/月。
+> 迁移的另一动因是 Pod Identity 不支持 Fargate（其 Agent 为 DaemonSet）。
 
 ### 集群部署架构设计原则
 
@@ -270,11 +272,6 @@ graph TD
 **标签控制示例**
 
 ```yaml
-# Fargate 调度 (inference-env 系统组件)
-metadata:
-  labels:
-    fargate: enabled  # 匹配 Fargate Profile
-
 # Karpenter 调度 (GPU 推理)
 spec:
   nodeSelector:
