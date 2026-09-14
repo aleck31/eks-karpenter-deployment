@@ -59,6 +59,7 @@
 │   ├── voxcpm2-tts/                    # VoxCPM2 TTS 语音合成 (OpenAI兼容)
 │   ├── bitwarden/                      # Bitwarden密码管理
 │   ├── convertx/                       # ConvertX文件转换
+│   ├── firecrawl/                      # Firecrawl 网页抓取 API
 │   └── auto-draw-io/                   # Auto-Draw-IO
 ├── tests/                        # 测试组件
 │   ├── test-alb-ingress.yaml           # ALB Ingress 测试
@@ -74,6 +75,42 @@
 │   └── oss-tts-model-latency-benchmark.md     # TTS模型延迟对比
 └── README.md                     # 项目说明文档
 ```
+
+## 📦 配置与环境值分离
+
+多数模块采用 kustomize base + overlay，把「结构」与「环境取值」分开：
+
+```
+<模块>/
+├── base/                  # 入库：通用清单，不含任何环境相关取值
+└── overlays/
+    ├── example/           # 入库：示例取值，供复制
+    └── <env-name>/        # 不入库：真实取值
+```
+
+**部署方式**
+
+```bash
+# 复制示例 overlay，目录名建议用语义化环境名（如 general-env / inference-env）
+cp -r <模块>/overlays/example <模块>/overlays/<env-name>
+vi <模块>/overlays/<env-name>/kustomization.yaml     # 填入实际取值
+
+kubectl config current-context                        # 先确认目标集群
+kubectl apply -k <模块>/overlays/<env-name>
+```
+
+**几个约定**
+
+- 环境相关取值（namespace、账号 ID、S3 桶名、EFS 文件系统 ID、访问域名）一律不入库，
+  由 overlay 注入。仓库中出现的 `123456789012`、`yourdomain.com`、`fs-xxxx` 均为占位符。
+- `.gitignore` 默认忽略 `overlays/` 下全部目录、仅放行 `example/`，
+  因此无论 overlay 取什么名字，真实取值都不会误提交。
+- 凭据（token、API key、密码）不纳入 kustomize，改为 `kubectl create secret` 前置步骤，
+  或使用 `*secret.yaml`（已被 `.gitignore` 排除）。
+- **overlay 不决定部署到哪个集群**，`kubectl` 的当前 context 才决定。
+  两者不匹配时命令仍会成功，但会写入错误的环境，部署前务必核对。
+- 部分模块无环境相关取值（`tools/monitoring`、`tools/aperf`、`applications/firecrawl`），
+  保持扁平结构，直接 `kubectl apply -k` 或 `-f`。
 
 ## 🚀 快速开始
 

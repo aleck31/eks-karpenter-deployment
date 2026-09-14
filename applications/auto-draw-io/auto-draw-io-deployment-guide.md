@@ -144,10 +144,10 @@ kubectl apply -k overlays/<env-name>
 ### 步骤 4: 验证内网部署
 ```bash
 # 检查 Pod 状态
-kubectl get pods -n hostwo -l app=auto-draw-io
+kubectl get pods -n <namespace> -l app=auto-draw-io
 
 # 检查 Internal ALB
-kubectl get ingress auto-draw-io-ingress -n hostwo
+kubectl get ingress auto-draw-io-ingress -n <namespace>
 
 # 内网测试访问
 kubectl run test-pod --image=curlimages/curl:latest --rm -i --restart=Never -- \
@@ -243,28 +243,33 @@ aws route53 change-resource-record-sets \
 
 ### 查看应用日志
 ```bash
-kubectl logs -n hostwo deployment/auto-draw-io -f
+kubectl logs -n <namespace> deployment/auto-draw-io -f
 ```
 
 ### 重启服务
 ```bash
-kubectl rollout restart deployment/auto-draw-io -n hostwo
+kubectl rollout restart deployment/auto-draw-io -n <namespace>
 ```
 
 ### 更新配置
 ```bash
-# 更新 ConfigMap 后重启
-kubectl apply -f auto-draw-io-configmap.yaml
-kubectl rollout restart deployment/auto-draw-io -n hostwo
+# 修改 base/auto-draw-io-configmap.yaml（环境无关键）
+# 或 overlays/<env-name>/kustomization.yaml（域名、区域）后重新 apply
+kubectl apply -k overlays/<env-name>
+kubectl rollout restart deployment/auto-draw-io -n <namespace>
 
-# 更新 Secret 后重启
-kubectl apply -f auto-draw-io-secret.yaml
-kubectl rollout restart deployment/auto-draw-io -n hostwo
+# 更新 Secret（凭据不走 kustomize）
+kubectl create secret generic auto-draw-io-secret -n <namespace> \
+  --from-literal=AWS_BEARER_TOKEN_BEDROCK='<your-token>' \
+  --from-literal=ACCESS_CODE='<your-access-code>' \
+  --from-literal=TAVILY_API_KEY='<your-tavily-key>' \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl rollout restart deployment/auto-draw-io -n <namespace>
 ```
 
 ### 扩缩容
 ```bash
-kubectl scale deployment auto-draw-io --replicas=2 -n hostwo
+kubectl scale deployment auto-draw-io --replicas=2 -n <namespace>
 ```
 
 ## 🐛 故障排除
@@ -293,22 +298,22 @@ CloudFront wasn't able to resolve the origin domain name
 #### 3. Pod 启动失败
 ```bash
 # 检查 Pod 状态
-kubectl describe pod -n hostwo [pod-name]
+kubectl describe pod -n <namespace> [pod-name]
 
 # 检查配置
-kubectl get configmap auto-draw-io-config -n hostwo -o yaml
-kubectl get secret auto-draw-io-secret -n hostwo -o yaml
+kubectl get configmap auto-draw-io-config -n <namespace> -o yaml
+kubectl get secret auto-draw-io-secret -n <namespace> -o yaml
 ```
 
 ### 调试命令
 ```bash
 # 进入容器调试
-kubectl exec -it -n hostwo deployment/auto-draw-io -- /bin/sh
+kubectl exec -it -n <namespace> deployment/auto-draw-io -- /bin/sh
 
 # 测试内网连接
 kubectl run test-curl --image=curlimages/curl:latest --rm -it --restart=Never -- \
   curl -I http://auto-draw-io-service.hostwo.svc.cluster.local
 
 # 检查环境变量
-kubectl exec -n hostwo deployment/auto-draw-io -- env | grep -E "AWS_|AI_"
+kubectl exec -n <namespace> deployment/auto-draw-io -- env | grep -E "AWS_|AI_"
 ```

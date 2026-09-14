@@ -169,8 +169,8 @@ kubectl rollout restart deployment/bitwarden -n bitwarden
 
 ### 更新配置
 ```bash
-# 修改 ConfigMap 后重启
-kubectl apply -f bitwarden-configmap.yaml
+# 修改 base/bitwarden-configmap.yaml 或 overlays/<env-name>/kustomization.yaml 后
+kubectl apply -k overlays/<env-name>
 kubectl rollout restart deployment/bitwarden -n bitwarden
 ```
 
@@ -247,7 +247,7 @@ kubectl rollout status deployment/bitwarden -n bitwarden
 ### 配置更新
 ```bash
 # 更新配置后重启
-kubectl apply -f bitwarden-configmap.yaml
+kubectl apply -k overlays/<env-name>
 kubectl rollout restart deployment/bitwarden -n bitwarden
 ```
 

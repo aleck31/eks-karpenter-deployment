@@ -154,18 +154,18 @@ kubectl apply -k overlays/<env-name>
 
 ```bash
 # 查看 Pod 状态（两个都应 1/1 Running，同一节点）
-kubectl get pods -n hosthree -o wide
+kubectl get pods -n <namespace> -o wide
 
 # 检查 GPU Time-Slicing
 kubectl get node -l node-type=gpu -o jsonpath='{.items[*].status.allocatable.nvidia\.com/gpu}'
 # 预期输出: 2
 
 # 测试 ASR health
-kubectl port-forward -n hosthree svc/qwen3-asr-service 8000:80 &
+kubectl port-forward -n <namespace> svc/qwen3-asr-service 8000:80 &
 curl -s http://localhost:8000/health
 
 # 测试 TTS health
-kubectl port-forward -n hosthree svc/qwen3-tts-service 8880:80 &
+kubectl port-forward -n <namespace> svc/qwen3-tts-service 8880:80 &
 curl -s http://localhost:8880/health | python3 -m json.tool
 # 预期: "status": "healthy", "ready": true
 ```
@@ -173,7 +173,7 @@ curl -s http://localhost:8880/health | python3 -m json.tool
 ## API 使用
 
 ```bash
-ALB=<ALB_DNS_NAME>  # kubectl get ingress -n hosthree 查看实际地址
+ALB=<ALB_DNS_NAME>  # kubectl get ingress -n <namespace> 查看实际地址
 
 # ASR - 语音识别
 curl http://$ALB:8000/v1/audio/transcriptions \
@@ -282,11 +282,11 @@ docker push <AWS_ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/qwen3-tts:latest
 
 ```bash
 # 查看 Pod 日志
-kubectl logs -n hosthree deployment/qwen3-asr -c asr
-kubectl logs -n hosthree deployment/qwen3-tts
+kubectl logs -n <namespace> deployment/qwen3-asr -c asr
+kubectl logs -n <namespace> deployment/qwen3-tts
 
 # 查看 initContainer 日志 (模型下载)
-kubectl logs -n hosthree <pod-name> -c model-downloader
+kubectl logs -n <namespace> <pod-name> -c model-downloader
 
 # ASR 启动失败常见原因:
 # 1. "weights were not initialized" → 模型文件不完整，删除 EFS 目录重新下载
