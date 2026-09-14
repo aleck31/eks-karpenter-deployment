@@ -158,6 +158,11 @@ metadata:
     alb.ingress.kubernetes.io/target-type: ip
     alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}]'
     alb.ingress.kubernetes.io/healthcheck-path: /
+    # 限制 ALB 入站来源。不设此项时控制器托管的安全组默认放开 0.0.0.0/0，
+    # 使 ALB 域名可被直连、绕过 CloudFront 上的任何防护。
+    # 取值为 AWS 托管前缀列表 com.amazonaws.global.cloudfront.origin-facing 的 ID，
+    # 各 region 不同，由 overlay 覆盖为实际值。
+    alb.ingress.kubernetes.io/security-group-prefix-lists: pl-xxxxxxxx
 spec:
   ingressClassName: alb
   rules:

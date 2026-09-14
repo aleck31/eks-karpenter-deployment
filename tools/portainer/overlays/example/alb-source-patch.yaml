@@ -1,0 +1,11 @@
+# ALB 入站来源限制。取 AWS 托管前缀列表
+# com.amazonaws.global.cloudfront.origin-facing 在本集群所属 region 的 ID：
+#   aws ec2 describe-managed-prefix-lists --region <region> \
+#     --filters Name=prefix-list-name,Values=com.amazonaws.global.cloudfront.origin-facing \
+#     --query 'PrefixLists[].PrefixListId' --output text
+#
+# 仅允许 CloudFront 回源，阻断对 ALB 域名的直连。
+# 若不经 CloudFront 暴露，改为 inbound-cidrs 指定办公出口网段。
+- op: replace
+  path: /metadata/annotations/alb.ingress.kubernetes.io~1security-group-prefix-lists
+  value: "pl-xxxxxxxx"

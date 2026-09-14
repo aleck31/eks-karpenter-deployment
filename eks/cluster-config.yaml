@@ -18,6 +18,23 @@ metadata:
 vpc:
   cidr: "10.1.0.0/16"
 
+  # API Server 端点访问控制。
+  #
+  # 认证本身是强制的：无凭据请求 /version 或 /api 均返回 401，
+  # 仅 /healthz、/livez 匿名可达（只暴露存活状态）。因此公网端点并非"敞开"，
+  # 收窄的目的是缩小攻击面，而非补认证。
+  #
+  # 必须先开 privateAccess 再收窄 publicAccessCIDRs：
+  # privateAccess 为 false 时节点是经 NAT 走公网端点连 API Server 的，
+  # 此时收窄白名单若未包含 NAT 出口 IP，将导致全部节点失联。
+  # 开启 privateAccess 后节点改走 VPC 内路径，白名单只需覆盖运维出口。
+  #
+  # publicAccessCIDRs 只接受 CIDR 字面量，不能引用托管前缀列表 ID，
+  # 故由 eks/sync-endpoint-cidrs.sh 从前缀列表展开同步（上限 40 条）。
+  clusterEndpoints:
+    publicAccess: true
+    privateAccess: true
+
 # 可用区配置 (新加坡区域 3 个 AZ)
 availabilityZones:
   - ap-southeast-1a

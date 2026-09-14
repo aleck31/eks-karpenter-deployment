@@ -17,3 +17,8 @@ patches:
     target:
       kind: Deployment
       name: portainer
+  # ALB 入站来源限制（仅允许 CloudFront 回源）
+  - path: alb-source-patch.yaml
+    target:
+      kind: Ingress
+      name: portainer-ingress

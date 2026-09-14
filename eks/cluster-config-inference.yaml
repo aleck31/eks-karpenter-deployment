@@ -26,6 +26,13 @@ metadata:
   name: inference-env
   region: us-west-2
 
+# API Server 端点访问控制，说明见 eks/cluster-config.yaml 同段注释。
+# 收窄 publicAccessCIDRs 前必须先开 privateAccess，否则节点经 NAT 走公网端点会失联。
+vpc:
+  clusterEndpoints:
+    publicAccess: true
+    privateAccess: true
+
 iam:
   podIdentityAssociations:
     # 以下三个为跨集群共用角色（两个集群共用同一角色）
