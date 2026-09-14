@@ -1,4 +1,5 @@
-# Portainer 的 --trusted-origins 需填实际访问域名
+# Portainer 的 --trusted-origins 须为 scheme://host 形式，
+# 缺少 scheme 会导致启动失败：invalid trusted origin
 - op: replace
   path: /spec/template/spec/containers/0/args/1
-  value: "portainer.yourdomain.com"
+  value: "https://portainer.yourdomain.com"

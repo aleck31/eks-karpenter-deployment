@@ -61,7 +61,7 @@ spec:
         image: portainer/portainer-ce:latest
         args:
         - "--trusted-origins"
-        - "YOUR_PORTAINER_DOMAIN"  # Replace with your actual Portainer access domain, e.g: portainer.example.com
+        - "https://YOUR_PORTAINER_DOMAIN"  # 须含 scheme，Portainer 新版会校验，如 https://portainer.example.com
         ports:
         - containerPort: 9000
         - containerPort: 8000
