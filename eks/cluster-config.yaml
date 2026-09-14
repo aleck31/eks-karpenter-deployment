@@ -59,7 +59,9 @@ iam:
     #   roleName: KarpenterServiceAccount-eks-karpenter-env
     #   roleOnly: true
 
-    # AWS LoadBalancer Controller 服务账户 (v2.13.4 不支持 Pod Identity)
+      # AWS LoadBalancer Controller 服务账户（IRSA）
+      # ALB Controller 自 v2.13.4 起实测可用 Pod Identity，v3.x 官方示例即采用该方式。
+      # 迁移到 Pod Identity 后本段可移除，改由 eks create-pod-identity-association 配置。
     - metadata:
         name: aws-load-balancer-controller
         namespace: kube-system
