@@ -42,27 +42,6 @@ REF_MAX_SECONDS = 10.0
 # registry so each migration runs once and never re-infers on later boots.
 REGISTRY_SCHEMA = 2
 
-# Voice Design fallback descriptions (used when no reference audio registered)
-# Descriptions for Voice Design, used when the caller passes a description
-# instead of a registered voice_id. All 13 names below also exist as registered
-# voiceprints, so their timbre comes from the stored recording, not from these
-# strings -- they remain only so that a bare name still resolves to something
-# sensible if it is ever unregistered.
-VOICE_DESIGN: dict[str, str] = {
-    "alloy": "Female voice. A young woman in her mid-20s with a clear, balanced, and versatile voice. Speaks with natural confidence and a neutral American accent, suitable for narration and general conversation",
-    "ash": "Male voice. A young man in his late 20s with a confident, direct voice. Slightly husky tone with assertive delivery, like a tech podcast host",
-    "ballad": "Male voice. A warm-toned man in his 30s with an expressive, melodic voice. Rich baritone with gentle emotional inflections, like a storyteller by the fireplace",
-    "coral": "Female voice. A friendly young woman in her mid-20s with a bright, conversational voice. Speaks with natural warmth and a slight smile, like chatting with a close friend",
-    "echo": "Male voice. A young man in his late 20s with a smooth, warm voice. Relaxed and easygoing delivery with a mellow tone, like a late-night radio DJ",
-    "fable": "Male voice. A distinguished British gentleman in his 40s with a deep, authoritative voice. Refined accent with measured pacing, like a classic audiobook narrator",
-    "onyx": "Male voice. A mature man in his 40s with a deep, resonant bass voice. Calm and composed delivery that commands attention, like a documentary narrator",
-    "nova": "Female voice. A young woman in her early 20s with an energetic, bright voice. Enthusiastic and upbeat with a playful sparkle, perfect for engaging with children and young audiences",
-    "sage": "Female voice. A composed woman in her 30s with a calm, reassuring voice. Speaks with quiet authority and gentle wisdom, like a trusted counselor or teacher",
-    "shimmer": "Female voice. A gentle young woman with a soft, warm, and soothing voice. Tender and nurturing tone with a comforting quality, like a kind older sister reading a bedtime story",
-    "verse": "Male voice. A clear-spoken man in his early 30s with an articulate, versatile voice. Precise diction with natural expressiveness, like a professional voice actor",
-    "marin": "Female voice. A natural young woman in her mid-20s with an approachable, down-to-earth voice. Casual and relatable with authentic warmth, like a friendly neighbor",
-    "cedar": "Male voice. A steady, trustworthy man in his late 40s with a mature, grounded voice. Reliable and reassuring tone with unhurried pacing, like a wise mentor",
-}
 
 CONTENT_TYPES = {
     "mp3": "audio/mpeg",
@@ -312,35 +291,41 @@ class SpeechRequest(BaseModel):
     speed: float = Field(default=1.0, ge=0.25, le=4.0)
     stream: bool = Field(default=False)
     cfg_value: float | None = Field(default=None, description="CFG guidance scale (default 1.5)")
+    voice_description: str | None = Field(
+        default=None,
+        description="Generate from a description instead of a registered voice. Timbre "
+                    "varies between calls; register a voice to get a stable one.",
+    )
 
 
 @app.post("/v1/audio/speech")
 async def create_speech(req: SpeechRequest):
-    # Check if voice has registered reference audio
-    ref_b64 = _get_voice_audio_b64(req.voice)
-
-    if ref_b64:
-        # Controllable Cloning: timbre anchored to a stored recording
+    # Voice Design must be asked for explicitly. Inferring it from an
+    # unrecognised voice value -- as this endpoint used to -- means a typo'd or
+    # stale voice id answers 200 with an arbitrary timbre, and the caller has no
+    # way to notice.
+    if req.voice_description is not None:
+        payload = {"target_text": f"({req.voice_description}){req.input}"}
+    else:
+        if req.voice not in _load_registry():
+            raise HTTPException(
+                status_code=404,
+                detail=f"Voice '{req.voice}' is not registered. List available voices at "
+                       "GET /v1/audio/voices, or pass voice_description to generate from a "
+                       "description instead.",
+            )
+        ref_b64 = _get_voice_audio_b64(req.voice)
+        if ref_b64 is None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Voice '{req.voice}' is registered but its reference audio is "
+                       "unavailable, so the timbre it promises cannot be reproduced.",
+            )
         payload = {
             "target_text": req.input,
             "ref_audio_wav_base64": ref_b64,
             "ref_audio_wav_format": "wav",
         }
-    else:
-        # Voice Design: the voice value is treated as a description. Reached
-        # either because the caller passed a description instead of a
-        # registered voice_id, or because a registered voice lost its
-        # recording -- the latter silently changes timbre, so refuse it when
-        # the entry exists but its audio does not.
-        if req.voice in _load_registry():
-            raise HTTPException(
-                status_code=503,
-                detail=f"Voice '{req.voice}' is registered but its reference audio is "
-                       "unavailable. Refusing to fall back to Voice Design, which would "
-                       "return a different timbre under the same voice id.",
-            )
-        voice_desc = VOICE_DESIGN.get(req.voice, req.voice)
-        payload = {"target_text": f"({voice_desc}){req.input}"}
 
     if req.cfg_value is not None:
         payload["cfg_value"] = req.cfg_value

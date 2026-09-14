@@ -19,14 +19,16 @@
 
 ### 两种模式
 
-1. **Controllable Cloning**（已注册 voice）— 使用参考音频克隆音色，音色一致
-2. **Voice Design**（voice 值为文字描述）— 按描述生成声音，音色每次不同
+1. **Controllable Cloning**（`voice` = 已注册 voice ID）— 使用参考音频克隆音色，音色一致
+2. **Voice Design**（`voice_description` = 文字描述）— 按描述生成声音，音色每次不同
 
-传入的 `voice` 值命中注册表时走 Cloning，否则整个字符串被当作描述走 Voice Design。
+**两种模式由不同字段区分,不会互相回落。** `voice` 只接受已注册 ID，未注册直接返回 **404**；要用描述生成必须显式传 `voice_description`。
+
+这样设计是因为让 `voice` 同时接受 ID 和描述会导致打错或过期的 ID 被当作描述使用，返回 200 加一个任意音色，调用方无从察觉。
 
 注意 Cloning 保证的是**音色一致**，不是逐字节可复现 —— VoxCPM2 是 diffusion 模型，同一参考音频同一文本两次调用的输出字节不同，但音色相同。
 
-已注册 voice 的参考音频若丢失，`/v1/audio/speech` 返回 **503** 而非退化到 Voice Design。同一个 voice ID 返回不同音色属于违背契约，因此宁可失败。
+已注册 voice 的参考音频若丢失，返回 **503** 而非退化到 Voice Design。同一个 voice ID 返回不同音色属于违背契约，因此宁可失败。
 
 ### 预置 Voice
 
@@ -142,6 +144,19 @@ curl -X POST http://<ALB>:8880/v1/audio/speech \
   }' --output speech.mp3
 ```
 
+### 按描述生成（Voice Design）
+
+```bash
+curl -X POST http://<ALB>:8880/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": "要合成的文本",
+    "voice_description": "Male voice. A calm narrator with a low steady tone"
+  }' --output out.mp3
+```
+
+不传 `voice`，改传 `voice_description`。音色每次不同，需要稳定音色请注册声纹后用 `voice`。
+
 ### 流式输出
 
 ```bash
@@ -235,7 +250,7 @@ curl -sX DELETE $ALB/v1/audio/voices/user-1024
 | 状态码 | 场景 | 客户端应对 |
 |--------|------|-----------|
 | 403 | 对预置 voice 执行 DELETE、或 PUT/POST 替换其参考音频 | 换一个 `voice_id`；UI 应对 `builtin: true` 的条目禁用删除与替换 |
-| 404 | voice 不存在；或 `/preview` 的参考音频缺失 | 检查 `voice_id` |
+| 404 | `voice` 未注册；或 `/preview` 的参考音频缺失 | 用 `GET /v1/audio/voices` 核对 ID；若本意是按描述生成，改用 `voice_description` |
 | 503 | 已注册 voice 的参考音频缺失，拒绝退化到 Voice Design | 调 detail 确认 `reference_audio` 状态，重新注册 |
 | 400 | 不支持的 `response_format` | 见「支持的输出格式」 |
 
