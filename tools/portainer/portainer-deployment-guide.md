@@ -20,49 +20,37 @@ kubectl get svc -n portainer
 
 ## 方法二：完整部署（Portainer CE + Agent + EFS 持久化存储）
 
-### 1. 创建 Fargate Profile（可选）
+### 1. 准备 overlay
+
+采用 kustomize base + overlay，环境相关取值（EFS 文件系统 ID、访问域名）不入库。
 
 ```bash
-# 获取 Fargate 执行角色
-FARGATE_ROLE=$(aws eks describe-fargate-profile \
-  --cluster-name eks-karpenter-env \
-  --fargate-profile-name default \
-  --region us-east-1 \
-  --profile lab \
-  --query 'fargateProfile.podExecutionRoleArn' \
-  --output text)
+cp -r overlays/example overlays/<env-name>
 
-# 创建 Portainer Fargate Profile
-aws eks create-fargate-profile \
-  --cluster-name eks-karpenter-env \
-  --fargate-profile-name portainer \
-  --pod-execution-role-arn $FARGATE_ROLE \
-  --selectors namespace=portainer \
-  --region us-east-1 \
-  --profile lab
+# 编辑两处：
+#   efs-patch.yaml     fileSystemId 改为你的 EFS 文件系统 ID
+#   domain-patch.yaml  访问域名（Portainer 的 --trusted-origins）
+vi overlays/<env-name>/efs-patch.yaml
+vi overlays/<env-name>/domain-patch.yaml
 ```
 
-### 2. 配置 EFS 持久化存储
+> `.gitignore` 默认忽略 `overlays/` 下全部目录、仅放行 `example/`，真实取值不会误提交。
+
+### 2. 创建 Namespace
 
 ```bash
-# 创建 Portainer 专用 StorageClass
-kubectl apply -f portainer-efs-storageclass.yaml
-
-# 创建 PVC
-kubectl apply -f portainer-efs-pvc.yaml
-
-# 验证存储
-kubectl get storageclass efs-portainer
-kubectl get pvc -n portainer
+kubectl create namespace portainer
 ```
 
-### 3. 部署 Portainer
+### 3. 部署
+
+一次性创建 StorageClass、PVC、Portainer CE、Agent、Service、Ingress：
 
 ```bash
-# 部署完整 Portainer 套件（包含 EFS 存储配置）
-kubectl apply -f portainer-deployment.yaml
+kubectl config current-context          # 先确认目标集群
+kubectl apply -k overlays/<env-name>
 
-# 验证部署
+# 验证
 kubectl get pods -n portainer -o wide
 kubectl get ingress -n portainer
 ```
@@ -80,7 +68,6 @@ kubectl get ingress -n portainer portainer-ingress \
 ### EFS 存储优势
 - **持久化** - Pod 重启后数据保持
 - **共享** - 支持多 Pod 访问（如果需要）
-- **Fargate 兼容** - 与 Fargate 完全兼容
 
 ### 存储路径
 - **EFS 文件系统**: `fs-0123456789abcdef0`
@@ -105,7 +92,7 @@ kubectl get all -n portainer
 # 检查存储
 kubectl get pvc,pv -n portainer
 
-# 检查节点分布（应该在 Fargate 上）
+# 检查节点分布
 kubectl get pods -n portainer -o wide
 
 # 测试数据持久化
@@ -122,12 +109,6 @@ kubectl delete deployment,service,ingress -n portainer --all
 # 完全清理（包括数据）
 kubectl delete namespace portainer
 
-# 删除 Fargate Profile（可选）
-aws eks delete-fargate-profile \
-  --cluster-name eks-karpenter-env \
-  --fargate-profile-name portainer \
-  --region us-east-1 \
-  --profile lab
 ```
 
 ## 故障排除

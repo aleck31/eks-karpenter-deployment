@@ -1,0 +1,4 @@
+# Portainer 的 --trusted-origins 需填实际访问域名
+- op: replace
+  path: /spec/template/spec/containers/0/args/1
+  value: "portainer.yourdomain.com"

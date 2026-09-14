@@ -55,7 +55,6 @@ spec:
     metadata:
       labels:
         app: portainer
-        fargate: enabled
     spec:
       containers:
       - name: portainer
@@ -91,7 +90,6 @@ spec:
     metadata:
       labels:
         app: portainer-agent
-        fargate: enabled
     spec:
       serviceAccountName: portainer-sa-clusteradmin
       containers:

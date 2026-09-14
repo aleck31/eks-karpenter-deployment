@@ -1,0 +1,8 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# base 只描述结构。EFS 文件系统 ID 由 overlays/<env>/ patch 注入。
+resources:
+  - portainer-efs-storageclass.yaml
+  - portainer-efs-pvc.yaml
+  - portainer-deployment.yaml

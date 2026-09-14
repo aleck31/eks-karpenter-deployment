@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 示例 overlay：展示需要按环境提供哪些值。
+# 用法：复制本目录为 overlays/<环境名>/，填入真实值。
+
+namespace: portainer
+
+resources:
+  - ../../base
+
+# EFS 文件系统 ID（每个集群不同）
+patches:
+  - path: efs-patch.yaml
+  # 访问域名（--trusted-origins）
+  - path: domain-patch.yaml
+    target:
+      kind: Deployment
+      name: portainer
