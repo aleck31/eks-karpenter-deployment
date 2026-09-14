@@ -13,12 +13,19 @@
 
 ## 📁 部署文件结构
 
+采用 kustomize base + overlay，环境相关取值（namespace、域名、邮箱）不入库。
+
 ```
 applications/bitwarden/
-├── bitwarden-deployment-guide.md     # 本部署指南
-├── bitwarden-configmap.yaml          # 环境变量配置
-├── bitwarden-efs-pvc.yaml            # EFS 持久卷声明
-└── bitwarden-deployment.yaml         # 应用部署 + Service + Ingress
+├── base/
+│   ├── kustomization.yaml
+│   ├── bitwarden-configmap.yaml      # 环境无关配置
+│   ├── bitwarden-efs-pvc.yaml        # EFS 持久卷声明
+│   └── bitwarden-deployment.yaml     # 应用部署 + Service + Ingress
+├── overlays/
+│   ├── example/                      # 入库：示例取值，供复制
+│   └── <env-name>/                   # 不入库：真实取值
+└── bitwarden-deployment-guide.md     # 本部署指南
 ```
 
 ## 🎯 前提条件
@@ -71,23 +78,35 @@ applications/bitwarden/
 
 ### 步骤 1: 创建 Namespace
 ```bash
-kubectl create namespace bitwarden
+kubectl create namespace <namespace>
 ```
 
-### 步骤 2: 创建 EFS 持久卷
+### 步骤 2: 准备 overlay
 ```bash
-kubectl apply -f bitwarden-efs-pvc.yaml
+cp -r overlays/example overlays/<env-name>
+
+# 编辑 namespace 与三项配置：
+#   BW_DOMAIN                             访问域名
+#   globalSettings__mail__replyToEmail    发信回复地址
+#   adminSettings__admins                 管理员邮箱
+vi overlays/<env-name>/kustomization.yaml
 ```
 
-### 步骤 3: 创建配置映射
+> `.gitignore` 默认忽略 `overlays/` 下全部目录、仅放行 `example/`，真实取值不会误提交。
+
+### 步骤 3: 部署
+
+一次性创建 EFS PVC、ConfigMap、Deployment、Service、Ingress：
+
 ```bash
-kubectl apply -f bitwarden-configmap.yaml
+kubectl config current-context          # 先确认目标集群
+kubectl apply -k overlays/<env-name>
 ```
 
-### 步骤 4: 部署应用
-```bash
-kubectl apply -f bitwarden-deployment.yaml
-```
+### 步骤 4: 获取安装凭据
+
+首次部署需在 https://bitwarden.com/host/ 获取 installation id/key，
+填入 overlay 后重新 apply。
 
 ### 步骤 5: 验证部署
 ```bash

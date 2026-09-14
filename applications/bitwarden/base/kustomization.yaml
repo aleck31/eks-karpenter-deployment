@@ -1,0 +1,9 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# base 只描述结构与占位配置。
+# namespace 与域名/邮箱由 overlays/<env>/ 注入。
+resources:
+  - bitwarden-configmap.yaml
+  - bitwarden-efs-pvc.yaml
+  - bitwarden-deployment.yaml
