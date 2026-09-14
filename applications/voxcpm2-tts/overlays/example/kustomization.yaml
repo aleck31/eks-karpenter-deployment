@@ -16,3 +16,15 @@ images:
   - name: 123456789012.dkr.ecr.us-west-2.amazonaws.com/voxcpm2-tts
     newName: <your-account-id>.dkr.ecr.<your-region>.amazonaws.com/voxcpm2-tts
     newTag: latest
+
+# ALB 入站来源限制。不设则控制器托管的安全组默认放开 0.0.0.0/0。
+# 该注解按 listen-port 生效：本模块 (8880) 与 qwen3-speech (8000) 共享
+# 同一 ALB，两边 overlay 需各自声明。
+patches:
+  - target:
+      kind: Ingress
+      name: voxcpm2-tts-ingress
+    patch: |
+      - op: add
+        path: /metadata/annotations/alb.ingress.kubernetes.io~1security-group-prefix-lists
+        value: pl-xxxxxxxxxxxxxxxxx

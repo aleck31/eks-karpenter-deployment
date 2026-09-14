@@ -17,6 +17,17 @@ resources:
 patches:
   - path: efs-patch.yaml
 
+  # ALB 入站来源限制。不设则控制器托管的安全组默认放开 0.0.0.0/0。
+  # 该注解按 listen-port 生效：本模块 (8000) 与 voxcpm2-tts (8880) 共享
+  # 同一 ALB，两边 overlay 需各自声明。
+  - target:
+      kind: Ingress
+      name: qwen3-asr-ingress
+    patch: |
+      - op: add
+        path: /metadata/annotations/alb.ingress.kubernetes.io~1security-group-prefix-lists
+        value: pl-xxxxxxxxxxxxxxxxx
+
 images:
   - name: 123456789012.dkr.ecr.us-west-2.amazonaws.com/qwen3-asr
     newName: <your-account-id>.dkr.ecr.<your-region>.amazonaws.com/qwen3-asr
