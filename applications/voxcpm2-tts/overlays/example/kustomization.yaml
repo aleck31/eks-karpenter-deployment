@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 示例 overlay：展示需要按环境提供哪些值。
+# 用法：复制本目录为 overlays/<环境名>/，填入真实值。
+#
+# 依赖：模型存储复用 qwen3-speech 模块的 qwen3-models-pvc，
+# 需先部署 applications/qwen3-speech 的 base/shared/。
+
+namespace: your-namespace
+
+resources:
+  - ../../base
+
+images:
+  - name: 123456789012.dkr.ecr.us-west-2.amazonaws.com/voxcpm2-tts
+    newName: <your-account-id>.dkr.ecr.<your-region>.amazonaws.com/voxcpm2-tts
+    newTag: latest

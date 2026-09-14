@@ -154,25 +154,62 @@ curl -X POST http://<ALB>:8880/v1/audio/voices \
 - Voice 参考音频: EFS `/shared/voices/{voice_id}/ref.wav`
 - Voice 注册表: EFS `/shared/voices/registry.json`
 
+> 模型存储复用 qwen3-speech 模块的 `qwen3-models-pvc`，
+> 需先部署 `applications/qwen3-speech/base/shared/`（EFS StorageClass + PVC）。
+
 ## 部署
+
+采用 kustomize base + overlay，环境相关取值（namespace、ECR 账号）不入库。
+
+```
+applications/voxcpm2-tts/
+├── base/
+│   ├── kustomization.yaml
+│   ├── voxcpm2-tts-deployment.yaml   # Deployment + Service
+│   └── voxcpm2-tts-ingress.yaml      # ALB Ingress (group: speech-services)
+├── overlays/
+│   ├── example/                      # 入库：示例取值，供复制
+│   └── <env-name>/                   # 不入库：真实取值
+├── Dockerfile                        # adapter 层
+├── Dockerfile.base                   # Nano-vLLM 基础镜像
+├── openai-adapter.py
+└── entrypoint.sh
+```
 
 ### 构建镜像
 
 ```bash
-# 构建 adapter 层（~3秒）
-DOCKER_BUILDKIT=1 docker buildx build -t voxcpm2-tts:latest --load .
-docker tag voxcpm2-tts:latest <account>.dkr.ecr.us-west-2.amazonaws.com/voxcpm2-tts:latest
-docker push <account>.dkr.ecr.us-west-2.amazonaws.com/voxcpm2-tts:latest
+# 基础镜像（首次或依赖变更时）
+docker build -f Dockerfile.base -t voxcpm2-tts:base-2.0.3 .
+
+# adapter 层（~3秒）。BASE_IMAGE 指向基础镜像所在位置
+DOCKER_BUILDKIT=1 docker buildx build --load \
+  --build-arg BASE_IMAGE=<account>.dkr.ecr.<region>.amazonaws.com/voxcpm2-tts:base-2.0.3 \
+  -t voxcpm2-tts:latest .
+
+docker tag voxcpm2-tts:latest <account>.dkr.ecr.<region>.amazonaws.com/voxcpm2-tts:latest
+docker push <account>.dkr.ecr.<region>.amazonaws.com/voxcpm2-tts:latest
 ```
+
+### 准备 overlay
+
+```bash
+cp -r overlays/example overlays/<env-name>
+# 编辑 namespace 与 ECR 镜像地址
+vi overlays/<env-name>/kustomization.yaml
+```
+
+> `.gitignore` 默认忽略 `overlays/` 下全部目录、仅放行 `example/`，真实取值不会误提交。
 
 ### 部署到 EKS
 
 ```bash
-# 先删旧 Pod 再部署新的，避免 GPU 争抢
-kubectl scale deployment voxcpm2-tts -n hosthree --replicas=0
-# 待旧 Pod 终止后
-kubectl apply -f voxcpm2-tts-deployment.yaml
-kubectl scale deployment voxcpm2-tts -n hosthree --replicas=1
+kubectl config current-context          # 先确认目标集群
+
+# 先清空旧 Pod 再部署，避免与新 Pod 争抢同一张 GPU 导致 OOM
+kubectl scale deployment voxcpm2-tts -n <namespace> --replicas=0
+# 待旧 Pod 完全终止后
+kubectl apply -k overlays/<env-name>
 ```
 
 ## 硬件配置
