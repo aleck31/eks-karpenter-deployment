@@ -218,7 +218,7 @@ kubectl get storageclass efs-sc
 kubectl run test-curl --image=curlimages/curl:latest --rm -it --restart=Never -- curl -I http://bitwarden-service.bitwarden.svc.cluster.local/alive
 
 # 测试 Internal ALB 连接
-kubectl run test-curl --image=curlimages/curl:latest --rm -it --restart=Never -- curl -I http://internal-k8s-bitwarden-bitwarde-038bec7911-328030193.ap-southeast-1.elb.amazonaws.com/alive
+kubectl run test-curl --image=curlimages/curl:latest --rm -it --restart=Never -- curl -I http://<internal-alb-dns>/alive
 ```
 
 ### 调试命令
