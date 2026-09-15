@@ -52,6 +52,35 @@
 | `shimmer` | 柔和女声，温柔治愈，如姐姐讲故事 | 睡前故事、安抚场景 |
 | `verse` | 清晰男声，吐字精准，表现力强 | 专业配音、新闻播报 |
 
+### 制作预置参考音频
+
+预置声纹本身用 Voice Design 生成，再注册为参考音频。要点如下。
+
+**描述里必须显式约束录音环境。** VoxCPM 会把描述中的环境特征一并合成 —— 官方文档说 prompt 的 "background sounds and ambiance will be replicated"，这对生成同样成立。不写约束，模型可能自行加入环境音，听起来就是底噪。
+
+```
+Clean studio recording, no background noise, no room reverb
+Dry close-mic studio recording, silent background
+```
+
+**一次生成挑不出好的，官方建议生成 1~3 次。** VoxCPM README 的 Risks 一节写明 Voice Design 与 Controllable Cloning 的结果 run 与 run 之间会变化。实践中每个 voice 生成 5 个候选、试听挑选比较稳妥。
+
+**CFG 值影响明显，按文本长度调。** 短句提高（2.0~2.5）增强清晰度，长文降低（1.2~1.5）提升稳定性。同一描述不同 CFG 的产出差异可能大于不同描述之间的差异。
+
+**音色相关的措辞会带来副作用。** 例如描述里强调 `Rich baritone`（浑厚男中音）会显著抬高低频能量，听感接近低频轰鸣。改为 `Mid-range voice, clear and articulate, not deep or boomy` 可缓解。
+
+**语速不要指望用描述控制。** `unhurried` / `speaks slowly` / `deliberately slow pacing` 之类措辞对语速的影响不稳定，实测加了约束反而比不加更快。要放慢就在文本里加标点制造停顿。
+
+**筛选只能靠试听。** 频谱指标（低频占比、高频占比、DC offset）与感知底噪不相关 —— 低频能量大部分属于音色而非噪声，据此排序会得出与听感相反的结论。指标只适合发现异常离群值（例如某条 DC offset 比同批高一到两个数量级）。
+
+生成后按与服务端一致的方式归一化，再写入参考音频目录：
+
+```bash
+ffmpeg -i raw.wav -af loudnorm=I=-16:TP=-1.5:LRA=11 -ar 16000 -ac 1 ref.wav
+```
+
+预置 voice 受 403 保护，替换需直接写入共享卷，并同步 `registry.json` 里该条目的 `audio` 字段（否则 detail 会继续返回旧时长）。
+
 ### Voice 管理 API
 
 ```bash
