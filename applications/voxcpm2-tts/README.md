@@ -55,20 +55,21 @@
 ### Voice 管理 API
 
 ```bash
-# 列出所有 voice（摘要：voice_id / name / description / type / builtin）
+# 列出所有 voice（摘要：voice_id / name / description / gender / type / builtin）
 GET /v1/audio/voices
 
 # 注册新 voice（上传参考音频，自动归一化为 16kHz mono -16 LUFS）
 POST /v1/audio/voices
-  Form: voice_id, name, description, audio(file)
+  Form: voice_id, name, description, gender, audio(file)
   → 403 若 voice_id 是预置 voice
+  → 400 若 gender 不在 female / male / neutral / unknown 之内
 
 # 查询单个 voice（含音频元数据与服务端质量判定，见下）
 GET /v1/audio/voices/{voice_id}
 
 # 更新 voice
 PUT /v1/audio/voices/{voice_id}
-  Form: name, description, audio(file)
+  Form: name, description, gender, audio(file)
   → 403 若对预置 voice 传 audio；仅改 name/description 允许
 
 # 删除 voice
@@ -80,6 +81,16 @@ GET /v1/audio/voices/{voice_id}/preview
   → 404 若参考音频缺失
 ```
 
+### 性别字段
+
+`gender` 取值 `female` / `male` / `neutral` / `unknown`，list 与 detail 均返回，可用于前端分组或筛选。
+
+**由调用方在注册时声明，服务端不做自动推断。** 不传默认 `unknown`；取值不在枚举内返回 400。已注册的 voice 可通过 PUT 修正，预置 voice 也允许改（它属于元数据，不是音频内容）。
+
+不从音频推断的原因：基频判别会误判女低音、男高音、童声与非二元发声，标错比不标更糟。13 个预置 voice 的性别已人工标注，用户注册的自定义 voice 若未声明则保持 `unknown`。
+
+不要用 `description` 里的 "female" / "male" 字样判断性别 —— 它是自由文本、可被 PUT 改写，且 `female` 含有 `male` 子串，朴素匹配会误判。
+
 **list 与 detail 的区别**：list 返回摘要，detail 额外返回 `created_at`（预置为 `null`）、音频元数据、以及 `reference_audio` 与 `warnings`。
 
 detail 响应示例：
@@ -89,6 +100,7 @@ detail 响应示例：
   "voice_id": "cedar",
   "name": "Cedar",
   "description": "Steady, mature male mentor",
+  "gender": "male",
   "created_at": null,
   "type": "builtin",
   "builtin": true,

@@ -45,6 +45,11 @@ REF_GOOD_MIN_SECONDS = 5.0
 REF_GOOD_MAX_SECONDS = 10.0
 REF_MAX_USEFUL_SECONDS = 15.0
 
+# Declared by the caller at registration, never inferred from the audio: pitch
+# alone misreads altos, tenors, children and non-binary speakers, and a wrong
+# label is worse than none. Unlabelled voices stay "unknown".
+VOICE_GENDERS = ("female", "male", "neutral", "unknown")
+
 # Bumped when a _heal_registry() migration is added. Persisted next to the
 # registry so each migration runs once and never re-infers on later boots.
 REGISTRY_SCHEMA = 2
@@ -208,6 +213,11 @@ def _heal_registry() -> dict:
     # only fills entries written before that, and is keyed on the file existing
     # rather than on any inference about the entry's origin.
     for voice_id, meta in registry.items():
+        # A plain default for a field added later, not an inference about the
+        # entry: gender is declared by the caller or stays unknown.
+        if "gender" not in meta:
+            meta["gender"] = "unknown"
+            changed = True
         if "audio" not in meta:
             audio_path = VOICES_DIR / voice_id / meta.get("file", "ref.wav")
             if audio_path.exists():
@@ -229,6 +239,15 @@ def _heal_registry() -> dict:
     return registry
 
 
+def _validate_gender(gender: str) -> str:
+    if gender not in VOICE_GENDERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"gender must be one of {', '.join(VOICE_GENDERS)}; got '{gender}'",
+        )
+    return gender
+
+
 def _assert_not_builtin(registry: dict, voice_id: str, action: str):
     """Reject destructive actions on built-in preset voices.
 
@@ -244,13 +263,7 @@ def _assert_not_builtin(registry: dict, voice_id: str, action: str):
         )
 
 
-@app.on_event("startup")
-async def _startup_heal():
-    _heal_registry()
-
-
 # --- Audio helpers ---
-
 def _convert_audio(audio_bytes: bytes, target_format: str) -> bytes:
     audio = AudioSegment.from_mp3(io.BytesIO(audio_bytes))
     buf = io.BytesIO()
@@ -400,6 +413,7 @@ async def list_voices():
         voices.append({
             "voice_id": vid, "name": meta.get("name", vid),
             "description": meta.get("description", ""),
+            "gender": meta.get("gender", "unknown"),
             "type": "builtin" if meta.get("builtin") else "custom",
             "builtin": bool(meta.get("builtin")),
         })
@@ -411,9 +425,11 @@ async def create_voice(
     voice_id: str = Form(...),
     name: str = Form(None),
     description: str = Form(None),
+    gender: str = Form("unknown"),
     audio: UploadFile = File(...),
 ):
     registry = _load_registry()
+    _validate_gender(gender)
 
     # Guard: never let a POST silently overwrite a built-in preset
     _assert_not_builtin(registry, voice_id, "overwriting via registration")
@@ -432,6 +448,7 @@ async def create_voice(
         "file": "ref.wav",
         "name": name or voice_id,
         "description": description or "",
+        "gender": gender,
         "builtin": False,
         "audio": audio_meta,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -447,6 +464,7 @@ async def update_voice(
     voice_id: str,
     name: str = Form(None),
     description: str = Form(None),
+    gender: str = Form(None),
     audio: UploadFile = File(None),
 ):
     registry = _load_registry()
@@ -468,6 +486,8 @@ async def update_voice(
         registry[voice_id]["name"] = name
     if description is not None:
         registry[voice_id]["description"] = description
+    if gender is not None:
+        registry[voice_id]["gender"] = _validate_gender(gender)
     _save_registry(registry)
     return {"voice_id": voice_id, "status": "updated"}
 
@@ -487,6 +507,7 @@ async def get_voice(voice_id: str):
         "voice_id": voice_id,
         "name": meta.get("name"),
         "description": meta.get("description"),
+        "gender": meta.get("gender", "unknown"),
         "created_at": meta.get("created_at"),
         "type": "builtin" if meta.get("builtin") else "custom",
         "builtin": bool(meta.get("builtin")),
