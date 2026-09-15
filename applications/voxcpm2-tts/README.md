@@ -32,9 +32,9 @@
 
 ### 预置 Voice
 
-13 个预置 voice 均已配置真实参考音频（非文字描述），走 Cloning 模式，音色稳定。
+预置 voice 均配置真实参考音频（非文字描述），走 Cloning 模式，音色稳定。
 
-它们在 API 中标记为 `type: builtin`，**不可删除、不可替换参考音频**（返回 403）。这些录音是从 42 个候选样本中逐个试听筛选出的，模型输出不可复现，覆盖后无法还原。修改 `name` / `description` 允许。
+它们在 API 中标记为 `type: builtin`，**不可删除、不可替换参考音频**（返回 403）。模型输出不可复现，覆盖后无法还原。修改 `name` / `description` 允许。
 
 | Voice | 特点 | 适合场景 |
 |-------|------|---------|
@@ -63,15 +63,15 @@ Clean studio recording, no background noise, no room reverb
 Dry close-mic studio recording, silent background
 ```
 
-**一次生成挑不出好的，官方建议生成 1~3 次。** VoxCPM README 的 Risks 一节写明 Voice Design 与 Controllable Cloning 的结果 run 与 run 之间会变化。实践中每个 voice 生成 5 个候选、试听挑选比较稳妥。
+**一次生成挑不出好的，官方建议生成 1~3 次。** VoxCPM README 的 Risks 一节写明 Voice Design 与 Controllable Cloning 的结果 run 与 run 之间会变化。生成多个候选后试听挑选。
 
 **CFG 值影响明显，按文本长度调。** 短句提高（2.0~2.5）增强清晰度，长文降低（1.2~1.5）提升稳定性。同一描述不同 CFG 的产出差异可能大于不同描述之间的差异。
 
 **音色相关的措辞会带来副作用。** 例如描述里强调 `Rich baritone`（浑厚男中音）会显著抬高低频能量，听感接近低频轰鸣。改为 `Mid-range voice, clear and articulate, not deep or boomy` 可缓解。
 
-**语速不要指望用描述控制。** `unhurried` / `speaks slowly` / `deliberately slow pacing` 之类措辞对语速的影响不稳定，实测加了约束反而比不加更快。要放慢就在文本里加标点制造停顿。
+**语速不要指望用描述控制。** `unhurried` / `speaks slowly` / `deliberately slow pacing` 之类措辞对语速的影响不稳定。要放慢在文本里加标点制造停顿更可靠。
 
-**筛选只能靠试听。** 频谱指标（低频占比、高频占比、DC offset）与感知底噪不相关 —— 低频能量大部分属于音色而非噪声，据此排序会得出与听感相反的结论。指标只适合发现异常离群值（例如某条 DC offset 比同批高一到两个数量级）。
+**筛选只能靠试听。** 频谱指标（低频占比、高频占比、DC offset）与感知底噪不相关 —— 低频能量大部分属于音色而非噪声，据此排序会得出与听感相反的结论。指标只适合发现同批次内的异常离群值。
 
 生成后按与服务端一致的方式归一化，再写入参考音频目录：
 
@@ -116,7 +116,7 @@ GET /v1/audio/voices/{voice_id}/preview
 
 **由调用方在注册时声明，服务端不做自动推断。** 不传默认 `unknown`；取值不在枚举内返回 400。已注册的 voice 可通过 PUT 修正，预置 voice 也允许改（它属于元数据，不是音频内容）。
 
-不从音频推断的原因：基频判别会误判女低音、男高音、童声与非二元发声，标错比不标更糟。13 个预置 voice 的性别已人工标注，用户注册的自定义 voice 若未声明则保持 `unknown`。
+不从音频推断的原因：基频判别会误判女低音、男高音、童声与非二元发声，标错比不标更糟。未声明的 voice 保持 `unknown`。
 
 不要用 `description` 里的 "female" / "male" 字样判断性别 —— 它是自由文本、可被 PUT 改写，且 `female` 含有 `male` 子串，朴素匹配会误判。
 
