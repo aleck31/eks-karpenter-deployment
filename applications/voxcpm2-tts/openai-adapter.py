@@ -33,10 +33,17 @@ VOICES_DIR = Path(os.getenv("VOICES_DIR", "/shared/voices"))
 # compare against a constant it has to hardcode.
 REF_SAMPLE_RATE = 16000
 REF_CHANNELS = 1
-# VoxCPM2 clones best from a few seconds of speech: too short starves it of
-# timbre, too long adds cost without improving the result.
+# Reference length guidance, in ascending order. Nothing here rejects an
+# upload -- a 2s clip still registers and still clones, just less faithfully.
+#   3s   the minimum VoxCPM states cloning works from
+#   5-10s where our own hand-picked presets sit (shortest accepted: 4.34s) and
+#        what community integrations converge on as reliable
+#   15s  community integrations still call this ideal; past it the extra audio
+#        buys nothing and only costs payload and processing time
 REF_MIN_SECONDS = 3.0
-REF_MAX_SECONDS = 10.0
+REF_GOOD_MIN_SECONDS = 5.0
+REF_GOOD_MAX_SECONDS = 10.0
+REF_MAX_USEFUL_SECONDS = 15.0
 
 # Bumped when a _heal_registry() migration is added. Persisted next to the
 # registry so each migration runs once and never re-infers on later boots.
@@ -125,23 +132,30 @@ def _probe_audio(audio_path: Path) -> dict:
 
 
 def _audio_warnings(audio: dict) -> list[str]:
-    """Judge a stored reference against what the model actually wants.
+    """Advise on a stored reference. Never blocks: a short clip still clones.
 
     The thresholds live here rather than in each client: the server knows the
     model's preferences, callers would each hardcode their own copy.
     """
     warnings = []
     duration = audio.get("duration_seconds")
+    good = f"{REF_GOOD_MIN_SECONDS:g}-{REF_GOOD_MAX_SECONDS:g}s"
     if duration is not None:
         if duration < REF_MIN_SECONDS:
             warnings.append(
-                f"duration {duration}s is below the {REF_MIN_SECONDS:g}-{REF_MAX_SECONDS:g}s "
-                "recommended range; cloning may not capture the timbre"
+                f"duration {duration}s is under the {REF_MIN_SECONDS:g}s minimum VoxCPM "
+                f"states for cloning; it will still work but expect the timbre to drift. "
+                f"Re-record at {good} for a faithful clone"
             )
-        elif duration > REF_MAX_SECONDS:
+        elif duration < REF_GOOD_MIN_SECONDS:
             warnings.append(
-                f"duration {duration}s exceeds the {REF_MIN_SECONDS:g}-{REF_MAX_SECONDS:g}s "
-                "recommended range; extra length raises cost without improving the clone"
+                f"duration {duration}s is usable; {good} clones more reliably"
+            )
+        elif duration > REF_MAX_USEFUL_SECONDS:
+            warnings.append(
+                f"duration {duration}s is longer than needed; anything past "
+                f"{REF_MAX_USEFUL_SECONDS:g}s adds request size and processing time "
+                f"without improving the clone. {good} is the sweet spot"
             )
     rate, channels = audio.get("sample_rate"), audio.get("channels")
     if rate is not None and rate != REF_SAMPLE_RATE:
