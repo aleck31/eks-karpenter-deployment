@@ -15,7 +15,15 @@ import httpx
 from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="Qwen3-ASR OpenAI Adapter")
+app = FastAPI(
+    title="Qwen3-ASR OpenAI Adapter",
+    description=(
+        "OpenAI-compatible ASR endpoints.\n\n"
+        "**`/v1/realtime` is a WebSocket.** OpenAPI cannot describe one, so the "
+        "entry under `paths` is a plain GET that returns the event protocol; "
+        "the streaming endpoint itself is reached by upgrading the same path."
+    ),
+)
 
 BACKEND_URL = os.getenv("ASR_BACKEND_URL", "http://localhost:8000")
 BACKEND_WS = os.getenv("ASR_BACKEND_WS", "ws://localhost:8000")
@@ -40,12 +48,17 @@ def _parse_asr_text(raw: str) -> tuple[str, str | None]:
 
 @app.post("/v1/audio/transcriptions")
 async def transcribe(file: UploadFile = File(...), model: str = Form(default="")):
+    # model is accepted for OpenAI compatibility and deliberately not forwarded.
+    # vLLM registers the model under its filesystem path, so passing the
+    # caller's value through rejects every friendly name with a 404 while
+    # leaking the server's layout to anyone who guesses right. This pod serves
+    # one model, so there is nothing to select. Matches the TTS adapter, which
+    # also accepts and discards the field.
     audio_bytes = await file.read()
     async with httpx.AsyncClient(timeout=120.0) as client:
         resp = await client.post(
             f"{BACKEND_URL}/v1/audio/transcriptions",
             files={"file": (file.filename, audio_bytes, file.content_type or "audio/wav")},
-            data={"model": model} if model else {},
         )
     if resp.status_code != 200:
         return JSONResponse(status_code=resp.status_code, content=resp.json())
@@ -61,6 +74,34 @@ async def transcribe(file: UploadFile = File(...), model: str = Form(default="")
 
 
 # --- WebSocket: /v1/realtime ---
+
+@app.get("/v1/realtime")
+async def realtime_info():
+    """Describe the WebSocket protocol served at this same path.
+
+    Exists so the streaming endpoint is discoverable from the OpenAPI schema.
+    OpenAPI cannot express a WebSocket, so FastAPI leaves @app.websocket routes
+    out of `paths` entirely -- a client generating from the schema would never
+    learn this endpoint is here.
+    """
+    return {
+        "protocol": "websocket",
+        "url": "ws(s)://<host>/v1/realtime",
+        "description": "Streaming transcription. Send raw audio frames, receive "
+                       "OpenAI Realtime transcription events.",
+        "server_events": [
+            "conversation.item.input_audio_transcription.delta",
+            "conversation.item.input_audio_transcription.completed",
+        ],
+        "notes": [
+            "Backend emits 'language XXX<asr_text>' prefixes and vendor event "
+            "names; this adapter strips the prefix, lifts the language out, and "
+            "renames events to the OpenAI convention.",
+            "Transcription context accumulates over a session, so a very long "
+            "one can reach the model's max-model-len.",
+        ],
+    }
+
 
 @app.websocket("/v1/realtime")
 async def realtime_proxy(client_ws: WebSocket):
