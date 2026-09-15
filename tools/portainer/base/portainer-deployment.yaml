@@ -58,7 +58,7 @@ spec:
     spec:
       containers:
       - name: portainer
-        image: portainer/portainer-ce:latest
+        image: portainer/portainer-ce:lts
         args:
         - "--trusted-origins"
         - "https://YOUR_PORTAINER_DOMAIN"  # 须含 scheme，Portainer 新版会校验，如 https://portainer.example.com
@@ -94,7 +94,7 @@ spec:
       serviceAccountName: portainer-sa-clusteradmin
       containers:
       - name: portainer-agent
-        image: portainer/agent:latest
+        image: portainer/agent:lts
         imagePullPolicy: Always
         env:
         - name: LOG_LEVEL

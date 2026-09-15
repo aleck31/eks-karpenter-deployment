@@ -7,6 +7,20 @@
 - EFS CSI Driver 已安装并配置 Pod Identity
 - kubectl 已配置
 
+## 镜像标签用 `lts`，不要用 `latest`
+
+base 清单固定为 `portainer/portainer-ce:lts` 与 `portainer/agent:lts`。
+
+`imagePullPolicy` 为 `Always`，而节点均为 Spot，因此镜像版本实际由节点回收时机决定，
+不由部署者决定。用 `latest` 时任何一次 Pod 重建都可能拉到新的大版本：曾因此拉到一个
+开始校验 `--trusted-origins` 格式的版本，而清单当时传的是裸域名，导致 CrashLoopBackOff
+持续三天（重启 894 次）。`latest` 已移动，事后也无法确定出事前是哪个版本。
+
+`lts` 只在长期支持线内滚动，安全补丁照常跟进，但不会跳到 STS 或新的大版本。
+Portainer 同时发布 `lts` 与 `sts`，而 `latest` 跟随较新的那条（含破坏性变更）。
+
+升级到新的大版本时应显式改这里的标签并在应用前查阅 release note，而不是依赖标签漂移。
+
 ## 方法一：官方 Agent（推荐用于已有 Portainer Server）
 
 ```bash
