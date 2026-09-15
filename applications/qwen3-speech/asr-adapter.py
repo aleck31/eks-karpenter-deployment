@@ -75,6 +75,53 @@ async def transcribe(file: UploadFile = File(...), model: str = Form(default="")
 
 # --- WebSocket: /v1/realtime ---
 
+_backend_model_id: str | None = None
+
+
+async def _resolve_backend_model() -> str | None:
+    """Look up the id vLLM registered the weights under, and cache it.
+
+    vLLM names the model after its filesystem path. Callers should not have to
+    know that, so the adapter substitutes it on their behalf -- the HTTP path
+    achieves the same by simply not forwarding the field.
+    """
+    global _backend_model_id
+    if _backend_model_id is None:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as c:
+                resp = await c.get(f"{BACKEND_URL}/v1/models")
+                resp.raise_for_status()
+                _backend_model_id = resp.json()["data"][0]["id"]
+        except (httpx.HTTPError, KeyError, IndexError, ValueError):
+            return None
+    return _backend_model_id
+
+
+def _rewrite_model(raw: str, real_model: str | None) -> str:
+    """Point any model reference in a client frame at the backend's real id.
+
+    session.update requires model at the top level of the frame -- the backend
+    rejects it nested under session -- so normalise either spelling to there.
+    Rewriting keeps the WebSocket as tolerant of the value as HTTP is, and
+    supplies it when the caller left it out.
+    """
+    if not real_model:
+        return raw
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return raw
+    if not isinstance(data, dict):
+        return raw
+    if data.get("type") != "session.update" and "model" not in data:
+        return raw
+    data["model"] = real_model
+    session = data.get("session")
+    if isinstance(session, dict):
+        session.pop("model", None)
+    return json.dumps(data)
+
+
 @app.get("/v1/realtime")
 async def realtime_info():
     """Describe the WebSocket protocol served at this same path.
@@ -110,6 +157,7 @@ async def realtime_proxy(client_ws: WebSocket):
     import websockets
 
     backend_url = f"{BACKEND_WS}/v1/realtime"
+    real_model = await _resolve_backend_model()
     async with websockets.connect(backend_url) as backend_ws:
         # Forward session.created to client
         msg = await backend_ws.recv()
@@ -120,11 +168,11 @@ async def realtime_proxy(client_ws: WebSocket):
         language = None
 
         async def client_to_backend():
-            """Forward client messages to vLLM."""
+            """Forward client messages to vLLM, retargeting model references."""
             try:
                 while True:
                     data = await client_ws.receive_text()
-                    await backend_ws.send(data)
+                    await backend_ws.send(_rewrite_model(data, real_model))
             except WebSocketDisconnect:
                 await backend_ws.close()
 
