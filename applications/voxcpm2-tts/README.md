@@ -1,5 +1,10 @@
 # VoxCPM2 TTS - OpenAI 兼容 TTS 服务
 
+> 同一 ALB 的 :8880 一个 listen-port 只能由一个 Ingress 声明，本模块与
+> `applications/breeze2-tts` 不能同时挂载 Ingress。两者共用 `/shared/voices`
+> 下的同一份 `registry.json`；breeze2-tts 额外要求每个声纹带 `ref_text`
+> （参考音频的准确文字稿），该字段本模块会忽略。
+
 基于 VoxCPM2 + Nano-vLLM 推理引擎，通过 OpenAI 兼容 adapter 对外提供 `/v1/audio/speech` 等语音合成接口。
 
 ## 架构

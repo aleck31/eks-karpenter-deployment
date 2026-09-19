@@ -54,8 +54,9 @@
 │   ├── monitoring/                     # Prometheus 指标采集
 │   └── logging/                        # Alloy + Loki 日志聚合
 ├── applications/                 # 业务应用
-│   ├── qwen3-speech/                   # Qwen3 ASR 语音识别
+│   ├── qwen3-speech/                   # Qwen3 语音套件(ASR, TTS) + 共享模型存储（HTTP + realtime WS）
 │   ├── voxcpm2-tts/                    # VoxCPM2 TTS 语音合成 (OpenAI兼容)
+│   ├── breeze2-tts/                    # Breeze TTS 2 语音合成 (OpenAI兼容)
 │   ├── bitwarden/                      # Bitwarden密码管理
 │   ├── convertx/                       # ConvertX文件转换
 │   ├── firecrawl/                      # Firecrawl 网页抓取 API
@@ -148,11 +149,16 @@ tools/logging/logging-deployment-guide.md
 
 ### 5. 部署 AI 推理服务 (可选)
 ```bash
-# Qwen3 ASR 语音识别
+# Qwen3 语音套件（ASR + TTS + 共享 EFS PVC）
+# base/shared 的 PVC 被 voxcpm2-tts 与 breeze2-tts 复用，需先部署
 applications/qwen3-speech/qwen3-speech-deployment-guide.md
 
 # VoxCPM2 TTS 语音合成 (OpenAI兼容接口)
 applications/voxcpm2-tts/README.md
+
+# Breeze TTS 2 语音合成 (OpenAI兼容接口)
+# 与 voxcpm2-tts 共用同一 ALB 端口与声纹目录，两者不能同时挂载 Ingress
+applications/breeze2-tts/README.md
 ```
 
 ## 📊 可观测性架构
