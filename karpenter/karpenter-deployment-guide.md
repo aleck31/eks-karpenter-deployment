@@ -155,11 +155,11 @@ kubectl logs -n karpenter -l app.kubernetes.io/name=karpenter --tail=20
 
 ```bash
 # 应用预配置的 NodePool
-kubectl apply -f nodepool-arm64.yaml
-kubectl apply -f nodepool-amd64.yaml
+# NodePool/NodeClass 含集群专属值，须经 overlay 应用
+kubectl apply -k karpenter/overlays/<集群名>
 
 # GPU NodePool（可选）
-kubectl apply -f ../gpu/nodepool-gpu.yaml
+kubectl apply -k ../gpu/overlays/<集群名>
 
 # 验证配置
 kubectl get nodepool
@@ -168,13 +168,13 @@ kubectl get ec2nodeclass
 
 ### 3.2 NodePool 配置说明
 
-**ARM64 NodePool** (`nodepool-arm64.yaml`):
+**ARM64 NodePool** (`base/nodepool-arm64.yaml`):
 - 实例类型: m8g, c7g, r7g 系列
 - 架构: ARM64 (Graviton)
 - 优先级: 高 (weight: 100)
 - 成本优化: 70% Spot + 30% On-Demand
 
-**AMD64 NodePool** (`nodepool-amd64.yaml`):
+**AMD64 NodePool** (`base/nodepool-amd64.yaml`):
 - 实例类型: m7i, c7i, r7i 系列
 - 架构: AMD64 (Intel)
 - 优先级: 中 (weight: 50)

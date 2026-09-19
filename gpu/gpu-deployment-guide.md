@@ -39,7 +39,8 @@ GPU NodePool 推荐使用 EKS 优化的 NVIDIA AMI，预集成了 GPU 支持所�
 
 ```bash
 # 应用 GPU NodePool 配置
-kubectl apply -f gpu/nodepool-gpu.yaml
+# NodePool/NodeClass 含集群专属值，须经 overlay 应用
+kubectl apply -k gpu/overlays/<集群名>
 
 # 验证 NodePool 创建
 kubectl get nodepool nodepool-gpu

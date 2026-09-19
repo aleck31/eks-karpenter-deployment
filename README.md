@@ -41,14 +41,13 @@
 │   ├── karpenter-policy.json           # Karpenter权限策略
 │   ├── karpenter-node-role-trust-policy.json
 │   ├── karpenter-irsa-trust-policy.json
-│   ├── nodepool-arm64.yaml             # ARM64节点池配置
-│   └── nodepool-amd64.yaml             # x86-64节点池配置
+│   ├── base/                           # NodePool/NodeClass 结构（含占位符）
+│   └── overlays/example/               # 集群名、节点角色名、可用区
 ├── gpu/                          # GPU支持部署文档及配置文件
 │   ├── gpu-deployment-guide.md         # GPU部署指南
-│   ├── nodepool-gpu.yaml               # GPU节点池配置
-│   ├── nvidia-device-plugin.yaml       # NVIDIA Device Plugin配置
-│   ├── nvidia-time-slicing-config.yaml # GPU Time-Slicing配置
-│   └── local-storage-class.yaml        # 本地存储类
+│   ├── base/                           # NodePool/NodeClass + Device Plugin
+│   ├── overlays/example/               # 集群名、节点角色名、机型收窄
+│   └── light-gpu-affinity-patch.yaml   # 轻量 GPU 负载机型偏好示例
 ├── tools/                        # 集群管理工具
 │   ├── aperf/                          # APerf性能分析工具（Job模式）
 │   ├── portainer/                      # Portainer容器管理工具
