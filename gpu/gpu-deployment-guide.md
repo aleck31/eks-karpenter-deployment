@@ -225,6 +225,29 @@ kubectl patch nodepool <name> --type merge \
 
 改动 `disruption` 不影响 `karpenter.sh/nodepool-hash`，不会触发节点漂移重建。
 
+### 时间切片不影响 Karpenter 开通决策
+
+Karpenter 从 EC2 机型元数据取物理 GPU 数，不知道 device plugin 会按 `replicas` 切分。
+N 个请求 `nvidia.com/gpu: 1` 的 Pod 会让它开 N 台机器，之后 kube-scheduler 按切片数
+把它们装进更少的节点，多出来的节点空转直到被回收。
+
+实测（Karpenter 1.9.0，`replicas: 2`）：2 个 GPU Pod → `nodeclaims=2`，
+两个 Pod 实际落在同一台，另一台从创建起即为空。
+
+NodeOverlay 的 `spec.capacity` 叠加 `nvidia.com/gpu` 无法改变这一点，只影响调度模拟。
+上游 issue kubernetes-sigs/karpenter#2140 提出过该需求，已关闭未实现。
+AWS 文档的建议是配合静态容量（NodePool `spec.replicas`）使用时间切片。
+
+### 机型与 AZ 的最终选择权在 EC2
+
+Karpenter 按价格排序候选机型后交给 `CreateFleet`，由 EC2 用
+`price-capacity-optimized` 决定最终机型与 AZ —— 它同时权衡价格和容量池深度，
+不会单纯选最便宜。实测最便宜的 g6.xlarge 各 AZ 的 Spot 放置评分均为最低档，
+因此常被跳过。
+
+因此 NodeOverlay 的 `priceAdjustment` 只能改变 Karpenter 传给 EC2 的排序，
+影响有限且方向难预判；想确定性控制机型只能收窄机型列表，代价是缩小容量池。
+
 ### 按显存需求区分机型
 
 Karpenter 按 CPU、内存、GPU **数量**选型，不感知各负载需要多少**显存**，
