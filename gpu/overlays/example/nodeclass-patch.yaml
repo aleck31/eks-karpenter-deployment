@@ -1,0 +1,14 @@
+# 集群专属值：子网与安全组的 discovery 标签、节点 IAM 角色名。
+# 角色名取实际值，各集群命名可能不同（KarpenterNodeRole-* 或 KarpenterNodeInstanceRole-*）。
+- op: replace
+  path: /spec/subnetSelectorTerms/0/tags/karpenter.sh~1discovery
+  value: "your-cluster"
+- op: replace
+  path: /spec/securityGroupSelectorTerms/0/tags/karpenter.sh~1discovery
+  value: "your-cluster"
+- op: replace
+  path: /spec/role
+  value: "KarpenterNodeRole-your-cluster"
+- op: replace
+  path: /spec/tags/cluster
+  value: "your-cluster"

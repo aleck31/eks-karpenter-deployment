@@ -1,0 +1,38 @@
+# 按需兜底池，weight 必须低于主池 —— 否则会抢在 Spot 之前被选中。
+# 主池本身已能 Spot→按需 回退，本池只是提供一个限额可控的显式按需层。
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: gpu-on-demand
+spec:
+  weight: 1
+  limits:
+    cpu: 8
+    memory: 32Gi
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 15m
+    budgets:
+      - nodes: "1"
+  template:
+    metadata:
+      labels:
+        node-type: gpu
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: gpu
+      taints:
+        - key: nvidia.com/gpu
+          effect: NoSchedule
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: ["g4dn.xlarge"]

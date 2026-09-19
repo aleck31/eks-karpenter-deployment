@@ -1,0 +1,33 @@
+# GPU 节点的 EC2 配置。role 与 discovery 标签为集群专属，由 overlay 覆盖。
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: gpu
+spec:
+  # alias 模式下 Karpenter 按实例类型自动选 nvidia 或 standard AMI，
+  # 不必固定 AMI 名（固定后集群升级 K8s 版本时会失配）
+  amiSelectorTerms:
+    - alias: al2023@latest
+
+  # NVMe instance store 组 RAID0 后自动成为 kubelet 的 ephemeral-storage，
+  # Pod 用 emptyDir 即可拿到本地盘性能。不另挂 EBS 数据卷。
+  instanceStorePolicy: RAID0
+
+  metadataOptions:
+    httpEndpoint: enabled
+    httpProtocolIPv6: disabled
+    httpTokens: required
+    httpPutResponseHopLimit: 1
+
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "CLUSTER_NAME"
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "CLUSTER_NAME"
+  role: "KarpenterNodeRole-CLUSTER_NAME"
+
+  # 节点 EC2 标签。cluster 值为集群专属，由 overlay 覆盖。
+  tags:
+    cluster: "CLUSTER_NAME"
+    node-type: gpu

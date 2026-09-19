@@ -1,0 +1,77 @@
+# GPU 主池：优先 Spot，买不到时自动转按需（覆盖全部机型），
+# 故 weight 须高于任何按需兜底池。
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: gpu
+spec:
+  weight: 10
+  limits:
+    cpu: 32
+    memory: 128Gi
+  disruption:
+    # 不用 WhenEmptyOrUnderutilized：它会为整合利用率驱逐推理 Pod，
+    # 而模型重新加载需数分钟
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 15m
+    # 必须显式声明：默认 10%，节点数不足 10 时向下取整为 0，回收被完全禁止
+    budgets:
+      - nodes: "1"
+  template:
+    metadata:
+      labels:
+        node-type: gpu
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: gpu
+      taints:
+        - key: nvidia.com/gpu
+          effect: NoSchedule
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64", "arm64"]
+        # 全量 GPU 机型目录。base 保留完整选项，overlay 按实际部署收窄。
+        # 注意多卡机型（4x GPU）在时间切片下切片数翻倍，g5g 为 ARM64。
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values:
+            # T4 16GB (x86_64) — 小模型推理，单价最低
+            - g4dn.xlarge     # 1x T4,  4 vCPU,  16 GB, 125GB NVMe
+            - g4dn.2xlarge    # 1x T4,  8 vCPU,  32 GB, 225GB NVMe
+            - g4dn.4xlarge    # 1x T4, 16 vCPU,  64 GB, 225GB NVMe
+            - g4dn.8xlarge    # 1x T4, 32 vCPU, 128 GB, 900GB NVMe
+            - g4dn.12xlarge   # 4x T4, 48 vCPU, 192 GB, 900GB NVMe
+
+            # T4g 16GB (ARM64) — 成本优化，需 arm64 镜像
+            - g5g.xlarge      # 1x T4g,  4 vCPU,   8 GB
+            - g5g.2xlarge     # 1x T4g,  8 vCPU,  16 GB
+            - g5g.4xlarge     # 1x T4g, 16 vCPU,  32 GB
+            - g5g.8xlarge     # 1x T4g, 32 vCPU,  64 GB
+            - g5g.16xlarge    # 2x T4g, 64 vCPU, 128 GB
+
+            # A10G 24GB (x86_64) — 中大模型推理
+            - g5.xlarge       # 1x A10G,  4 vCPU,  16 GB
+            - g5.2xlarge      # 1x A10G,  8 vCPU,  32 GB
+            - g5.4xlarge      # 1x A10G, 16 vCPU,  64 GB
+            - g5.8xlarge      # 1x A10G, 32 vCPU, 128 GB
+            - g5.12xlarge     # 4x A10G, 48 vCPU, 192 GB
+
+            # L4 23GB (x86_64) — 能效比更好
+            - g6.xlarge       # 1x L4,  4 vCPU,  16 GB
+            - g6.2xlarge      # 1x L4,  8 vCPU,  32 GB
+            - g6.4xlarge      # 1x L4, 16 vCPU,  64 GB
+            - g6.8xlarge      # 1x L4, 32 vCPU, 128 GB
+            - g6.12xlarge     # 4x L4, 48 vCPU, 192 GB
+
+            # L40S 48GB (x86_64) — 高性能推理
+            - g6e.xlarge      # 1x L40S,  4 vCPU,  16 GB
+            - g6e.2xlarge     # 1x L40S,  8 vCPU,  32 GB
+            - g6e.4xlarge     # 1x L40S, 16 vCPU,  64 GB
+            - g6e.8xlarge     # 1x L40S, 32 vCPU, 128 GB
+            - g6e.12xlarge    # 4x L40S, 48 vCPU, 192 GB
