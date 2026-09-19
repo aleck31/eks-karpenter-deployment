@@ -11,3 +11,9 @@ tools/*/overlays/*
 !tools/*/overlays/example/
 applications/*/overlays/*
 !applications/*/overlays/example/
+
+# NodePool/NodeClass 含集群专属的 role 名与 discovery 标签
+gpu/overlays/*
+!gpu/overlays/example/
+karpenter/overlays/*
+!karpenter/overlays/example/
