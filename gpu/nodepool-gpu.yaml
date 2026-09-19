@@ -77,7 +77,9 @@ spec:
   
   # 节点终止策略
   disruption:
-    consolidationPolicy: WhenEmptyOrUnderutilized
+    # 不用 WhenEmptyOrUnderutilized：它会为整合利用率驱逐推理 Pod，
+    # 而模型重新加载需数分钟
+    consolidationPolicy: WhenEmpty
     consolidateAfter: 15m
     # 必须显式声明。Karpenter 默认 budgets 为 10%，节点数不足 10 时
     # floor(n × 10%) = 0，回收被完全禁止，空节点会无限期留存。
