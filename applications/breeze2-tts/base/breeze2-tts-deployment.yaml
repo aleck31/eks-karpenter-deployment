@@ -1,0 +1,163 @@
+# Breeze TTS 2 部署配置 (单容器: breeze_infer :8000 + OpenAI Adapter :8880)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: breeze2-tts
+  labels:
+    app: breeze2-tts
+spec:
+  replicas: 1
+  # 后端一次只服务一个请求，多副本无法共享 GPU 上的单份模型；扩容需先解决
+  # 显存与调度，不是改 replicas 就能生效的。
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: breeze2-tts
+  template:
+    metadata:
+      labels:
+        app: breeze2-tts
+    spec:
+      initContainers:
+      - name: model-downloader
+        image: 123456789012.dkr.ecr.us-west-2.amazonaws.com/breeze2-tts:latest
+        securityContext:
+          runAsUser: 0
+        command:
+        - bash
+        - -c
+        - |
+          MODEL_DIR="/shared/Breeze-TTS-2"
+          # audio_tokenizer/ 是流式路径必需的子目录，缺失时上游会退回 Mimi
+          # 且不支持分块流式，所以它也要纳入完整性判断。
+          if [ -f "$MODEL_DIR/config.json" ] \
+             && ls "$MODEL_DIR"/*.safetensors 1>/dev/null 2>&1 \
+             && [ -d "$MODEL_DIR/audio_tokenizer" ]; then
+            echo "Model complete, skipping download"
+          else
+            echo "Downloading Breeze-TTS-2..."
+            rm -rf "$MODEL_DIR"
+            hf download BreezeBlue/Breeze-TTS-2 --local-dir "$MODEL_DIR"
+          fi
+          mkdir -p /shared/voices
+        volumeMounts:
+        - name: models
+          mountPath: /shared
+        resources:
+          requests:
+            cpu: 500m
+            memory: 2Gi
+          limits:
+            cpu: 1
+            memory: 4Gi
+
+      containers:
+      - name: breeze2-tts
+        image: 123456789012.dkr.ecr.us-west-2.amazonaws.com/breeze2-tts:latest
+        env:
+        - name: BREEZE_MODEL_PATH
+          value: "/shared/Breeze-TTS-2"
+        # 固定的加速参数组合。改动会使所有已注册声纹存下的 seed 失效，
+        # 依据见 entrypoint.sh 内的实测数据与 README「部署契约」。
+        - name: BREEZE_FAST_FLAGS
+          value: "--fast-depth-decoder --fast-backbone-decode --fast-codec"
+        - name: BREEZE_BACKEND_URL
+          value: "http://localhost:8000"
+        - name: VOICES_DIR
+          value: "/shared/voices"
+        ports:
+        - containerPort: 8880
+          name: http
+        - containerPort: 8000
+          name: backend
+        volumeMounts:
+        - name: models
+          mountPath: /shared
+        resources:
+          requests:
+            cpu: 500m
+            memory: 3Gi
+            nvidia.com/gpu: 1
+          limits:
+            cpu: "2"
+            memory: 8Gi
+            nvidia.com/gpu: 1
+        # CUDA Graph 捕获与 inductor 编译约 40s，加上首次模型加载，
+        # failureThreshold 需覆盖冷启动全过程。
+        startupProbe:
+          httpGet:
+            path: /ready
+            port: 8880
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8880
+          periodSeconds: 30
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8880
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+
+      volumes:
+      - name: models
+        persistentVolumeClaim:
+          claimName: qwen3-models-pvc
+
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+      nodeSelector:
+        node-type: gpu
+      affinity:
+        nodeAffinity:
+          # 硬约束: 仅调度到 24GB 显存 GPU (L4/A10G)
+          # g4dn 保留给其他小模型 GPU 应用使用
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node.kubernetes.io/instance-type
+                operator: In
+                values: ["g6.xlarge", "g6.2xlarge", "g6.4xlarge", "g5.xlarge", "g5.2xlarge", "g5.4xlarge"]
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 50
+            preference:
+              matchExpressions:
+              - key: node.kubernetes.io/instance-type
+                operator: In
+                values: ["g6.xlarge", "g6.2xlarge", "g6.4xlarge"]
+          - weight: 30
+            preference:
+              matchExpressions:
+              - key: node.kubernetes.io/instance-type
+                operator: In
+                values: ["g5.xlarge", "g5.2xlarge", "g5.4xlarge"]
+
+      restartPolicy: Always
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: breeze2-tts-service
+  labels:
+    app: breeze2-tts
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 8880
+    protocol: TCP
+    name: http
+  selector:
+    app: breeze2-tts

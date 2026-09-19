@@ -1,0 +1,57 @@
+# Breeze TTS 2 基础镜像：官方 breeze-tts 推理代码 + 依赖。
+#
+# 选 pytorch 官方 runtime 镜像，原因有两个：
+#   - Breeze 的 requirements.txt 钉死 torch==2.9.1，此 tag 正好自带该版本
+#   - devel 变体含完整 CUDA toolkit，镜像会大一倍多（实测 28.7GB vs runtime 路线），
+#     而 `--fast-depth-decoder` 走 torch.compile (inductor) 只需要 C 编译器，
+#     不需要 nvcc；单独装 build-essential 即可
+#
+# 缺 gcc 时服务会在启动阶段报 InductorError: Failed to find C compiler 并退出，
+# 不会降级运行，所以 build-essential 不是可选项。
+#
+# 构建：
+#   docker build -f Dockerfile.base -t breeze2-tts:base-<breeze-commit> .
+ARG BASE_IMAGE=pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PIP_NO_CACHE_DIR=1
+
+# build-essential：inductor 编译 depth decoder 所需的 C 编译器
+# ffmpeg/ffprobe：adapter 用于参考音频归一化、探测与格式转换
+# sox + libsox-fmt-all：qwen-tts 依赖的 sox python 包需要该二进制
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      build-essential \
+      git \
+      ffmpeg \
+      sox \
+      libsox-fmt-all \
+ && rm -rf /var/lib/apt/lists/*
+
+ARG BREEZE_REPO=https://github.com/breezeblue-ai/breeze-tts.git
+ARG BREEZE_REF=main
+
+WORKDIR /opt
+RUN git clone --depth 1 --branch ${BREEZE_REF} ${BREEZE_REPO} breeze-tts \
+ && cd breeze-tts \
+ && git rev-parse HEAD > /opt/breeze-tts.commit
+
+WORKDIR /opt/breeze-tts
+RUN pip install --no-cache-dir -r requirements.txt \
+ && pip install --no-cache-dir "huggingface_hub[cli]"
+
+# 与 voxcpm2-tts 一致的非 root 运行身份。/shared 上的声纹目录属主为 10001，
+# 两个应用共用同一 PVC，UID 必须一致，否则声纹读写会 PermissionError。
+RUN useradd -m -u 10001 appuser \
+ && chown -R appuser:appuser /opt/breeze-tts
+
+# inductor 与 HF 缓存需可写，且不能落在只读层
+ENV TORCHINDUCTOR_CACHE_DIR=/var/cache/inductor
+ENV HF_HOME=/var/cache/huggingface
+RUN mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$HF_HOME" \
+ && chown -R appuser:appuser "$TORCHINDUCTOR_CACHE_DIR" "$HF_HOME"
+
+USER appuser
+EXPOSE 8000

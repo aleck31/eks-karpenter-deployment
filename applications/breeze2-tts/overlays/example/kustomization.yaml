@@ -1,0 +1,33 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 示例 overlay：展示需要按环境提供哪些值。
+# 用法：复制本目录为 overlays/<环境名>/，填入真实值。
+#
+# 依赖：模型存储复用 qwen3-speech 模块的 qwen3-models-pvc，
+# 需先部署 applications/qwen3-speech 的 base/shared/。
+#
+# 声纹目录 /shared/voices 与 voxcpm2-tts 共用同一 PVC，两个应用的容器
+# 运行身份均为 uid 10001，否则声纹读写会 PermissionError。
+
+namespace: your-namespace
+
+resources:
+  - ../../base
+
+images:
+  - name: 123456789012.dkr.ecr.us-west-2.amazonaws.com/breeze2-tts
+    newName: <your-account-id>.dkr.ecr.<your-region>.amazonaws.com/breeze2-tts
+    newTag: latest
+
+# ALB 入站来源限制。不设则控制器托管的安全组默认放开 0.0.0.0/0。
+# 该注解按 listen-port 生效：本模块 (8880) 与 qwen3-speech (8000) 共享
+# 同一 ALB，两边 overlay 需各自声明。
+patches:
+  - target:
+      kind: Ingress
+      name: breeze2-tts-ingress
+    patch: |
+      - op: add
+        path: /metadata/annotations/alb.ingress.kubernetes.io~1security-group-prefix-lists
+        value: pl-xxxxxxxxxxxxxxxxx
