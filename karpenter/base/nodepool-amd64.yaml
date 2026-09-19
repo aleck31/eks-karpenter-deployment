@@ -1,0 +1,76 @@
+# amd64 通用池。可用区限制为集群专属，由 overlay 追加。
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: amd64
+spec:
+  weight: 50
+  limits:
+    cpu: 500
+    memory: 500Gi
+  disruption:
+    budgets:
+    - nodes: '1'
+    consolidateAfter: 15m
+    consolidationPolicy: WhenEmptyOrUnderutilized
+  template:
+    metadata:
+      labels:
+        arch: amd64
+        cost-tier: standard
+        node-type: amd64
+    spec:
+      expireAfter: 720h
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: amd64
+      requirements:
+      - key: kubernetes.io/arch
+        operator: In
+        values:
+        - amd64
+      - key: kubernetes.io/os
+        operator: In
+        values:
+        - linux
+      - key: karpenter.sh/capacity-type
+        operator: In
+        values:
+        - spot
+        - on-demand
+      - key: node.kubernetes.io/instance-type
+        operator: In
+        values:
+        - m7i.large
+        - m7i.xlarge
+        - m7i.2xlarge
+        - m7i.4xlarge
+        - m6i.large
+        - m6i.xlarge
+        - m6i.2xlarge
+        - m6i.4xlarge
+        - m6a.large
+        - m6a.xlarge
+        - m6a.2xlarge
+        - m6a.4xlarge
+        - c7i.large
+        - c7i.xlarge
+        - c7i.2xlarge
+        - c7i.4xlarge
+        - c6i.large
+        - c6i.xlarge
+        - c6i.2xlarge
+        - c6i.4xlarge
+        - c6a.large
+        - c6a.xlarge
+        - c6a.2xlarge
+        - c6a.4xlarge
+        - r6i.large
+        - r6i.xlarge
+        - r6i.2xlarge
+        - r6i.4xlarge
+        - r6a.large
+        - r6a.xlarge
+        - r6a.2xlarge
+        - r6a.4xlarge

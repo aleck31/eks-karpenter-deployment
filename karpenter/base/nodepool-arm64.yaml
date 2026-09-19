@@ -1,0 +1,80 @@
+# arm64 通用池。可用区限制为集群专属，由 overlay 追加。
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: arm64
+spec:
+  weight: 100
+  limits:
+    cpu: 1000
+    memory: 1000Gi
+  disruption:
+    budgets:
+    - nodes: '1'
+    consolidateAfter: 15m
+    consolidationPolicy: WhenEmptyOrUnderutilized
+  template:
+    metadata:
+      labels:
+        arch: arm64
+        cost-tier: optimized
+        node-type: arm64
+    spec:
+      expireAfter: 720h
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: arm64
+      requirements:
+      - key: kubernetes.io/arch
+        operator: In
+        values:
+        - arm64
+      - key: kubernetes.io/os
+        operator: In
+        values:
+        - linux
+      - key: karpenter.sh/capacity-type
+        operator: In
+        values:
+        - spot
+        - on-demand
+      - key: node.kubernetes.io/instance-type
+        operator: In
+        values:
+        - m8g.large
+        - m8g.xlarge
+        - m8g.2xlarge
+        - m8g.4xlarge
+        - m7g.large
+        - m7g.xlarge
+        - m7g.2xlarge
+        - m7g.4xlarge
+        - m6g.large
+        - m6g.xlarge
+        - m6g.2xlarge
+        - m6g.4xlarge
+        - c8g.large
+        - c8g.xlarge
+        - c8g.2xlarge
+        - c8g.4xlarge
+        - c7g.large
+        - c7g.xlarge
+        - c7g.2xlarge
+        - c7g.4xlarge
+        - c6g.large
+        - c6g.xlarge
+        - c6g.2xlarge
+        - c6g.4xlarge
+        - r8g.large
+        - r8g.xlarge
+        - r8g.2xlarge
+        - r8g.4xlarge
+        - r7g.large
+        - r7g.xlarge
+        - r7g.2xlarge
+        - r7g.4xlarge
+        - r6g.large
+        - r6g.xlarge
+        - r6g.2xlarge
+        - r6g.4xlarge

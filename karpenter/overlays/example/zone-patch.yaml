@@ -1,0 +1,8 @@
+# 限定可用区。不加此项则使用全部被发现的子网；
+# 某些可用区缺少目标机型或子网时需显式限定。
+- op: add
+  path: /spec/template/spec/requirements/-
+  value:
+    key: topology.kubernetes.io/zone
+    operator: In
+    values: ["your-region-a", "your-region-b", "your-region-c"]
