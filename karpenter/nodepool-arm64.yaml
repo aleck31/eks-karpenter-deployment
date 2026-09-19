@@ -85,7 +85,11 @@ spec:
     memory: 1000Gi
   disruption:
     consolidationPolicy: WhenEmptyOrUnderutilized
-    consolidateAfter: 30s
+    consolidateAfter: 15m
+    # 必须显式声明。Karpenter 默认 budgets 为 10%，节点数不足 10 时
+    # floor(n × 10%) = 0，回收被完全禁止，空节点会无限期留存。
+    budgets:
+      - nodes: "1"
 
 ---
 # ARM64 NodeClass

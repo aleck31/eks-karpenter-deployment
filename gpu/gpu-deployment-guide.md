@@ -205,16 +205,64 @@ requirements:
 
 ### 自动缩容配置
 ```yaml
-# 快速缩容以节省成本
 disruption:
-  consolidationPolicy: WhenEmpty
-  consolidateAfter: 30s  # 30秒后缩容空闲节点
+  consolidationPolicy: WhenEmptyOrUnderutilized
+  consolidateAfter: 15m
+  # 必须显式声明。默认 budgets 为 10%，节点数不足 10 时 floor(n × 10%) = 0，
+  # 回收被完全禁止，空节点会无限期留存。
+  budgets:
+    - nodes: "1"
+```
+
+NodePool 名称与仓库文件不一致时（如 inference-env 的 NodePool 名为 `gpu`，
+早于本仓库 `nodepool-*` 命名约定），直接 `apply -f` 会新建一套而非更新，
+应只同步该段：
+
+```bash
+kubectl patch nodepool <name> --type merge \
+  -p '{"spec":{"disruption":{"consolidateAfter":"15m","budgets":[{"nodes":"1"}]}}}'
+```
+
+改动 `disruption` 不影响 `karpenter.sh/nodepool-hash`，不会触发节点漂移重建。
+
+### 按显存需求区分机型
+
+Karpenter 按 CPU、内存、GPU **数量**选型，不感知各负载需要多少**显存**，
+因此显存只用几 GB 的负载可能被放到 A10G 机型上，单价是 T4 的三倍以上。
+显存需求应由工作负载自己声明，放在各应用的清单里，不集中在本模块。
+
+大模型推理需排除 T4（g4dn 显存 16GB，KV cache 不足会导致崩溃重启）：
+
+```yaml
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: node.kubernetes.io/instance-type
+              operator: In
+              values: [g6.xlarge, g6.2xlarge, g5.xlarge, g5.2xlarge]
+```
+
+轻量推理（向量化、人脸检测等，显存 ≲8GB）应优选 T4。用 `preferred` 而非
+`required`，Spot 容量不足时可回退，不会阻塞调度：
+
+```yaml
+affinity:
+  nodeAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 60
+        preference:
+          matchExpressions:
+            - key: node.kubernetes.io/instance-type
+              operator: In
+              values: [g4dn.xlarge, g4dn.2xlarge]
 ```
 
 ### 实例类型优先级
-1. **开发测试**: g4dn.xlarge (Spot)
-2. **生产推理**: g5.xlarge (On-Demand)
-3. **大规模训练**: p3.2xlarge (Spot + On-Demand 混合)
+1. **轻量推理** (显存 ≲8GB): g4dn.xlarge (Spot)
+2. **大模型推理** (显存 ≥20GB): g6.xlarge / g6.2xlarge (Spot)
+3. **不可中断的推理**: 同上但用 On-Demand NodePool
 
 ## 🔍 监控和故障排除
 

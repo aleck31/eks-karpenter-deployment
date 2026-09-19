@@ -1,0 +1,31 @@
+# 示例：轻量 GPU 负载（显存 ≲8GB，如向量化、人脸检测）的机型偏好。
+# Karpenter 按 CPU/内存/GPU 数量选型，不感知显存需求，这类负载可能被放到
+# A10G 机型上，单价是 T4 的三倍以上。用 preferred 而非 required，
+# g4dn Spot 容量不足时可回退，不会阻塞调度。
+#
+# 机型偏好属于工作负载自身属性，正式使用时应写进该应用的清单，此处仅作示例。
+# 反向场景（大模型推理需排除 T4）见 gpu/gpu-deployment-guide.md。
+#
+#   kubectl -n <namespace> patch deployment <name> --patch-file gpu/light-gpu-affinity-patch.yaml
+spec:
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 60
+              preference:
+                matchExpressions:
+                  - key: node.kubernetes.io/instance-type
+                    operator: In
+                    values:
+                      - g4dn.xlarge
+                      - g4dn.2xlarge
+            - weight: 20
+              preference:
+                matchExpressions:
+                  - key: node.kubernetes.io/instance-type
+                    operator: In
+                    values:
+                      - g5.xlarge
+                      - g6.xlarge
