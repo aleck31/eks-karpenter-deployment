@@ -50,13 +50,34 @@ spec:
         - /models/Qwen3-ASR-1.7B
         - --gpu-memory-utilization
         - "0.35"
+        # Sized for one VAD segment, not a whole recording: the adapter splits at
+        # silence and sends at most 120s, which is ~2030 tokens at the measured
+        # 13.0 audio tokens per second.
+        #
+        # Both ceilings have to move together. vLLM sets encoder_cache_size from
+        # max_num_batched_tokens verbatim, while audio tokens also count toward
+        # max_model_len -- raising only one just relocates the rejection. They
+        # share the gpu-memory-utilization budget, so an oversized max_model_len
+        # reserves KV cache for sequences that cannot occur and starves the
+        # encoder cache.
         - --max-model-len
-        - "16384"
+        - "8192"
+        # Left at vLLM's default; a 120s segment needs ~1560 audio tokens.
+        - --max-num-batched-tokens
+        - "2048"
         - --host
         - "0.0.0.0"
         - --port
         - "8000"
         - --enforce-eager
+        # Required for the realtime WebSocket path. vLLM's AsyncScheduler
+        # underflows num_output_placeholders when a streaming segment's final
+        # prefill chunk is appended mid-generation, killing the EngineCore
+        # (vllm-project/vllm#35755, still unfixed on main; the fix PR #50692 is
+        # open). Measured here: 19s of audio gives 4 assertion failures and a
+        # truncated transcript with async scheduling on, 0 with it off.
+        # Costs 3-8% throughput. Drop this once a release carries the fix.
+        - --no-async-scheduling
         - --hf-overrides
         - '{"architectures": ["Qwen3ASRRealtimeGeneration"]}'
         ports:

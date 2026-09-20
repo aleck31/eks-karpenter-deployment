@@ -11,6 +11,8 @@ import asyncio
 import json
 import os
 import re
+import subprocess
+import tempfile
 import httpx
 from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -24,6 +26,40 @@ app = FastAPI(
         "the streaming endpoint itself is reached by upgrading the same path."
     ),
 )
+
+# Segments run concurrently, so wall time is roughly
+# ceil(segments / SEGMENT_CONCURRENCY) * SEGMENT_MAX_SECONDS * 0.8 -- about 13
+# minutes for a one-hour recording, not the ~48 serial processing would take.
+# 0.35s of budget per second of audio covers that with room to spare while
+# staying under the ALB's 1800s idle timeout.
+TRANSCRIBE_TIMEOUT = float(os.getenv("ASR_TRANSCRIBE_TIMEOUT", "300"))
+TRANSCRIBE_TIMEOUT_PER_AUDIO_SECOND = float(
+    os.getenv("ASR_TIMEOUT_PER_AUDIO_SECOND", "0.35")
+)
+# vLLM batches requests, so segments overlap. Bounded because each concurrent
+# segment holds its own encoder cache allocation.
+SEGMENT_CONCURRENCY = int(os.getenv("ASR_SEGMENT_CONCURRENCY", "4"))
+# Measured on Qwen3-ASR-1.7B: audio embedding tokens per second of input, used
+# to restate the backend's encoder-cache error as an audio-length limit.
+AUDIO_TOKENS_PER_SECOND = 13.0
+
+# Long recordings are split at speech boundaries before reaching the backend.
+# Quality degrades well before the token ceiling: 65s transcribed to exactly the
+# input text, 309s returned about two thirds of the words, 619s returned 202
+# characters -- each with a 200 and no sign anything was dropped.
+#
+# Cutting on speech boundaries rather than a clock is the point. The backend's
+# own realtime path commits on a fixed window and splits words mid-syllable
+# ("浪也很" / "高沙滩上").
+SEGMENT_MAX_SECONDS = float(os.getenv("ASR_SEGMENT_MAX_SECONDS", "120"))
+# Below this a recording goes through untouched -- segmenting a voice turn would
+# cost a VAD pass for nothing.
+SEGMENT_MIN_SECONDS = float(os.getenv("ASR_SEGMENT_MIN_SECONDS", "150"))
+# Silero VAD operates on 16kHz mono.
+VAD_SAMPLE_RATE = 16000
+# A gap has to be at least this long to be a sentence boundary rather than the
+# pause between two words.
+VAD_MIN_GAP_SECONDS = float(os.getenv("ASR_VAD_MIN_GAP_SECONDS", "0.35"))
 
 BACKEND_URL = os.getenv("ASR_BACKEND_URL", "http://localhost:8000")
 BACKEND_WS = os.getenv("ASR_BACKEND_WS", "ws://localhost:8000")
@@ -44,6 +80,192 @@ def _parse_asr_text(raw: str) -> tuple[str, str | None]:
     return text, language
 
 
+def _suffix_of(filename: str) -> str:
+    """Keep the caller's extension so ffprobe/ffmpeg pick the right demuxer."""
+    ext = os.path.splitext(filename)[1].lower()
+    return ext if 1 < len(ext) <= 6 and ext[1:].isalnum() else ".wav"
+
+
+def _audio_duration(path: str) -> float | None:
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", path],
+            capture_output=True, text=True, check=True, timeout=60,
+        )
+        return float(out.stdout.strip())
+    except (subprocess.SubprocessError, ValueError):
+        return None
+
+
+_vad_model = None
+
+
+def _load_vad():
+    """Load Silero VAD once. Energy thresholding was the wrong tool here.
+
+    ffmpeg's silencedetect only measures amplitude, so in a meeting recording
+    room tone, keyboards or a projector fan sit above any threshold low enough
+    to catch real pauses -- it would report no silence at all and every cut
+    would fall back to the clock. Silero VAD classifies speech, so gaps survive
+    background noise.
+    """
+    global _vad_model
+    if _vad_model is None:
+        from silero_vad import load_silero_vad
+        _vad_model = load_silero_vad()
+    return _vad_model
+
+
+def _speech_gaps(path: str) -> list[float]:
+    """Midpoint of every gap between speech runs, in seconds.
+
+    Midpoint rather than either edge: the start of a gap clips the previous
+    word's decay, the end of it clips the next word's onset.
+
+    Audio is decoded with ffmpeg and soundfile rather than silero_vad's own
+    read_audio, which routes through torchaudio and so pulls in torchcodec on
+    2.9+. Both are already present for other reasons.
+    """
+    try:
+        import numpy as np
+        import soundfile as sf
+        import torch
+        from silero_vad import get_speech_timestamps
+
+        pcm_path = f"{path}.vad.wav"
+        try:
+            subprocess.run(
+                ["ffmpeg", "-v", "error", "-y", "-i", path,
+                 "-ar", str(VAD_SAMPLE_RATE), "-ac", "1", "-c:a", "pcm_s16le", pcm_path],
+                capture_output=True, check=True, timeout=600,
+            )
+            samples, _ = sf.read(pcm_path, dtype="float32", always_2d=False)
+        finally:
+            if os.path.exists(pcm_path):
+                os.unlink(pcm_path)
+
+        if samples.ndim > 1:
+            samples = samples.mean(axis=1)
+        runs = get_speech_timestamps(
+            torch.from_numpy(np.ascontiguousarray(samples)),
+            _load_vad(), sampling_rate=VAD_SAMPLE_RATE, return_seconds=True,
+        )
+    except Exception:
+        # No VAD, no cut points: _segment_bounds falls back to the clock, which
+        # is worse but still bounded.
+        return []
+    gaps = []
+    for previous, following in zip(runs, runs[1:]):
+        gap = following["start"] - previous["end"]
+        if gap >= VAD_MIN_GAP_SECONDS:
+            gaps.append(previous["end"] + gap / 2)
+    return gaps
+
+
+def _segment_bounds(duration: float, gaps: list[float]) -> list[tuple[float, float]]:
+    """Cut at the last speech gap before each limit, falling back to the clock.
+
+    The clock fallback only fires when a whole budget's worth of audio holds no
+    qualifying gap.
+    """
+    bounds, start = [], 0.0
+    while duration - start > SEGMENT_MAX_SECONDS:
+        limit = start + SEGMENT_MAX_SECONDS
+        # A cut must advance past the halfway mark, or a cluster of early gaps
+        # would produce a run of tiny segments.
+        candidates = [g for g in gaps
+                      if start + SEGMENT_MAX_SECONDS / 2 < g <= limit]
+        cut = max(candidates) if candidates else limit
+        bounds.append((start, cut))
+        start = cut
+    bounds.append((start, duration))
+    return bounds
+
+
+def _extract_segment(path: str, start: float, end: float) -> bytes:
+    """Cut [start, end) losslessly into a 16kHz mono wav the backend accepts.
+
+    The output path must be unique per call: segments of one request are cut
+    concurrently, and a path derived only from the source had every segment
+    writing and then unlinking the same file, so one segment's cleanup deleted
+    another's output mid-read.
+    """
+    fd, out_path = tempfile.mkstemp(prefix="seg-", suffix=".wav")
+    os.close(fd)
+    try:
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-ss", f"{start:.3f}",
+             "-to", f"{end:.3f}", "-i", path,
+             "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", out_path],
+            capture_output=True, check=True, timeout=600,
+        )
+        with open(out_path, "rb") as fh:
+            return fh.read()
+    finally:
+        if os.path.exists(out_path):
+            os.unlink(out_path)
+
+
+async def _transcribe_once(client: httpx.AsyncClient, audio: bytes,
+                           filename: str) -> tuple[str, dict]:
+    resp = await client.post(
+        f"{BACKEND_URL}/v1/audio/transcriptions",
+        files={"file": (filename, audio, "audio/wav")},
+    )
+    if resp.status_code != 200:
+        raise _BackendRejected(resp)
+    data = resp.json()
+    text, language = _parse_asr_text(data.get("text", ""))
+    return text, {"language": language, "usage": data.get("usage")}
+
+
+class _BackendRejected(Exception):
+    def __init__(self, resp: httpx.Response):
+        self.resp = resp
+
+
+def _backend_error_payload(resp: httpx.Response) -> dict:
+    """Normalise a backend error, translating the ones callers can act on.
+
+    vLLM rejects over-long audio two different ways depending on which ceiling
+    it hits first -- the encoder cache or max_model_len -- and both messages
+    name an internal buffer rather than the thing the caller controls. Restate
+    either as an audio-length limit, derived from the measured audio embedding
+    tokens per second.
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        return {"error": {"message": f"Transcription backend returned HTTP {resp.status_code}",
+                          "type": "backend_error"}}
+    message = str(((body or {}).get("error") or {}).get("message", ""))
+
+    needed = budget = None
+    match = re.search(r"audio item with (\d+) embedding tokens.*?"
+                      r"encoder cache size (\d+)", message)
+    if match:
+        needed, budget = int(match.group(1)), int(match.group(2))
+    else:
+        match = re.search(r"decoder prompt \(length (\d+)\) is longer than the "
+                          r"maximum model length of (\d+)", message)
+        if match:
+            needed, budget = int(match.group(1)), int(match.group(2))
+
+    if needed is None:
+        return body
+    return {"error": {
+        "message": f"Audio is too long: it needs {needed} tokens against a budget of "
+                   f"{budget}. At {AUDIO_TOKENS_PER_SECOND:g} tokens per second that is "
+                   f"about {budget / AUDIO_TOKENS_PER_SECOND:.0f}s "
+                   f"({budget / AUDIO_TOKENS_PER_SECOND / 60:.1f} minutes). Split the "
+                   "recording, or raise both --max-model-len and "
+                   "--max-num-batched-tokens on the backend.",
+        "type": "audio_too_long",
+        "limit_seconds": round(budget / AUDIO_TOKENS_PER_SECOND),
+    }}
+
+
 # --- HTTP: /v1/audio/transcriptions ---
 
 @app.post("/v1/audio/transcriptions")
@@ -55,21 +277,74 @@ async def transcribe(file: UploadFile = File(...), model: str = Form(default="")
     # one model, so there is nothing to select. Matches the TTS adapter, which
     # also accepts and discards the field.
     audio_bytes = await file.read()
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        resp = await client.post(
-            f"{BACKEND_URL}/v1/audio/transcriptions",
-            files={"file": (file.filename, audio_bytes, file.content_type or "audio/wav")},
-        )
-    if resp.status_code != 200:
-        return JSONResponse(status_code=resp.status_code, content=resp.json())
+    filename = file.filename or "audio.wav"
 
-    data = resp.json()
-    text, language = _parse_asr_text(data.get("text", ""))
-    result = {"text": text}
+    with tempfile.NamedTemporaryFile(suffix=_suffix_of(filename), delete=False) as fh:
+        fh.write(audio_bytes)
+        source_path = fh.name
+    try:
+        duration = _audio_duration(source_path)
+        segments = (_segment_bounds(duration, _speech_gaps(source_path))
+                    if duration and duration > SEGMENT_MIN_SECONDS else None)
+        budget = max(TRANSCRIBE_TIMEOUT,
+                     (duration or 0) * TRANSCRIBE_TIMEOUT_PER_AUDIO_SECOND)
+
+        async with httpx.AsyncClient(timeout=budget) as client:
+            try:
+                if segments is None:
+                    text, meta = await _transcribe_once(client, audio_bytes, filename)
+                    parts, language = [text], meta["language"]
+                else:
+                    gate = asyncio.Semaphore(SEGMENT_CONCURRENCY)
+
+                    async def run(index: int, start: float, end: float):
+                        # The gate covers the cut as well as the request: a
+                        # one-hour recording is 30 segments, and cutting them
+                        # all at once would fan out 30 ffmpeg processes across
+                        # the container's 2 CPUs.
+                        async with gate:
+                            # Slicing is CPU work in ffmpeg; keep it off the
+                            # event loop so concurrent segments overlap.
+                            chunk = await asyncio.to_thread(
+                                _extract_segment, source_path, start, end)
+                            return await _transcribe_once(
+                                client, chunk, f"seg{index:03d}.wav")
+
+                    results = await asyncio.gather(*[
+                        run(i, s0, e0) for i, (s0, e0) in enumerate(segments)
+                    ])
+                    # Ordered by segment, not by completion: gather preserves
+                    # input order, which is what makes the concatenation valid.
+                    parts = [text for text, _ in results if text]
+                    language = next((m["language"] for _, m in results
+                                     if m["language"]), None)
+            except httpx.TimeoutException:
+                # ~0.8x realtime, so a voice-turn-sized timeout turned long
+                # recordings into an empty 500 naming nothing.
+                return JSONResponse(
+                    status_code=504,
+                    content={"error": {
+                        "message": f"Transcription did not finish within "
+                                   f"{budget:g}s. Raise ASR_TRANSCRIBE_TIMEOUT or "
+                                   "ASR_TIMEOUT_PER_AUDIO_SECOND.",
+                        "type": "timeout",
+                    }},
+                )
+            except _BackendRejected as rejected:
+                return JSONResponse(status_code=rejected.resp.status_code,
+                                    content=_backend_error_payload(rejected.resp))
+    finally:
+        if os.path.exists(source_path):
+            os.unlink(source_path)
+
+    result = {"text": "".join(parts)}
     if language:
         result["language"] = language
-    if "usage" in data:
-        result["duration"] = data["usage"].get("seconds")
+    if duration is not None:
+        result["duration"] = round(duration, 2)
+    if segments is not None:
+        # Lets a caller tell a segmented transcript from a single-pass one.
+        result["segments"] = len(segments)
     return JSONResponse(content=result)
 
 
