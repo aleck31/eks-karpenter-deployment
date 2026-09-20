@@ -4,3 +4,8 @@ kind: Kustomization
 resources:
     - qwen3-asr-deployment.yaml
     - qwen3-speech-ingress.yaml
+
+configMapGenerator:
+    - name: qwen3-asr-adapter
+      files:
+          - asr-adapter.py

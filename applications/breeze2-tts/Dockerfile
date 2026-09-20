@@ -7,7 +7,8 @@ FROM ${BASE_IMAGE}
 # adapter 依赖（ffmpeg 已在基础镜像中）
 RUN pip install --no-cache-dir pydub httpx python-multipart pysbd
 
-COPY --chown=appuser:appuser openai-adapter.py /opt/breeze-tts/openai-adapter.py
+# 集群运行 ConfigMap 挂载的副本，这份仅供本地使用。
+COPY --chown=appuser:appuser base/openai-adapter.py /opt/breeze-tts/openai-adapter.py
 COPY --chown=appuser:appuser entrypoint.sh /opt/breeze-tts/entrypoint.sh
 
 USER root

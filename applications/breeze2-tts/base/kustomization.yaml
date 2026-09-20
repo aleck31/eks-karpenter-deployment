@@ -5,3 +5,8 @@ kind: Kustomization
 resources:
   - breeze2-tts-deployment.yaml
   - breeze2-tts-ingress.yaml
+
+configMapGenerator:
+  - name: breeze2-tts-adapter
+    files:
+      - openai-adapter.py

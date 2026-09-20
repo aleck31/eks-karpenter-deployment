@@ -87,6 +87,11 @@ spec:
         - name: models
           mountPath: /models
           readOnly: true
+        # Overrides the copy baked into the image.
+        - name: adapter
+          mountPath: /app/asr-adapter.py
+          subPath: asr-adapter.py
+          readOnly: true
         resources:
           requests:
             cpu: 500m
@@ -122,6 +127,9 @@ spec:
       - name: models
         persistentVolumeClaim:
           claimName: qwen3-models-pvc
+      - name: adapter
+        configMap:
+          name: qwen3-asr-adapter
 
       tolerations:
       - key: nvidia.com/gpu

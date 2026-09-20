@@ -136,6 +136,73 @@ BreezeBlue Research and Non-Commercial License，仅限研究与非商业用途�
 
 **语言。** 开放权重为中英双语。官网宣称的 50 语言指其托管服务，不适用于本部署。
 
+## 文件结构
+
+```
+applications/breeze2-tts/
+├── Dockerfile.base                  # breeze-tts 源码 + 依赖，构建慢
+├── Dockerfile                       # adapter 层，秒级
+├── entrypoint.sh                    # 后端 :8000 + adapter :8880
+├── base/
+│   ├── openai-adapter.py            # 以 ConfigMap 挂载，改它无需重建镜像
+│   ├── breeze2-tts-deployment.yaml  # Deployment + Service
+│   ├── breeze2-tts-ingress.yaml     # 声明 ALB :8880
+│   └── kustomization.yaml
+└── overlays/
+    ├── example/                     # 入库：示例取值，供复制
+    └── <env-name>/                  # 不入库：真实取值
+```
+
+## 前置条件
+
+| 依赖 | 说明 |
+|------|------|
+| GPU NodePool | 见 `gpu/gpu-deployment-guide.md`，需 Time-Slicing |
+| 24 GB 显存机型 | Deployment 硬约束 g6/g5 系列；g4dn 的 16 GB 不够 |
+| `qwen3-models-pvc` | 复用 qwen3-speech 的 EFS PVC，**须先部署** `applications/qwen3-speech/base/shared` |
+| ALB :8880 空闲 | 同一 listen-port 只能由一个 Ingress 声明，见「接管 :8880」 |
+
+## 资源分配
+
+| 项 | 值 | 依据 |
+|---|---|---|
+| 显存 | 8.9 GiB | 实测，含三项加速参数的 CUDA Graph |
+| `nvidia.com/gpu` | 1 | Time-Slicing 下每节点 2 个槽位，故一节点最多 2 个 GPU Pod |
+| 内存 | 请求 3Gi / 上限 8Gi | |
+| CPU | 请求 500m / 上限 2 | |
+| 模型权重 | 7.2 GB on EFS | initContainer 下载，与其它服务共享 PVC |
+
+## 验证部署
+
+```bash
+kubectl get pods -n <namespace> -o wide          # 应 1/1 Running
+kubectl exec deploy/breeze2-tts -- curl -s localhost:8000/docs -o /dev/null -w '%{http_code}\n'
+curl -s "http://<alb>:8880/v1/audio/voices" | head -c 200
+```
+
+`/ready` 与 `/health` 的区别：`/health` 只表示 adapter 进程活着，`/ready` 会确认
+后端 :8000 可达。探针已分别用于 liveness 与 readiness/startup。
+
+## 故障排除
+
+| 现象 | 原因 | 处理 |
+|------|------|------|
+| 启动即退出，日志 `InductorError: Failed to find C compiler` | 基础镜像缺 gcc | 用 `Dockerfile.base`，它装了 `build-essential` |
+| `ValueError: 't5_gemma_module' is already used` | `transformers` 被升级 | 不要在此镜像里装会牵动 transformers 的包 |
+| 并发请求 503 | 后端单并发，排队超 `BREEZE_QUEUE_TIMEOUT` | 降低并发；扩副本无效（见「已知限制」） |
+| 同一 seed 音色变了 | 加速参数被改动 | 恢复为部署契约里的三项组合 |
+| Pod 一直 Pending | GPU 槽位被占满或无 24GB 机型 | `kubectl describe pod` 看调度事件 |
+| 换了节点后声纹丢失 | 声纹在 EFS，不会丢；检查 PVC 是否挂载 | 确认 `VOICES_DIR=/shared/voices` |
+
+重启时用 `scale --replicas=0` 等 Pod 消失后再 `--replicas=1`，或 `rollout restart`。
+`kubectl delete pod --wait=false` 会绕过 `strategy: Recreate`，新旧 Pod 同时争抢
+GPU 槽位，导致新 Pod 落到另一个节点。
+
+## 成本
+
+单个 g6.xlarge Spot 约 $0.22/小时。与 `qwen3-asr` 共享节点时通过 Time-Slicing
+同用一张 L4（8.9 + 7.7 GiB，24 GB 内可容纳），不需要额外节点。
+
 ## 构建
 
 ```bash
@@ -162,6 +229,34 @@ kubectl apply -k overlays/<env-name>
 
 首次启动需下载 7.2 GB 权重（initContainer）加约 40 秒 CUDA Graph 捕获，
 `startupProbe` 的 `failureThreshold: 60` 已覆盖。
+
+### 只改 adapter
+
+`base/openai-adapter.py` 由 `configMapGenerator` 生成 ConfigMap 并挂载到容器，
+覆盖镜像内的同名文件。所以调整接口不必重建 14.7 GB 镜像：
+
+```bash
+vi base/openai-adapter.py
+kubectl apply -k overlays/<env-name>
+```
+
+ConfigMap 名字带内容哈希，文件一改 Deployment 就会滚动更新，无需手动重启。
+`strategy: Recreate` 会先终止旧 Pod 再建新的，约 1-2 分钟（模型重新加载）。
+
+以下改动仍需重建镜像并推送：
+
+| 改动 | 原因 |
+|------|------|
+| 新增 Python 依赖 | 依赖装在镜像层 |
+| 修改 `entrypoint.sh` | 由 `COPY` 进镜像 |
+| 升级 breeze-tts 源码 | 属于 `Dockerfile.base` |
+
+验证运行中的版本：
+
+```bash
+kubectl exec deploy/breeze2-tts -- md5sum /opt/breeze-tts/openai-adapter.py
+md5sum base/openai-adapter.py
+```
 
 ### 接管 :8880
 

@@ -12,7 +12,8 @@ FROM ${BASE_IMAGE}
 RUN pip install websockets python-multipart onnxruntime --no-cache-dir \
  && pip install --no-deps silero-vad --no-cache-dir
 
-COPY asr-adapter.py /app/asr-adapter.py
+# The cluster runs the ConfigMap-mounted copy; this one is for local use.
+COPY base/asr/asr-adapter.py /app/asr-adapter.py
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 

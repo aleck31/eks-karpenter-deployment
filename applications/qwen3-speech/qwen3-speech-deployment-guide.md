@@ -17,6 +17,7 @@ applications/qwen3-speech/
 ├── base/
 │   ├── shared/                      # EFS StorageClass + PVC（各服务共用）
 │   ├── asr/                         # ASR Deployment + Service + Ingress
+│   │   └── asr-adapter.py           # 以 ConfigMap 挂载，改它无需重建镜像
 │   ├── tts/                         # Qwen3-TTS CustomVoice Deployment + Service
 │   └── tts-base/                    # Qwen3-TTS Base Deployment + Service（声音克隆）
 ├── overlays/
@@ -25,7 +26,6 @@ applications/qwen3-speech/
 │   │   └── efs-patch.yaml
 │   └── <env-name>/                  # 不入库：真实取值
 ├── Dockerfile                       # ASR 镜像（vLLM + adapter）
-├── asr-adapter.py
 ├── entrypoint.sh
 └── qwen3-speech-deployment-guide.md  # 本文档
 ```
@@ -150,7 +150,44 @@ kubectl apply -k overlays/<env-name>
 同时部署多个服务时，它们通过 GPU Time-Slicing 共享同一张卡，
 需确认显存总量足够（见「资源分配」一节）。
 
-### 5. 验证部署
+### 5. 只改 adapter
+
+`base/asr/asr-adapter.py` 由 `configMapGenerator` 生成 ConfigMap 并挂载到容器，
+覆盖镜像内的同名文件。所以调整接口不必重建 30 GB 镜像：
+
+```bash
+vi base/asr/asr-adapter.py
+kubectl apply -k overlays/<env-name>
+```
+
+ConfigMap 名字带内容哈希，文件一改 Deployment 就会滚动更新，无需手动重启。
+约 1-2 分钟（vLLM 重新加载模型）。
+
+以下改动仍需重建镜像并推送：
+
+| 改动 | 原因 |
+|------|------|
+| 新增 Python 依赖 | 依赖装在镜像层 |
+| 修改 `entrypoint.sh` | 由 `COPY` 进镜像 |
+| 更换 vLLM 版本 | 属于基础镜像 |
+
+验证运行中的版本：
+
+```bash
+kubectl exec deploy/qwen3-asr -c asr -- md5sum /app/asr-adapter.py
+md5sum base/asr/asr-adapter.py
+```
+
+改 vLLM 启动参数（`args`）属于 Deployment 本身，同样只需 `apply -k`，
+但注意 `startupProbe` 探的是 adapter 的 `:8001`，vLLM 起不来时 Pod 仍会显示
+`1/1 Running`。必须另外确认后端：
+
+```bash
+kubectl exec deploy/qwen3-asr -c asr -- \
+  python3 -c "import httpx; print(httpx.get('http://localhost:8000/v1/models').status_code)"
+```
+
+### 6. 验证部署
 
 ```bash
 # 查看 Pod 状态（两个都应 1/1 Running，同一节点）

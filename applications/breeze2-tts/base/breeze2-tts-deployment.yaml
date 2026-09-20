@@ -75,6 +75,11 @@ spec:
         volumeMounts:
         - name: models
           mountPath: /shared
+        # 覆盖镜像里的副本。
+        - name: adapter
+          mountPath: /opt/breeze-tts/openai-adapter.py
+          subPath: openai-adapter.py
+          readOnly: true
         resources:
           requests:
             cpu: 500m
@@ -111,6 +116,9 @@ spec:
       - name: models
         persistentVolumeClaim:
           claimName: qwen3-models-pvc
+      - name: adapter
+        configMap:
+          name: breeze2-tts-adapter
 
       tolerations:
       - key: nvidia.com/gpu
