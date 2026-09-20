@@ -161,6 +161,8 @@ applications/voxcpm2-tts/deployment-guide.md
 applications/breeze2-tts/deployment-guide.md
 ```
 
+三个语音模块另有 `api-reference.md`，供调用方查接口、字段、错误码与响应头。
+
 ## 📊 可观测性架构
 
 指标与日志各自独立采集，统一在 Amazon Managed Grafana 中查询。

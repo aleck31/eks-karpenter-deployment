@@ -53,6 +53,11 @@ kubectl apply -k <应用>/overlays/<env-name>
 - `base/kustomization.yaml` + 清单文件 — 通用结构
 - `overlays/example/kustomization.yaml` — 示例取值
 
+### 对外提供 API 的模块
+- 另加 `api-reference.md` — 接口、字段、错误码、响应头
+- 两者受众不同：部署指南由搭建服务的人读一次，接口参考由调用方反复查。
+  合在一起时接口内容占了半篇，且容易被部署步骤割成两段
+
 ### 配置要求
 
 - **环境相关取值不入库**：namespace、账号 ID、S3 桶名、EFS 文件系统 ID、访问域名
