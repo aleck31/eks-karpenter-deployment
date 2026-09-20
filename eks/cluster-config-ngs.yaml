@@ -54,7 +54,7 @@ iam:
         awsLoadBalancerController: true
 
     # Karpenter Pod Identity 在部署 Karpenter 时单独配置
-    # 详见 karpenter/karpenter-deployment-guide.md
+    # 详见 karpenter/deployment-guide.md
 # 不创建默认节点组
 managedNodeGroups: []
 # System Node Group 单独管理，详见 eks/nodegroup-system.yaml

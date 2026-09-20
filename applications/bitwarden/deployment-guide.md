@@ -25,7 +25,7 @@ applications/bitwarden/
 ├── overlays/
 │   ├── example/                      # 入库：示例取值，供复制
 │   └── <env-name>/                   # 不入库：真实取值
-└── bitwarden-deployment-guide.md     # 本部署指南
+└── deployment-guide.md     # 本部署指南
 ```
 
 ## 🎯 前提条件

@@ -4,7 +4,7 @@
 # g4dn Spot 容量不足时可回退，不会阻塞调度。
 #
 # 机型偏好属于工作负载自身属性，正式使用时应写进该应用的清单，此处仅作示例。
-# 反向场景（大模型推理需排除 T4）见 gpu/gpu-deployment-guide.md。
+# 反向场景（大模型推理需排除 T4）见 gpu/deployment-guide.md。
 #
 #   kubectl -n <namespace> patch deployment <name> --patch-file gpu/light-gpu-affinity-patch.yaml
 spec:

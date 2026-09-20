@@ -2,7 +2,7 @@
 # :8880 → Breeze TTS 2 (OpenAI 兼容接口 /v1/audio/speech)
 #
 # 该端口原由 voxcpm2-tts 占用。同一 ALB group 内一个 listen-port 只能由一个
-# Ingress 声明，两者不可同时存在，切换步骤见 README。
+# Ingress 声明，两者不可同时存在，切换步骤见部署指南。
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress

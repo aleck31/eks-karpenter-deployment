@@ -35,7 +35,7 @@
 
 ```
 applications/auto-draw-io/
-├── auto-draw-io-deployment-guide.md     # 本部署指南
+├── deployment-guide.md     # 本部署指南
 ├── auto-draw-io-configmap.yaml          # 非敏感环境变量配置
 ├── auto-draw-io-secret.yaml             # 敏感信息配置 (AWS 凭据)
 └── auto-draw-io-deployment.yaml         # 应用部署 + Service + Ingress

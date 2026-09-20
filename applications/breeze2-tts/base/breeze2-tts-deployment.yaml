@@ -60,7 +60,7 @@ spec:
         - name: BREEZE_MODEL_PATH
           value: "/shared/Breeze-TTS-2"
         # 固定的加速参数组合。改动会使所有已注册声纹存下的 seed 失效，
-        # 依据见 entrypoint.sh 内的实测数据与 README「部署契约」。
+        # 依据见部署指南「部署契约」。
         - name: BREEZE_FAST_FLAGS
           value: "--fast-depth-decoder --fast-backbone-decode --fast-codec"
         - name: BREEZE_BACKEND_URL

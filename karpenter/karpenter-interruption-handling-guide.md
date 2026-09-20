@@ -1,6 +1,6 @@
 # Karpenter Spot 中断处理配置指南
 
-**前置条件**：必须先完成 Karpenter 部署（参考 `karpenter/karpenter-deployment-guide.md`）
+**前置条件**：必须先完成 Karpenter 部署（参考 `karpenter/deployment-guide.md`）
 
 ## 概述
 
@@ -157,7 +157,7 @@ done
 SQS 权限已包含在仓库的 `karpenter/karpenter-policy.json` 中（`SQSInterruptionHandling` 语句，
 资源通配 `arn:aws:sqs:*:*:karpenter-*` 以匹配 `karpenter-${CLUSTER_NAME}` 命名约定）。
 
-**新建集群**：按 `karpenter-deployment-guide.md` 创建 KarpenterControllerPolicy 时已自动包含，无需额外操作。
+**新建集群**：按 `deployment-guide.md` 创建 KarpenterControllerPolicy 时已自动包含，无需额外操作。
 
 **已有集群**：为托管策略创建新版本使其生效。
 

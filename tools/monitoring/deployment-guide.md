@@ -255,7 +255,7 @@ resources:
 ## 相关文档
 
 - [EKS 集群部署指南](../../eks/create-eks-cluster-guide.md)
-- [Karpenter 部署指南](../../karpenter/karpenter-deployment-guide.md)
+- [Karpenter 部署指南](../../karpenter/deployment-guide.md)
 - [AWS Managed Grafana 用户指南](https://docs.aws.amazon.com/grafana/)
 - [Prometheus 官方文档](https://prometheus.io/docs/)
 

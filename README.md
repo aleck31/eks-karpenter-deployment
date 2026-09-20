@@ -36,7 +36,7 @@
 │   ├── iam_policy.json                 # LoadBalancer Controller策略
 │   └── fix-eks-web-console-access.md   # Web控制台访问修复
 ├── karpenter/                    # Karpenter部署文档及配置文件
-│   ├── karpenter-deployment-guide.md   # Karpenter部署指南
+│   ├── deployment-guide.md   # Karpenter部署指南
 │   ├── karpenter-interruption-handling-guide.md  # Spot中断处理指南
 │   ├── karpenter-policy.json           # Karpenter权限策略
 │   ├── karpenter-node-role-trust-policy.json
@@ -44,7 +44,7 @@
 │   ├── base/                           # NodePool/NodeClass 结构（含占位符）
 │   └── overlays/example/               # 集群名、节点角色名、可用区
 ├── gpu/                          # GPU支持部署文档及配置文件
-│   ├── gpu-deployment-guide.md         # GPU部署指南
+│   ├── deployment-guide.md         # GPU部署指南
 │   ├── base/                           # NodePool/NodeClass + Device Plugin
 │   ├── overlays/example/               # 集群名、节点角色名、机型收窄
 │   └── light-gpu-affinity-patch.yaml   # 轻量 GPU 负载机型偏好示例
@@ -123,42 +123,42 @@ eks/create-eks-cluster-guide.md
 ### 2. 部署 Karpenter
 ```bash
 # 已验证详细指南
-karpenter/karpenter-deployment-guide.md
+karpenter/deployment-guide.md
 ```
 
 ### 3. 部署 GPU 支持 (可选)
 ```bash
 # 已验证详细指南
-gpu/gpu-deployment-guide.md
+gpu/deployment-guide.md
 ```
 
 ### 4. 部署集群管理工具 (可选)
 ```bash
 # 部署 Portainer 容器管理界面
-tools/portainer/portainer-deployment-guide.md
+tools/portainer/deployment-guide.md
 
 # 部署 APerf 性能分析工具（Job模式）
-tools/aperf/aperf-deployment-guide.md
+tools/aperf/deployment-guide.md
 
 # 部署 Prometheus 指标采集
-tools/monitoring/monitoring-deployment-guide.md
+tools/monitoring/deployment-guide.md
 
 # 部署 Alloy + Loki 日志聚合
-tools/logging/logging-deployment-guide.md
+tools/logging/deployment-guide.md
 ```
 
 ### 5. 部署 AI 推理服务 (可选)
 ```bash
 # Qwen3 语音套件（ASR + TTS + 共享 EFS PVC）
 # base/shared 的 PVC 被 voxcpm2-tts 与 breeze2-tts 复用，需先部署
-applications/qwen3-speech/qwen3-speech-deployment-guide.md
+applications/qwen3-speech/deployment-guide.md
 
 # VoxCPM2 TTS 语音合成 (OpenAI兼容接口)
-applications/voxcpm2-tts/README.md
+applications/voxcpm2-tts/deployment-guide.md
 
 # Breeze TTS 2 语音合成 (OpenAI兼容接口)
 # 与 voxcpm2-tts 共用同一 ALB 端口与声纹目录，两者不能同时挂载 Ingress
-applications/breeze2-tts/README.md
+applications/breeze2-tts/deployment-guide.md
 ```
 
 ## 📊 可观测性架构

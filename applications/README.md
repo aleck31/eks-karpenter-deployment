@@ -49,7 +49,7 @@ kubectl apply -k <应用>/overlays/<env-name>
 - 使用应用名称的小写形式，多单词用连字符分隔（如 `my-app`）
 
 ### 必需文件
-- `[app-name]-deployment-guide.md` 或 `README.md` — 部署指南
+- `deployment-guide.md` — 部署指南。文件名固定，模块名由所在目录表达
 - `base/kustomization.yaml` + 清单文件 — 通用结构
 - `overlays/example/kustomization.yaml` — 示例取值
 

@@ -27,7 +27,7 @@ applications/qwen3-speech/
 │   └── <env-name>/                  # 不入库：真实取值
 ├── Dockerfile                       # ASR 镜像（vLLM + adapter）
 ├── entrypoint.sh
-└── qwen3-speech-deployment-guide.md  # 本文档
+└── deployment-guide.md  # 本文档
 ```
 
 ## 架构
@@ -74,7 +74,7 @@ g4dn.xlarge 可分配: ~3.9 CPU / ~14.7Gi 内存 / 1 GPU (Time-Slicing 虚拟为
 - EFS CSI Driver 已安装
 - ALB Ingress Controller 已安装
 
-详见 `gpu/gpu-deployment-guide.md`。
+详见 `gpu/deployment-guide.md`。
 
 ## 部署步骤
 
@@ -93,7 +93,7 @@ kubectl apply -f ../../gpu/nvidia-time-slicing-config.yaml
 # 需要在 DaemonSet 中添加:
 # 1. 环境变量 CONFIG_FILE=/config/config.yaml
 # 2. Volume mount: nvidia-device-plugin-config ConfigMap → /config
-# 参考 gpu/gpu-deployment-guide.md 中的 Device Plugin 部署说明
+# 参考 gpu/deployment-guide.md 中的 Device Plugin 部署说明
 ```
 
 验证 Time-Slicing 生效（需要 GPU 节点运行后检查）：
@@ -308,6 +308,37 @@ docker push <AWS_ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/qwen3-tts:latest
 - Karpenter consolidation: WhenEmptyOrUnderutilized, 30 分钟后回收/right-sizing (GPU 节点启停代价大，避免频繁整合)
 - Spot 中断处理已启用 (SQS + EventBridge)，提前 10-20 分钟迁移
 
+## 环境变量
+
+ASR adapter（容器 `:8001`，对外端口）：
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `ASR_BACKEND_URL` | `http://localhost:8000` | vLLM HTTP 地址 |
+| `ASR_BACKEND_WS` | `ws://localhost:8000` | vLLM realtime WebSocket 地址 |
+| `ASR_SEGMENT_MIN_SECONDS` | `150` | 低于此时长直接透传，不切分 |
+| `ASR_SEGMENT_MAX_SECONDS` | `120` | 单段上限。按实测 13.0 token/秒 折合约 1560 token，留有余量 |
+| `ASR_VAD_MIN_GAP_SECONDS` | `0.35` | silero-vad 判定为可切点的最小语音间隙 |
+| `ASR_SEGMENT_CONCURRENCY` | `4` | 并发转写的段数。同时限制 ffmpeg 切分进程数，容器 CPU 上限为 2 |
+| `ASR_TRANSCRIBE_TIMEOUT` | `300` | 超时下限 |
+| `ASR_TIMEOUT_PER_AUDIO_SECOND` | `0.35` | 超时系数。实际预算 `max(下限, 时长 × 系数)` |
+
+切点取语音间隙的**中点**而非边界：取起点会切掉前一个词的尾音，取终点会切掉后一个
+词的起音。VAD 失败时回退到按时钟均分，仍有界但可能切断句子。
+
+用 silero-vad 而非 ffmpeg `silencedetect`（后者是能量阈值，不是 VAD）。
+粉噪对照实测：
+
+| 噪声幅度 | silero-vad | silencedetect |
+|---------|-----------|---------------|
+| 0.00 | 37 个间隙 | 49 个 |
+| 0.05 | 39 | 51 |
+| **0.10** | **34** | **0 — 完全失效** |
+| 0.20 | 32 | 0 |
+
+幅度 0.10 时能量阈值找不到任何间隙，每次切分都退化为按时钟切，正是要避免的
+"切断句子"。会议室的空调、投影仪、键盘声很容易超过该幅度。
+
 ## 已知限制
 
 - Time-Slicing 不提供显存隔离，两个模型可能互相影响
@@ -354,6 +385,31 @@ curl -X POST http://<ALB>:8000/v1/audio/transcriptions \
 {"text": "Hello world.", "language": "english", "duration": 2.5}
 ```
 
+**长度无上限。** 超过 150 秒的音频由 adapter 用 silero-vad 在语音间隙切分，
+每段不超过 120 秒，并发 4 段转写后按输入顺序拼接。发生切分时多返回 `segments`：
+
+```json
+{"text": "...", "language": "chinese", "duration": 3600.0, "segments": 31}
+```
+
+实测一小时录音 31 段、95 秒返回。`duration` 由 ffprobe 测得，始终存在（可探测时）。
+
+超时预算随时长伸缩：`max(300s, 时长 × 0.35)`。一小时音频为 1260 秒，
+在 ALB 的 1800 秒 idle timeout 之内。
+
+| 情况 | 状态 | 响应 |
+|------|------|------|
+| 超时 | 504 | `{"error": {"type": "timeout", ...}}` |
+| 后端拒绝超长音频 | 400 | `{"error": {"type": "audio_too_long", "limit_seconds": N}}` |
+| 后端其它错误 | 502 | 不泄露内部地址 |
+
+`audio_too_long` 正常情况下不会出现（分段已消除长度限制），它是后端参数被
+调小后的兜底。`limit_seconds` 按实测的 13.0 audio token/秒 换算得出。
+
+`GET /health` 与 `GET /ready` 的区别：前者只表示 adapter 存活，
+后者确认 vLLM 后端可达。**startupProbe 探的是 adapter 的 `:8001`**，
+所以 Pod 显示 `1/1 Running` 时 vLLM 仍可能已死，排障时用 `/ready` 或直连 `:8000`。
+
 ### ASR 流式 (WebSocket Realtime)
 
 实时语音识别，边录边转录。
@@ -388,6 +444,26 @@ curl -X POST http://<ALB>:8000/v1/audio/transcriptions \
 - **每段只有 1 个 done**：收到 `transcription.done` 即表示本段结束
 - **无 VAD**：服务端不会自动断句，分段完全由客户端决定
 - **没有 `input_audio_buffer.clear`**：不需要手动清空，final 自动处理
+
+#### 稳定性依赖后端的 `--no-async-scheduling`
+
+vLLM 的 AsyncScheduler 在流式分段的最后一个 prefill chunk 于生成中途追加时，
+会让 `num_output_placeholders` 减到负数，断言失败并带走 EngineCore
+（[vllm-project/vllm#35755](https://github.com/vllm-project/vllm/issues/35755)）。
+表现是转录文本重复、随后 WebSocket 返回 `processing_error`，Pod 重启。
+
+实测对照（19 秒音频）：
+
+| 配置 | 断言失败 | 结果 |
+|------|---------|------|
+| async scheduling 开 | 4 次 | EngineCore 崩溃，四句只转出三句 |
+| `--no-async-scheduling` | 0 次 | 文本完整 |
+
+该缺陷在 vLLM main 分支仍未修复，修复 PR 未合并，**升级版本无效**。
+Deployment 的 `--no-async-scheduling` 不可移除，代价是吞吐下降 3-8%
+（并发 1/2/4/8 下实测 2.52→2.35、4.56→4.20、9.10→8.43、17.06→16.60 req/s）。
+
+修复后实测 180 秒音频稳定、零崩溃，是上游报告崩溃阈值的 11 倍。
 
 #### 完整调用示例：连续 3 句话，得到 3 条独立结果
 
