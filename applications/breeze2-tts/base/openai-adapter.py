@@ -14,6 +14,7 @@ exist because of how Breeze cloning works:
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import io
 import json
@@ -31,8 +32,7 @@ from pathlib import Path
 
 import httpx
 import pysbd
-from fastapi import (FastAPI, File, Form, HTTPException, Request, Response,
-                     UploadFile)
+from fastapi import (FastAPI, File, Form, HTTPException, Request, Response, UploadFile)
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
@@ -233,6 +233,16 @@ BACKEND_RTF = 0.88
 # retry. BACKEND_QUEUE_TIMEOUT then caps how long anyone who does queue waits.
 BACKEND_QUEUE_TIMEOUT = float(os.getenv("BREEZE_QUEUE_TIMEOUT", "120"))
 QUEUE_REJECT_SECONDS = float(os.getenv("BREEZE_QUEUE_REJECT_SECONDS", "0"))
+# A held slot is treated as abandoned past estimate x FACTOR + GRACE seconds.
+STALE_HOLDER_FACTOR = 4.0
+STALE_HOLDER_GRACE = 300.0
+
+# Chunks buffered between the backend reader and the caller. 4KB each, so
+# this bounds the buffer at 2MB -- enough for a player consuming at realtime
+# to lag the 12% that RTF 0.88 runs ahead by, without holding a whole segment.
+STREAM_QUEUE_CHUNKS = 512
+# How long the buffer may sit full before the consumer is presumed gone.
+CONSUMER_STALL_SECONDS = 30.0
 _SLOT_POLL_SECONDS = 0.05
 
 
@@ -266,6 +276,25 @@ class _BackendSlot:
     def queued(self) -> int:
         return len(self._queued)
 
+    def _reclaim_if_stale(self) -> None:
+        """Free a slot whose holder is long gone.
+
+        The holder releases in a generator's finally, and a streaming response
+        has several ways to unwind that never run it -- notably an exception
+        while closing the backend client during GeneratorExit. One missed release
+        used to wedge the backend for the pod's lifetime, answering every
+        subsequent request as busy with the GPU idle. The grace period is
+        deliberately far past any real request so a slow synthesis is never cut
+        off; this is a floor under a bug, not a timeout.
+        """
+        if not self._busy or self._started_at is None:
+            return
+        grace = self._estimate * STALE_HOLDER_FACTOR + STALE_HOLDER_GRACE
+        if asyncio.get_event_loop().time() - self._started_at > grace:
+            self._busy = False
+            self._started_at = None
+            self._estimate = 0.0
+
     def projected_wait(self) -> float:
         """Seconds before a caller arriving now could start.
 
@@ -274,15 +303,21 @@ class _BackendSlot:
         only as good as CHARS_PER_SECOND and BACKEND_RTF -- enough to decide
         whether queueing is worth it, not a promise.
         """
+        self._reclaim_if_stale()
         if not self._busy:
             return 0.0
         loop = asyncio.get_event_loop()
         elapsed = loop.time() - self._started_at if self._started_at else 0.0
         return max(0.0, self._estimate - elapsed) + sum(self._queued)
 
-    async def acquire(self, timeout: float, estimate: float = 0.0) -> float:
-        """Take the slot, returning how many seconds the caller waited."""
-        loop = asyncio.get_running_loop()
+    def reject_if_busy(self) -> None:
+        """Raise 429 if a caller arriving now would not be served promptly.
+
+        Called before the response starts. Raising this from inside a streaming
+        body is useless -- the 200 headers have already gone out, so the client
+        receives a successful response with an empty payload, which for mp3 is
+        an ID3 header and zero frames.
+        """
         projected = self.projected_wait()
         # QUEUE_REJECT_SECONDS <= 0 means never queue, which is the default.
         if self._busy and (QUEUE_REJECT_SECONDS <= 0
@@ -298,6 +333,10 @@ class _BackendSlot:
                          "X-Retry-After-Seconds": str(retry_after)},
             )
 
+    async def acquire(self, timeout: float, estimate: float = 0.0) -> float:
+        """Take the slot, returning how many seconds the caller waited."""
+        loop = asyncio.get_running_loop()
+        self.reject_if_busy()
         self._queued.append(estimate)
         waiting_since = loop.time()
         deadline = waiting_since + timeout
@@ -917,6 +956,26 @@ def _silence_pcm(duration_ms: int) -> bytes:
     return b"\x00" * (frames * BACKEND_CHANNELS * BACKEND_SAMPLE_WIDTH)
 
 
+def _backend_stream_error(status: int) -> ApiError:
+    """Translate a backend status seen by the reader task.
+
+    409 means the backend thinks an inference is already running. Since this
+    adapter admits one request at a time, the only way to see it is the backend's
+    own lock having leaked -- which happens when a streaming response is
+    abandoned mid-flight, and which only a restart clears. Saying so beats
+    reporting a generic upstream failure, because the action differs.
+    """
+    if status == 409:
+        return ApiError(
+            503, "backend_lock_stuck",
+            "Synthesis backend reports an inference already running while this "
+            "adapter has none. Its internal lock has not been released and only "
+            "a restart clears it.",
+            headers={"Retry-After": "30"},
+        )
+    return ApiError(502, "backend_error", _backend_failure_detail(status))
+
+
 def _backend_failure_detail(status: int) -> str:
     """Describe a backend failure without echoing its URL back to the caller.
 
@@ -941,9 +1000,7 @@ async def _post_segment(client: httpx.AsyncClient, fields: dict,
         )
         resp.raise_for_status()
     except httpx.HTTPStatusError as e:
-        raise HTTPException(
-            status_code=502, detail=_backend_failure_detail(e.response.status_code)
-        )
+        raise _backend_stream_error(e.response.status_code)
     except httpx.RequestError as e:
         raise HTTPException(
             status_code=502,
@@ -975,44 +1032,131 @@ async def _synthesize(fields: dict, ref_audio: bytes | None,
         _BACKEND_SLOT.release()
 
 
-async def _stream_backend(fields: dict, ref_audio: bytes | None,
+async def _stream_backend(request: Request, fields: dict, ref_audio: bytes | None,
                           segments: list[tuple[str, int]],
                           target_format: str) -> StreamingResponse:
     """Stream segment PCM through, transcoding on the fly when needed.
 
-    The slot is acquired inside the innermost generator rather than before
-    returning the response: if the client disconnects between this function
-    returning and the body being iterated, a lock acquired out here would never
-    be released and the backend would be wedged for the pod's lifetime. Tying
-    its lifetime to the generator means every path that can end the generator,
-    including being closed without ever yielding, runs the release.
-    """
+    Two properties this has to hold, both learned the hard way.
 
-    async def pcm_chunks():
-        await _BACKEND_SLOT.acquire(BACKEND_QUEUE_TIMEOUT,
-                                    _estimate_seconds(segments))
-        client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=10.0, read=900.0, write=30.0, pool=10.0)
-        )
+    Nothing that can fail may fail after the response starts. A StreamingResponse
+    has already sent 200 by the time its body is iterated, so an exception raised
+    there cannot become a status -- the caller receives a successful response with
+    an empty payload, which for mp3 is an ID3 header and zero audio frames. The
+    first segment is therefore requested here, and its first bytes are in hand,
+    before the response object exists.
+
+    A caller who disconnects frees the backend immediately. The reader task owns
+    the backend connection and closes it as soon as nobody is listening, which
+    releases the inference lock and the slot within the same event loop turn.
+    That depends on the backend patch in
+    patches/release-inference-lock-on-disconnect.py (upstream issue #20): stock
+    breeze_infer.api holds its lock when a response is abandoned mid-stream, so
+    the GPU falls idle while every request answers 409 until a restart. Without
+    the patch this code has to drain instead, which costs the caller the rest of
+    the segment.
+    """
+    _BACKEND_SLOT.reject_if_busy()
+    waited = await _BACKEND_SLOT.acquire(max(BACKEND_QUEUE_TIMEOUT, 1.0),
+                                         _estimate_seconds(segments))
+
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=10.0, read=900.0, write=30.0, pool=10.0)
+    )
+    queue: asyncio.Queue = asyncio.Queue(maxsize=STREAM_QUEUE_CHUNKS)
+    abandoned = asyncio.Event()
+    primed: asyncio.Future = asyncio.get_running_loop().create_future()
+
+    async def reader():
+        """Own the backend connection from first byte to last."""
         try:
-            for text, pause_ms in segments:
-                body, content_type = _build_multipart({**fields, "text": text}, ref_audio)
+            for index, (text, pause_ms) in enumerate(segments):
+                if abandoned.is_set() or await request.is_disconnected():
+                    abandoned.set()
+                    break
+                body, content_type = _build_multipart({**fields, "text": text},
+                                                      ref_audio)
                 async with client.stream(
                     "POST", f"{BACKEND_URL}/v1/audio/speech",
                     content=body, headers={"Content-Type": content_type},
                 ) as resp:
                     if resp.status_code != 200:
-                        raise HTTPException(
-                            status_code=502,
-                            detail=_backend_failure_detail(resp.status_code),
-                        )
+                        await resp.aread()
+                        if not primed.done():
+                            primed.set_exception(_backend_stream_error(resp.status_code))
+                        return
                     async for chunk in resp.aiter_bytes(chunk_size=4096):
-                        yield chunk
-                if pause_ms:
-                    yield _silence_pcm(pause_ms)
+                        if not primed.done():
+                            primed.set_result(None)
+                        # Asked of the connection, not inferred from the
+                        # generator. Starlette cancels the task consuming a
+                        # streaming body on disconnect but leaves the async
+                        # generator suspended at its yield, so a finally that
+                        # sets a flag there does not run until garbage
+                        # collection -- and the read went on to the end of the
+                        # segment, holding this adapter's slot and answering 429
+                        # long after the caller pressed stop.
+                        if abandoned.is_set() or await request.is_disconnected():
+                            abandoned.set()
+                            return
+                        try:
+                            await asyncio.wait_for(queue.put(chunk),
+                                                   timeout=CONSUMER_STALL_SECONDS)
+                        except asyncio.TimeoutError:
+                            # The buffer has been full this long with nobody
+                            # draining it: a backstop for a consumer that went
+                            # away without the connection reporting it.
+                            abandoned.set()
+                            return
+                if pause_ms and not abandoned.is_set():
+                    await queue.put(_silence_pcm(pause_ms))
+            if not primed.done():
+                # 200 with no body at all: report it rather than stream nothing.
+                primed.set_exception(ApiError(
+                    502, "backend_returned_no_audio",
+                    "Synthesis backend accepted the request but produced no audio."))
+        except Exception as exc:
+            if not primed.done():
+                primed.set_exception(exc)
         finally:
-            await client.aclose()
+            if not primed.done():
+                primed.set_exception(ApiError(
+                    502, "backend_error",
+                    "Synthesis backend closed the connection unexpectedly."))
             _BACKEND_SLOT.release()
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+            with contextlib.suppress(asyncio.QueueFull):
+                queue.put_nowait(None)
+
+    task = asyncio.create_task(reader())
+
+    # Surface a backend failure as a status code, which is only possible while no
+    # response exists yet.
+    try:
+        await primed
+    except BaseException:
+        abandoned.set()
+        # The reader still finishes the backend request and releases the slot;
+        # detaching rather than awaiting keeps a slow failure off this path.
+        raise
+
+    async def pcm_chunks():
+        try:
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    break
+                yield chunk
+        finally:
+            # The caller is gone. Tell the reader to stop queueing but let it run
+            # to the end of the backend response, or the backend's lock leaks.
+            abandoned.set()
+            while not queue.empty():
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    queue.get_nowait()
 
     if target_format == "pcm":
         source = pcm_chunks()
@@ -1038,6 +1182,7 @@ async def _stream_backend(fields: dict, ref_audio: bytes | None,
             "X-Breeze-Segments": str(len(segments)),
             "X-Audio-Duration-Estimate": str(estimate),
             "X-Audio-Sample-Rate": str(BACKEND_SAMPLE_RATE),
+            "X-Queue-Wait": f"{waited:.2f}",
         },
     )
 
@@ -1075,25 +1220,30 @@ async def _transcode_stream(pcm_iter, target_format: str):
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
     )
+    # PIPE was requested for both, so neither is None. Stated rather than assumed
+    # so dropping either from the call above fails here instead of as an
+    # AttributeError mid-stream.
+    stdin, stdout = proc.stdin, proc.stdout
+    assert stdin is not None and stdout is not None
 
     async def feed():
         try:
             async for chunk in pcm_iter:
-                proc.stdin.write(chunk)
-                await proc.stdin.drain()
+                stdin.write(chunk)
+                await stdin.drain()
         except (BrokenPipeError, ConnectionResetError):
             pass
         finally:
-            if proc.stdin.can_write_eof():
+            if stdin.can_write_eof():
                 try:
-                    proc.stdin.write_eof()
+                    stdin.write_eof()
                 except (OSError, RuntimeError):
                     pass
 
     feeder = asyncio.create_task(feed())
     try:
         while True:
-            out = await proc.stdout.read(4096)
+            out = await stdout.read(4096)
             if not out:
                 break
             yield out
@@ -1103,7 +1253,12 @@ async def _transcode_stream(pcm_iter, target_format: str):
         # it would hang while still holding the backend slot.
         feeder.cancel()
         await asyncio.gather(feeder, return_exceptions=True)
-        await pcm_iter.aclose()
+        try:
+            await pcm_iter.aclose()
+        except Exception:
+            # The generator's own finally has already released the slot; a
+            # failure to close it cleanly must not mask that.
+            pass
         if proc.returncode is None:
             proc.kill()
         await proc.wait()
@@ -1140,7 +1295,7 @@ class SpeechRequest(BaseModel):
 
 
 @app.post("/v1/audio/speech")
-async def create_speech(req: SpeechRequest):
+async def create_speech(req: SpeechRequest, request: Request):
     segments = segment_text(req.input)
     if not segments:
         raise HTTPException(status_code=400, detail="input is empty")
@@ -1195,7 +1350,8 @@ async def create_speech(req: SpeechRequest):
         fields["cfg_scale"] = req.cfg_value
 
     if req.stream:
-        return await _stream_backend(fields, ref_audio, segments, req.response_format)
+        return await _stream_backend(request, fields, ref_audio, segments,
+                                     req.response_format)
 
     pcm = await _synthesize(fields, ref_audio, segments)
     audio_bytes = _pcm_to_format(pcm, req.response_format)

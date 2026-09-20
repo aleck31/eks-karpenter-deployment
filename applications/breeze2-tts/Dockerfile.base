@@ -42,6 +42,15 @@ WORKDIR /opt/breeze-tts
 RUN pip install --no-cache-dir -r requirements.txt \
  && pip install --no-cache-dir "huggingface_hub[cli]"
 
+# 上游把推理锁的释放放在同步生成器的 finally 里，客户端断开时该 finally 不会执行，
+# 锁被永久持有：GPU 空闲而后续请求全部 409，只能重启进程。补丁改为用
+# BackgroundTask 关闭生成器并释放锁。依据与验证方式见脚本内注释。
+# 补丁在上游源码变动时会拒绝应用并使构建失败，而不是静默跳过。
+COPY patches/release-inference-lock-on-disconnect.py /tmp/patch.py
+RUN python3 /tmp/patch.py \
+ && python3 /tmp/patch.py --check \
+ && rm /tmp/patch.py
+
 # 与 voxcpm2-tts 一致的非 root 运行身份。/shared 上的声纹目录属主为 10001，
 # 两个应用共用同一 PVC，UID 必须一致，否则声纹读写会 PermissionError。
 RUN useradd -m -u 10001 appuser \
