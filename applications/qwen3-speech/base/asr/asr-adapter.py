@@ -252,7 +252,8 @@ def _backend_error_payload(resp: httpx.Response) -> dict:
         if match:
             needed, budget = int(match.group(1)), int(match.group(2))
 
-    if needed is None:
+    if needed is None or budget is None:
+        # Always assigned together; stated so the pairing survives an edit.
         return body
     return {"error": {
         "message": f"Audio is too long: it needs {needed} tokens against a budget of "
@@ -337,7 +338,7 @@ async def transcribe(file: UploadFile = File(...), model: str = Form(default="")
         if os.path.exists(source_path):
             os.unlink(source_path)
 
-    result = {"text": "".join(parts)}
+    result: dict[str, object] = {"text": "".join(parts)}
     if language:
         result["language"] = language
     if duration is not None:
