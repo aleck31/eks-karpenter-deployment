@@ -2,6 +2,7 @@
 .dev
 *.info
 *secret.yaml
+__pycache__
 tmp
 
 # Kustomize overlay：默认忽略全部环境目录，仅放行 example

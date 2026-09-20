@@ -14,8 +14,10 @@ exist because of how Breeze cloning works:
 
 import asyncio
 import base64
+import hashlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -24,12 +26,14 @@ import subprocess
 import tempfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from email.utils import formatdate
 from pathlib import Path
 
 import httpx
 import pysbd
-from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi import (FastAPI, File, Form, HTTPException, Request, Response,
+                     UploadFile)
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
 
@@ -42,10 +46,54 @@ async def _lifespan(_app: FastAPI):
 
 app = FastAPI(title="Breeze TTS 2 OpenAI TTS Adapter", lifespan=_lifespan)
 
+
+class ApiError(HTTPException):
+    """HTTPException carrying a stable machine-readable code.
+
+    Callers previously had to tell business state from infrastructure failure by
+    inspecting the prose in `detail`, and a missing reference recording answered
+    503 -- the same status an ALB returns with no pod behind it, and the same one
+    this adapter uses for a full backend queue.
+    """
+
+    def __init__(self, status_code: int, code: str, message: str,
+                 headers: dict | None = None):
+        super().__init__(status_code=status_code, detail=message, headers=headers)
+        self.code = code
+
+
+@app.exception_handler(HTTPException)
+async def _http_exception_handler(_request, exc: HTTPException):
+    # `detail` is kept alongside `error` so existing callers keep working.
+    code = getattr(exc, "code", None) or _DEFAULT_ERROR_CODES.get(
+        exc.status_code, "error")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "detail": exc.detail,
+            "error": {"code": code, "message": exc.detail,
+                      "status": exc.status_code},
+        },
+        headers=getattr(exc, "headers", None),
+    )
+
+
+_DEFAULT_ERROR_CODES = {
+    400: "invalid_request",
+    403: "forbidden",
+    404: "not_found",
+    409: "conflict",
+    424: "dependency_missing",
+    502: "backend_error",
+    503: "backend_unavailable",
+}
+
 BACKEND_URL = os.getenv("BREEZE_BACKEND_URL", "http://localhost:8000")
 VOICES_DIR = Path(os.getenv("VOICES_DIR", "/shared/voices"))
 
 # Breeze emits raw little-endian signed 16-bit PCM with no container.
+MODEL_ID = os.getenv("BREEZE_MODEL_ID", "breeze-tts-2")
+
 BACKEND_SAMPLE_RATE = 24000
 BACKEND_CHANNELS = 1
 BACKEND_SAMPLE_WIDTH = 2
@@ -141,22 +189,55 @@ def _split_sentences(text: str) -> list[str]:
         merged.append(piece)
     return merged
 
-# Shared with voxcpm2-tts on the same volume. Not bumped for ref_text/seed:
-# neither can be inferred from an existing entry, so there is no migration to
-# run -- a voice without ref_text is rejected at synthesis time with an
-# actionable error instead.
-REGISTRY_SCHEMA = 2
+# Shared with voxcpm2-tts on the same volume.
+#   v2  marked presets as builtin
+#   v3  added created_at / updated_at / audio.sha256 / audio loudness, so a
+#       client can key a cache on content rather than on size_bytes, which a
+#       same-length replacement does not change
+REGISTRY_SCHEMA = 3
+
+# Loudness guidance. _normalize_audio targets -16 LUFS, so a stored reference
+# far from that was written straight onto the volume. The SNR figure is a crude
+# floor-to-peak estimate, not a true speech/noise separation -- enough to flag a
+# recording made in a noisy room, not to grade one.
+REF_TARGET_LUFS = -16.0
+REF_LUFS_TOLERANCE = 6.0
+REF_PEAK_CEILING_DB = -1.0
+REF_SNR_FLOOR_DB = 20.0
+
+# Measured on this deployment's voices at 3.63-3.82 characters per second
+# (81 chars / 22.3s and 73 chars / 19.1s). Only used to advertise an estimated
+# duration before streaming starts, where the real figure is not yet knowable.
+CHARS_PER_SECOND = 3.7
+
+# Real-time factor with the deployed --fast-* combination: generating one
+# second of audio takes this long. Measured at 0.88 on an L4.
+BACKEND_RTF = 0.88
 
 # The backend serves one request at a time and answers HTTP 409 for anything
 # concurrent. Serialising here turns that into a queue rather than an error the
 # caller has to retry, but the queue is bounded: past the wait budget a caller
 # is better off being told the service is busy than blocking indefinitely.
+# The backend serves one request at a time and answers HTTP 409 for anything
+# concurrent. Serialising here turns that into a queue rather than an error the
+# caller has to retry.
+#
+# By default nothing queues: a second request is rejected the moment it arrives,
+# with Retry-After carrying the projected remaining time. Holding the connection
+# open and failing later tells the caller nothing it can act on and is
+# indistinguishable from the service hanging, which is how a one-at-a-time
+# backend ends up looking unusable.
+#
+# Raise BREEZE_QUEUE_REJECT_SECONDS to let callers wait that many projected
+# seconds instead -- useful for a batch client that would rather block than
+# retry. BACKEND_QUEUE_TIMEOUT then caps how long anyone who does queue waits.
 BACKEND_QUEUE_TIMEOUT = float(os.getenv("BREEZE_QUEUE_TIMEOUT", "120"))
+QUEUE_REJECT_SECONDS = float(os.getenv("BREEZE_QUEUE_REJECT_SECONDS", "0"))
 _SLOT_POLL_SECONDS = 0.05
 
 
 class _BackendSlot:
-    """Single-occupancy gate for the backend.
+    """Single-occupancy gate for the backend, with a projected wait.
 
     Deliberately not an asyncio.Lock. `asyncio.wait_for(lock.acquire())` can
     leave the lock held when the timeout fires in the same loop iteration the
@@ -173,30 +254,94 @@ class _BackendSlot:
 
     def __init__(self) -> None:
         self._busy = False
+        self._started_at: float | None = None
+        self._estimate = 0.0
+        self._queued: list[float] = []
 
     @property
     def busy(self) -> bool:
         return self._busy
 
-    async def acquire(self, timeout: float) -> None:
+    @property
+    def queued(self) -> int:
+        return len(self._queued)
+
+    def projected_wait(self) -> float:
+        """Seconds before a caller arriving now could start.
+
+        The in-flight request's remaining time plus everything already queued
+        ahead of the caller. Derived from the character-count estimate, so it is
+        only as good as CHARS_PER_SECOND and BACKEND_RTF -- enough to decide
+        whether queueing is worth it, not a promise.
+        """
+        if not self._busy:
+            return 0.0
+        loop = asyncio.get_event_loop()
+        elapsed = loop.time() - self._started_at if self._started_at else 0.0
+        return max(0.0, self._estimate - elapsed) + sum(self._queued)
+
+    async def acquire(self, timeout: float, estimate: float = 0.0) -> float:
+        """Take the slot, returning how many seconds the caller waited."""
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-        while self._busy:
-            if loop.time() >= deadline:
-                raise HTTPException(
-                    status_code=503,
-                    detail="Synthesis backend is busy. Breeze serves one request at a "
-                           f"time; the {timeout:g}s queue budget was exhausted. "
-                           "Retry shortly.",
-                )
-            await asyncio.sleep(_SLOT_POLL_SECONDS)
+        projected = self.projected_wait()
+        # QUEUE_REJECT_SECONDS <= 0 means never queue, which is the default.
+        if self._busy and (QUEUE_REJECT_SECONDS <= 0
+                           or projected > QUEUE_REJECT_SECONDS):
+            retry_after = max(1, math.ceil(projected))
+            raise ApiError(
+                429, "backend_busy",
+                f"Synthesis backend is busy. Breeze serves one request at a time, "
+                f"so this request was not queued. About {projected:.0f}s remain on "
+                f"the request in flight; retry after the interval in Retry-After.",
+                headers={"Retry-After": str(retry_after),
+                         "X-Queue-Depth": str(self.queued + 1),
+                         "X-Retry-After-Seconds": str(retry_after)},
+            )
+
+        self._queued.append(estimate)
+        waiting_since = loop.time()
+        deadline = waiting_since + timeout
+        try:
+            while self._busy:
+                if loop.time() >= deadline:
+                    raise ApiError(
+                        503, "backend_busy",
+                        f"Synthesis backend is busy. Breeze serves one request at a "
+                        f"time; the {timeout:g}s queue budget was exhausted.",
+                        headers={"Retry-After": str(
+                            max(1, math.ceil(self.projected_wait())))},
+                    )
+                await asyncio.sleep(_SLOT_POLL_SECONDS)
+        finally:
+            # Also runs when the caller disconnects mid-wait, so someone who gave
+            # up stops inflating the projection for everyone behind them.
+            try:
+                self._queued.remove(estimate)
+            except ValueError:
+                pass
         self._busy = True
+        self._started_at = loop.time()
+        self._estimate = estimate
+        return loop.time() - waiting_since
 
     def release(self) -> None:
         self._busy = False
+        self._started_at = None
+        self._estimate = 0.0
 
 
 _BACKEND_SLOT = _BackendSlot()
+
+
+def _estimate_seconds(segments: list[tuple[str, int]]) -> float:
+    """How long synthesising these segments should take.
+
+    Characters over the measured speaking rate gives audio duration; times the
+    measured RTF gives generation time. Pauses are local silence and cost
+    nothing to produce.
+    """
+    chars = sum(len(text) for text, _ in segments)
+    return chars / CHARS_PER_SECOND * BACKEND_RTF
 
 CONTENT_TYPES = {
     "mp3": "audio/mpeg",
@@ -250,6 +395,59 @@ def _reference_path(voice_id: str, registry: dict | None = None) -> Path:
     return VOICES_DIR / voice_id / filename
 
 
+def _sha256_file(path: Path) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for block in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(block)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _measure_loudness(audio_path: Path) -> dict:
+    """Measure integrated loudness, true peak and a crude noise-floor margin.
+
+    ebur128 gives LUFS and true peak directly. The SNR figure is peak minus the
+    RMS trough across 50ms windows -- it approximates how far speech sits above
+    the quietest part of the recording, which is not a real speech/noise
+    separation but does separate a quiet room from a noisy one.
+    """
+    try:
+        out = subprocess.run(
+            ["ffmpeg", "-v", "info", "-i", str(audio_path),
+             "-af", "ebur128=peak=true,astats=metadata=1:reset=0",
+             "-f", "null", "-"],
+            capture_output=True, timeout=60, text=True, errors="replace",
+        )
+    except (subprocess.SubprocessError, OSError):
+        return {}
+
+    log = out.stderr
+    result: dict = {}
+
+    summary = log.rsplit("Summary:", 1)
+    if len(summary) == 2:
+        for key, field in (("I:", "lufs"), ("Peak:", "true_peak_db")):
+            match = re.search(rf"{re.escape(key)}\s*(-?\d+(?:\.\d+)?)\s*(?:LUFS|dBFS)",
+                              summary[1])
+            if match:
+                result[field] = round(float(match.group(1)), 1)
+
+    peak = re.search(r"Peak level dB:\s*(-?\d+(?:\.\d+)?)", log)
+    trough = re.search(r"Noise floor dB:\s*(-?\d+(?:\.\d+)?)", log)
+    if peak and trough:
+        margin = round(float(peak.group(1)) - float(trough.group(1)), 1)
+        # astats omits the noise floor on some inputs, and reports it equal to the
+        # peak on a pure tone -- both yield a figure that says nothing about the
+        # recording. Report only a positive margin; absent beats misleading,
+        # since the warning threshold would otherwise fire on every synthetic clip.
+        if margin > 0:
+            result["snr_db"] = margin
+    return result
+
+
 def _probe_audio(audio_path: Path) -> dict:
     """Extract duration / sample rate / channels from a reference recording."""
     try:
@@ -262,18 +460,93 @@ def _probe_audio(audio_path: Path) -> dict:
         )
         probed = json.loads(out.stdout)
         stream = (probed.get("streams") or [{}])[0]
-        return {
+        meta = {
             "duration_seconds": round(float(probed.get("format", {}).get("duration", 0)), 2),
             "sample_rate": int(stream.get("sample_rate", 0)) or None,
             "channels": stream.get("channels"),
             "codec": stream.get("codec_name"),
             "size_bytes": audio_path.stat().st_size,
+            # Content-addressed so a caller's cache key survives a replacement
+            # that happens to be the same length.
+            "sha256": _sha256_file(audio_path),
         }
+        meta.update(_measure_loudness(audio_path))
+        return meta
     except (subprocess.SubprocessError, ValueError, KeyError, OSError):
         return {}
 
 
-def _audio_warnings(audio: dict) -> list[str]:
+def _voice_view(voice_id: str, meta: dict, registry: dict) -> dict:
+    """The one representation of a voice, served by both list and detail.
+
+    The listing used to carry a subset, so a caller wanting a reference
+    transcript or duration had to fan out one request per voice. The registry is
+    a single document already held in memory, so the only per-voice cost here is
+    one stat to confirm the recording is still on disk.
+    """
+    audio = meta.get("audio") or {}
+    # Audio metadata is captured at registration time, so a recording lost
+    # afterwards would keep being reported as present.
+    present = _reference_path(voice_id, registry).exists()
+
+    warnings = _registry_warnings(meta)
+    if present:
+        warnings += _audio_warnings(audio)
+    else:
+        warnings.append(_warn(
+            "reference_audio_missing", "reference_audio", "missing", "present",
+            "reference audio is missing; the stored duration and sample rate no "
+            "longer describe anything on disk and cloning cannot use this voice",
+            severity="error"))
+
+    return {
+        "voice_id": voice_id,
+        "name": meta.get("name", voice_id),
+        "description": meta.get("description", ""),
+        "gender": meta.get("gender", "unknown"),
+        "type": "builtin" if meta.get("builtin") else "custom",
+        "builtin": bool(meta.get("builtin")),
+        "ref_text": meta.get("ref_text"),
+        "seed": meta.get("seed"),
+        "ready": bool(meta.get("ref_text")) and present,
+        "reference_audio": "present" if present else "missing",
+        "created_at": meta.get("created_at"),
+        # Any change to the reference clip, its transcript or the seed produces a
+        # different voice, so a client can key a synthesis cache on this alone.
+        "updated_at": meta.get("updated_at"),
+        "duration_seconds": audio.get("duration_seconds") if present else None,
+        "sample_rate": audio.get("sample_rate") if present else None,
+        "channels": audio.get("channels") if present else None,
+        "codec": audio.get("codec") if present else None,
+        "size_bytes": audio.get("size_bytes") if present else None,
+        "sample_sha256": audio.get("sha256") if present else None,
+        "lufs": audio.get("lufs") if present else None,
+        "true_peak_db": audio.get("true_peak_db") if present else None,
+        "snr_db": audio.get("snr_db") if present else None,
+        "warnings": warnings,
+    }
+
+
+def _touch(meta: dict, *, created: bool = False) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    if created:
+        meta["created_at"] = now
+    meta["updated_at"] = now
+    return meta
+
+
+def _warn(code: str, field: str, value, threshold, message: str,
+          severity: str = "warning") -> dict:
+    """One advisory finding.
+
+    Structured so a client can colour or fold by threshold instead of parsing
+    the sentence; `message` stays for callers that only display text.
+    """
+    return {"code": code, "field": field, "value": value,
+            "threshold": threshold, "severity": severity, "message": message}
+
+
+def _audio_warnings(audio: dict) -> list[dict]:
     """Advise on a stored reference. Never blocks: a short clip still clones.
 
     The thresholds live here rather than in each client: the server knows the
@@ -284,43 +557,71 @@ def _audio_warnings(audio: dict) -> list[str]:
     good = f"{REF_GOOD_MIN_SECONDS:g}-{REF_GOOD_MAX_SECONDS:g}s"
     if duration is not None:
         if duration < REF_MIN_SECONDS:
-            warnings.append(
+            warnings.append(_warn(
+                "reference_very_short", "duration_seconds", duration,
+                REF_MIN_SECONDS,
                 f"duration {duration}s is very short for cloning; it will still work "
-                f"but expect the timbre to drift. Re-record at {good} for a faithful clone"
-            )
+                f"but expect the timbre to drift. Re-record at {good} for a faithful clone"))
         elif duration < REF_GOOD_MIN_SECONDS:
-            warnings.append(
-                f"duration {duration}s is usable; {good} clones more reliably"
-            )
+            warnings.append(_warn(
+                "reference_short", "duration_seconds", duration,
+                REF_GOOD_MIN_SECONDS,
+                f"duration {duration}s is usable; {good} clones more reliably"))
         elif duration > REF_MAX_USEFUL_SECONDS:
-            warnings.append(
+            warnings.append(_warn(
+                "reference_long", "duration_seconds", duration,
+                REF_MAX_USEFUL_SECONDS,
                 f"duration {duration}s is longer than needed; anything past "
                 f"{REF_MAX_USEFUL_SECONDS:g}s adds request size and processing time "
-                f"without improving the clone. {good} is the sweet spot"
-            )
+                f"without improving the clone. {good} is the sweet spot"))
+
     rate, channels = audio.get("sample_rate"), audio.get("channels")
     if rate is not None and rate != REF_SAMPLE_RATE:
-        warnings.append(
+        warnings.append(_warn(
+            "sample_rate_unexpected", "sample_rate", rate, REF_SAMPLE_RATE,
             f"sample rate {rate}Hz is not the expected {REF_SAMPLE_RATE}Hz; "
-            "this recording did not go through API normalization"
-        )
+            "this recording did not go through API normalization"))
     if channels is not None and channels != REF_CHANNELS:
-        warnings.append(
+        warnings.append(_warn(
+            "channels_unexpected", "channels", channels, REF_CHANNELS,
             f"{channels} channels instead of mono; "
-            "this recording did not go through API normalization"
-        )
+            "this recording did not go through API normalization"))
+
+    # Loudness findings share the thresholds _normalize_audio targets, so a
+    # client's "re-record" prompt matches what the server judged.
+    lufs = audio.get("lufs")
+    if lufs is not None and abs(lufs - REF_TARGET_LUFS) > REF_LUFS_TOLERANCE:
+        warnings.append(_warn(
+            "loudness_off_target", "lufs", lufs, REF_TARGET_LUFS,
+            f"integrated loudness {lufs} LUFS is more than "
+            f"{REF_LUFS_TOLERANCE:g} LU from the {REF_TARGET_LUFS:g} LUFS target; "
+            "this recording did not go through API normalization"))
+    peak = audio.get("true_peak_db")
+    if peak is not None and peak > REF_PEAK_CEILING_DB:
+        warnings.append(_warn(
+            "peak_too_high", "true_peak_db", peak, REF_PEAK_CEILING_DB,
+            f"true peak {peak} dBFS exceeds {REF_PEAK_CEILING_DB:g} dBFS and may "
+            "already be clipped; re-record with more headroom"))
+    snr = audio.get("snr_db")
+    if snr is not None and snr < REF_SNR_FLOOR_DB:
+        warnings.append(_warn(
+            "noise_floor_high", "snr_db", snr, REF_SNR_FLOOR_DB,
+            f"only {snr} dB between peak and noise floor (below "
+            f"{REF_SNR_FLOOR_DB:g} dB); background noise is audible and will be "
+            "cloned along with the voice"))
     return warnings
 
 
-def _registry_warnings(meta: dict) -> list[str]:
+def _registry_warnings(meta: dict) -> list[dict]:
     """Advise on fields this backend needs that an entry may predate."""
     warnings = []
     if not meta.get("ref_text"):
-        warnings.append(
+        warnings.append(_warn(
+            "ref_text_missing", "ref_text", None, None,
             "ref_text is not set; Breeze requires the reference clip's exact "
             "transcript, so this voice cannot be used for cloning until one is "
-            "supplied via PUT /v1/audio/voices/{voice_id}"
-        )
+            "supplied via PUT /v1/audio/voices/{voice_id}",
+            severity="error"))
     return warnings
 
 
@@ -357,6 +658,23 @@ def _heal_registry() -> dict:
                 meta["builtin"] = "created_at" not in meta
                 changed = True
 
+    if schema < 3:
+        # created_at was only written from the v2-era registration path, so 13 of
+        # 25 entries here had none. Falling back to the recording's mtime beats
+        # leaving null, which every client would have to special-case anyway.
+        for voice_id, meta in registry.items():
+            audio_path = VOICES_DIR / voice_id / meta.get("file", "ref.wav")
+            stamp = None
+            if audio_path.exists():
+                stamp = datetime.fromtimestamp(
+                    audio_path.stat().st_mtime, timezone.utc).isoformat()
+            if not meta.get("created_at") and stamp:
+                meta["created_at"] = stamp
+                changed = True
+            if not meta.get("updated_at"):
+                meta["updated_at"] = meta.get("created_at") or stamp
+                changed = True
+
     # Not a migration: audio metadata is recorded at registration time, so this
     # only fills entries written before that, and is keyed on the file existing
     # rather than on any inference about the entry's origin.
@@ -366,11 +684,16 @@ def _heal_registry() -> dict:
         if "gender" not in meta:
             meta["gender"] = "unknown"
             changed = True
+        audio_path = VOICES_DIR / voice_id / meta.get("file", "ref.wav")
         if "audio" not in meta:
-            audio_path = VOICES_DIR / voice_id / meta.get("file", "ref.wav")
             if audio_path.exists():
                 meta["audio"] = _probe_audio(audio_path)
                 changed = True
+        elif audio_path.exists() and not (meta["audio"] or {}).get("sha256"):
+            # Re-probe rather than patch: the digest and the loudness figures come
+            # from the same pass, and an entry missing one is missing both.
+            meta["audio"] = _probe_audio(audio_path)
+            changed = True
 
     if changed:
         try:
@@ -639,7 +962,7 @@ async def _synthesize(fields: dict, ref_audio: bytes | None,
     caller interleave, so a long passage could be stretched out arbitrarily and
     the seed's effect would be the only thing holding the timbre together.
     """
-    await _BACKEND_SLOT.acquire(BACKEND_QUEUE_TIMEOUT)
+    await _BACKEND_SLOT.acquire(BACKEND_QUEUE_TIMEOUT, _estimate_seconds(segments))
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             out = bytearray()
@@ -666,7 +989,8 @@ async def _stream_backend(fields: dict, ref_audio: bytes | None,
     """
 
     async def pcm_chunks():
-        await _BACKEND_SLOT.acquire(BACKEND_QUEUE_TIMEOUT)
+        await _BACKEND_SLOT.acquire(BACKEND_QUEUE_TIMEOUT,
+                                    _estimate_seconds(segments))
         client = httpx.AsyncClient(
             timeout=httpx.Timeout(connect=10.0, read=900.0, write=30.0, pool=10.0)
         )
@@ -701,10 +1025,20 @@ async def _stream_backend(fields: dict, ref_audio: bytes | None,
     else:
         source = _transcode_stream(pcm_chunks(), target_format)
 
+    # Estimated, not measured: generation has not finished when the first bytes
+    # go out, so the real duration is not yet knowable. Named separately from an
+    # exact figure so a player can tell a projection from a fact.
+    chars = sum(len(text) for text, _ in segments)
+    pauses = sum(pause for _, pause in segments) / 1000.0
+    estimate = round(chars / CHARS_PER_SECOND + pauses, 1)
     return StreamingResponse(
         source,
         media_type=CONTENT_TYPES[target_format],
-        headers={"X-Breeze-Segments": str(len(segments))},
+        headers={
+            "X-Breeze-Segments": str(len(segments)),
+            "X-Audio-Duration-Estimate": str(estimate),
+            "X-Audio-Sample-Rate": str(BACKEND_SAMPLE_RATE),
+        },
     )
 
 
@@ -825,25 +1159,25 @@ async def create_speech(req: SpeechRequest):
     else:
         registry = _load_registry()
         if req.voice not in registry:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Voice '{req.voice}' is not registered. List available voices at "
+            raise ApiError(
+                404, "voice_not_found",
+                f"Voice '{req.voice}' is not registered. List available voices at "
                        "GET /v1/audio/voices, or pass voice_description to generate from a "
                        "description instead.",
             )
         meta = registry[req.voice]
         ref_path = _reference_path(req.voice, registry)
         if not ref_path.exists():
-            raise HTTPException(
-                status_code=503,
-                detail=f"Voice '{req.voice}' is registered but its reference audio is "
+            raise ApiError(
+                424, "reference_audio_missing",
+                f"Voice '{req.voice}' is registered but its reference audio is "
                        "unavailable, so the timbre it promises cannot be reproduced.",
             )
         ref_text = meta.get("ref_text")
         if not ref_text:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Voice '{req.voice}' has no ref_text. Breeze clones from a "
+            raise ApiError(
+                424, "ref_text_missing",
+                f"Voice '{req.voice}' has no ref_text. Breeze clones from a "
                        "reference clip paired with its exact transcript and rejects the "
                        "clip alone. Set it with PUT /v1/audio/voices/"
                        f"{req.voice} (field ref_text).",
@@ -866,9 +1200,15 @@ async def create_speech(req: SpeechRequest):
     pcm = await _synthesize(fields, ref_audio, segments)
     audio_bytes = _pcm_to_format(pcm, req.response_format)
     content_type = CONTENT_TYPES.get(req.response_format, "application/octet-stream")
+    # Exact here, unlike the streaming path: the whole waveform is in hand.
+    duration = len(pcm) / (BACKEND_SAMPLE_RATE * BACKEND_CHANNELS * BACKEND_SAMPLE_WIDTH)
     return Response(
         content=audio_bytes, media_type=content_type,
-        headers={"X-Breeze-Segments": str(len(segments))},
+        headers={
+            "X-Breeze-Segments": str(len(segments)),
+            "X-Audio-Duration": f"{duration:.2f}",
+            "X-Audio-Sample-Rate": str(BACKEND_SAMPLE_RATE),
+        },
     )
 
 
@@ -918,21 +1258,8 @@ async def clone_speech(req: CloneRequest):
 @app.get("/v1/audio/voices")
 async def list_voices():
     registry = _load_registry()
-    voices = []
-    for vid, meta in registry.items():
-        voices.append({
-            "voice_id": vid, "name": meta.get("name", vid),
-            "description": meta.get("description", ""),
-            "gender": meta.get("gender", "unknown"),
-            "type": "builtin" if meta.get("builtin") else "custom",
-            "builtin": bool(meta.get("builtin")),
-            # Surfaced in the listing because a voice missing it cannot be
-            # synthesised at all, which a caller should not have to discover
-            # one detail lookup at a time.
-            "ready": bool(meta.get("ref_text")),
-            "seed": meta.get("seed"),
-        })
-    return {"voices": voices}
+    return {"voices": [_voice_view(vid, meta, registry)
+                       for vid, meta in registry.items()]}
 
 
 @app.post("/v1/audio/voices")
@@ -952,6 +1279,15 @@ async def create_voice(
 
     # Guard: never let a POST silently overwrite a built-in preset
     _assert_not_builtin(registry, voice_id, "overwriting via registration")
+    # Nor a custom one. The id namespace is flat and shared, so a repeated POST
+    # used to replace another caller's reference recording with no way back.
+    if voice_id in registry:
+        raise ApiError(
+            409, "voice_exists",
+            f"Voice '{voice_id}' already exists. Registration never replaces a "
+            "stored recording; use PUT /v1/audio/voices/{voice_id} to update it, "
+            "or choose another id.",
+        )
 
     audio_bytes = await audio.read()
     fmt = audio.filename.rsplit(".", 1)[-1].lower() if audio.filename else "wav"
@@ -962,7 +1298,7 @@ async def create_voice(
     (voice_dir / "ref.wav").write_bytes(normalized)
 
     audio_meta = _probe_audio(voice_dir / "ref.wav")
-    registry[voice_id] = {
+    registry[voice_id] = _touch({
         "file": "ref.wav",
         "name": name or voice_id,
         "description": description or "",
@@ -971,12 +1307,14 @@ async def create_voice(
         "ref_text": ref_text,
         "seed": seed,
         "audio": audio_meta,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
+    }, created=True)
     _save_registry(registry)
-    # Surfaced on upload rather than only via a later detail lookup: the caller
-    # can re-record while they still have the source material at hand.
-    return {"voice_id": voice_id, "status": "created", "warnings": _audio_warnings(audio_meta)}
+    # The full view is returned rather than a bare status: the caller can act on
+    # the loudness and duration findings while the source material is still at
+    # hand, with no follow-up request.
+    return {"voice_id": voice_id, "status": "created",
+            "warnings": _audio_warnings(audio_meta),
+            "voice": _voice_view(voice_id, registry[voice_id], registry)}
 
 
 @app.put("/v1/audio/voices/{voice_id}")
@@ -992,7 +1330,7 @@ async def update_voice(
     _validate_voice_id(voice_id)
     registry = _load_registry()
     if voice_id not in registry:
-        raise HTTPException(status_code=404, detail=f"Voice '{voice_id}' not found")
+        raise ApiError(404, "voice_not_found", f"Voice '{voice_id}' not found")
 
     if audio:
         # Built-in presets: metadata is editable, reference audio is not
@@ -1022,48 +1360,21 @@ async def update_voice(
         registry[voice_id]["ref_text"] = ref_text
     if seed is not None:
         registry[voice_id]["seed"] = _validate_seed(seed)
+    _touch(registry[voice_id])
     _save_registry(registry)
-    return {"voice_id": voice_id, "status": "updated"}
+    return {"voice_id": voice_id, "status": "updated",
+            "voice": _voice_view(voice_id, registry[voice_id], registry)}
 
 
 @app.get("/v1/audio/voices/{voice_id}")
 async def get_voice(voice_id: str):
     registry = _load_registry()
     if voice_id not in registry:
-        raise HTTPException(status_code=404, detail=f"Voice '{voice_id}' not found")
-    meta = registry[voice_id]
-    audio = meta.get("audio") or {}
-    # Audio metadata is captured at registration time, so a recording lost
-    # afterwards would keep being reported as present. Checking here keeps this
-    # response consistent with what /preview and synthesis actually do.
-    reference_present = _reference_path(voice_id, registry).exists()
-    warnings = _registry_warnings(meta)
-    if reference_present:
-        warnings += _audio_warnings(audio)
-    else:
-        warnings.append(
-            "reference audio is missing; the stored duration and sample rate no "
-            "longer describe anything on disk and cloning cannot use this voice"
-        )
-    return {
-        "voice_id": voice_id,
-        "name": meta.get("name"),
-        "description": meta.get("description"),
-        "gender": meta.get("gender", "unknown"),
-        "created_at": meta.get("created_at"),
-        "type": "builtin" if meta.get("builtin") else "custom",
-        "builtin": bool(meta.get("builtin")),
-        "ref_text": meta.get("ref_text"),
-        "seed": meta.get("seed"),
-        "ready": bool(meta.get("ref_text")) and reference_present,
-        "reference_audio": "present" if reference_present else "missing",
-        "duration_seconds": audio.get("duration_seconds") if reference_present else None,
-        "sample_rate": audio.get("sample_rate") if reference_present else None,
-        "channels": audio.get("channels") if reference_present else None,
-        "codec": audio.get("codec") if reference_present else None,
-        "size_bytes": audio.get("size_bytes") if reference_present else None,
-        "warnings": warnings,
-    }
+        raise ApiError(404, "voice_not_found", f"Voice '{voice_id}' not found")
+    # Returns exactly one element of GET /v1/audio/voices -- this route holds no
+    # extra fields. It exists to fetch one voice by id (570 bytes against 16 KB
+    # for the full listing) and to answer 404 for an id that does not exist.
+    return _voice_view(voice_id, registry[voice_id], registry)
 
 
 @app.delete("/v1/audio/voices/{voice_id}")
@@ -1071,7 +1382,7 @@ async def delete_voice(voice_id: str):
     _validate_voice_id(voice_id)
     registry = _load_registry()
     if voice_id not in registry:
-        raise HTTPException(status_code=404, detail=f"Voice '{voice_id}' not found")
+        raise ApiError(404, "voice_not_found", f"Voice '{voice_id}' not found")
     _assert_not_builtin(registry, voice_id, "deletion")
     voice_dir = VOICES_DIR / voice_id
     if voice_dir.exists():
@@ -1082,14 +1393,101 @@ async def delete_voice(voice_id: str):
 
 
 @app.get("/v1/audio/voices/{voice_id}/preview")
-async def preview_voice(voice_id: str):
+async def preview_voice(voice_id: str, request: Request):
     registry = _load_registry()
     if voice_id not in registry:
-        raise HTTPException(status_code=404, detail=f"Voice '{voice_id}' not found")
+        raise ApiError(404, "voice_not_found", f"Voice '{voice_id}' not found")
     audio_path = _reference_path(voice_id, registry)
     if not audio_path.exists():
-        raise HTTPException(status_code=404, detail="Reference audio file missing")
-    return Response(content=audio_path.read_bytes(), media_type="audio/wav")
+        # 424, not 404: the voice exists and this is a stored-state problem, not
+        # a wrong URL. Distinct from the 503 an ALB returns with no pod behind it.
+        raise ApiError(
+            424, "reference_audio_missing",
+            f"Voice '{voice_id}' is registered but its reference audio is missing "
+            "from storage. Re-upload it via PUT /v1/audio/voices/{voice_id}.",
+        )
+
+    # The digest is recorded at registration, so a replacement of identical
+    # length still changes it -- size alone made a stale cache entry look valid.
+    digest = (registry[voice_id].get("audio") or {}).get("sha256")
+    etag = f'"{digest}"' if digest else None
+    stat = audio_path.stat()
+    headers = {
+        "Last-Modified": formatdate(stat.st_mtime, usegmt=True),
+        "Cache-Control": "private, max-age=0, must-revalidate",
+    }
+    if etag:
+        headers["ETag"] = etag
+        if request.headers.get("if-none-match") == etag:
+            return Response(status_code=304, headers=headers)
+    return Response(content=audio_path.read_bytes(), media_type="audio/wav",
+                    headers=headers)
+
+
+# --- Capability discovery ---
+
+@app.get("/v1/models")
+async def list_models():
+    """Advertise the model id and what this deployment can actually do.
+
+    Without this a caller has to hardcode the model id and every limit, and has
+    no way to tell a deployment that supports streaming mp3 from one that does
+    not.
+    """
+    registry = _load_registry()
+    return {
+        "object": "list",
+        "data": [{
+            "id": MODEL_ID,
+            "object": "model",
+            "owned_by": "breezeblue",
+            "capabilities": {
+                "speech": True,
+                "streaming": True,
+                "voice_clone": True,
+                "voice_design": True,
+                "timing_marks": False,
+                # One at a time, and a second request is rejected rather than
+                # queued: a caller should retry on Retry-After, not block.
+                "concurrent_requests": 1,
+                "queues_when_busy": QUEUE_REJECT_SECONDS > 0,
+            },
+            "busy": _BACKEND_SLOT.busy,
+            "projected_wait_seconds": round(_BACKEND_SLOT.projected_wait(), 1),
+            "response_formats": sorted(CONTENT_TYPES),
+            "streaming_formats": sorted(CONTENT_TYPES),
+            "sample_rate": BACKEND_SAMPLE_RATE,
+            "seed": {"min": SEED_MIN, "max": SEED_MAX, "default": SEED_DEFAULT},
+            "text": {"max_segment_chars": MAX_SEGMENT_CHARS,
+                     "chars_per_second": CHARS_PER_SECOND},
+            "reference_audio": {
+                "sample_rate": REF_SAMPLE_RATE,
+                "channels": REF_CHANNELS,
+                "target_lufs": REF_TARGET_LUFS,
+                "min_seconds": REF_MIN_SECONDS,
+                "recommended_seconds": [REF_GOOD_MIN_SECONDS, REF_GOOD_MAX_SECONDS],
+                "max_useful_seconds": REF_MAX_USEFUL_SECONDS,
+            },
+            "voices": len(registry),
+        }],
+    }
+
+
+@app.get("/v1/audio/speech/status")
+async def speech_status():
+    """Whether a synthesis request would be accepted right now.
+
+    Cheap enough to poll: a client can check before sending a long request
+    instead of discovering the rejection after uploading it.
+    """
+    projected = round(_BACKEND_SLOT.projected_wait(), 1)
+    return {
+        "busy": _BACKEND_SLOT.busy,
+        "accepting": not _BACKEND_SLOT.busy or QUEUE_REJECT_SECONDS > 0,
+        "projected_wait_seconds": projected,
+        "retry_after_seconds": max(1, math.ceil(projected)) if projected else 0,
+        "concurrent_requests": 1,
+    }
 
 
 # --- Health ---
@@ -1111,4 +1509,4 @@ async def ready():
                 return {"status": "ready"}
         except httpx.RequestError:
             pass
-    raise HTTPException(status_code=503, detail="Backend not ready")
+    raise ApiError(503, "backend_not_ready", "Backend not ready")
