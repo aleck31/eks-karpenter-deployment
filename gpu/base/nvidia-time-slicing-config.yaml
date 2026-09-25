@@ -1,5 +1,12 @@
 # NVIDIA GPU Time-Slicing 配置
-# 将每张物理 GPU 虚拟为 2 个 nvidia.com/gpu 资源
+#
+# replicas 决定每张物理 GPU 对外暴露几个 nvidia.com/gpu 资源。
+# 时间切片只分时复用计算单元，不切分显存 —— 同卡上的 Pod 共享全部显存、
+# 可互相 OOM，因此 replicas 必须按"最小显存机型能否装下这么多 Pod"来定。
+#
+# 取 3 的依据（实测值）：32GB 卡上两个语音推理服务常驻约 20GB，
+# 第三个轻量负载按需占用 0~4GB；渲染类负载每个仅 545MB。
+# 调整此值时需同步检查最小显存机型能否装下这么多 Pod。
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -13,4 +20,4 @@ data:
       timeSlicing:
         resources:
         - name: nvidia.com/gpu
-          replicas: 2
+          replicas: 3

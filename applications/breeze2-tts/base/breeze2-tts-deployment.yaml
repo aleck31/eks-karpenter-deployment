@@ -136,8 +136,16 @@ spec:
             - matchExpressions:
               - key: node.kubernetes.io/instance-type
                 operator: In
-                values: ["g6.xlarge", "g6.2xlarge", "g6.4xlarge", "g5.xlarge", "g5.2xlarge", "g5.4xlarge"]
+                values: ["g7.2xlarge", "g7.4xlarge", "g6.xlarge", "g6.2xlarge", "g6.4xlarge", "g5.xlarge", "g5.2xlarge", "g5.4xlarge"]
           preferredDuringSchedulingIgnoredDuringExecution:
+          # g7 优先：Spot 容量评分四个 AZ 均为最高档（g6 仅 2~4），
+          # 32GB 显存可与另两个推理服务共用一张卡
+          - weight: 90
+            preference:
+              matchExpressions:
+              - key: node.kubernetes.io/instance-type
+                operator: In
+                values: ["g7.2xlarge", "g7.4xlarge"]
           - weight: 50
             preference:
               matchExpressions:
