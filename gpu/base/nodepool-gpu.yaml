@@ -75,3 +75,38 @@ spec:
             - g6e.4xlarge     # 1x L40S, 16 vCPU,  64 GB
             - g6e.8xlarge     # 1x L40S, 32 vCPU, 128 GB
             - g6e.12xlarge    # 4x L40S, 48 vCPU, 192 GB
+
+            # RTX PRO 4500 32GB (x86_64) — Spot 供给最好（四 AZ 均为最高档），
+            # 显存高于 L4，无 xlarge 档
+            - g7.2xlarge      # 1x RTX PRO 4500,  8 vCPU,  32 GB
+            - g7.4xlarge      # 1x RTX PRO 4500, 16 vCPU,  64 GB
+            - g7.8xlarge      # 1x RTX PRO 4500, 32 vCPU, 128 GB
+            - g7.12xlarge     # 2x RTX PRO 4500, 48 vCPU, 192 GB
+
+            # L4 分片 vGPU (x86_64) — 单价最低，但 EC2 报告 GPU Count=0，
+            # 需 NodeOverlay 补 capacity 才能被 Karpenter 调度
+            - g6f.xlarge      # L4 分片  2GB,  4 vCPU,  16 GB
+            - g6f.2xlarge     # L4 分片  5GB,  8 vCPU,  32 GB
+            - g6f.4xlarge     # L4 分片 11GB, 16 vCPU,  64 GB
+
+---
+# g6f/gr6f 是 L4 的 vGPU 分片机型。EC2 的 DescribeInstanceTypes 对它们报告
+# GpuInfo.Gpus[0].Count = 0，Karpenter 因此认为无 GPU，请求 nvidia.com/gpu
+# 的 Pod 永远不会被调度到这类节点上。此处补上容量声明。
+#
+# 显存按分片大小递减（2/5/11GB），适合显存需求很小的负载：
+# 渲染任务实测仅 545MB，g6f.2xlarge 的 Spot 单价为 g6.2xlarge 的 26%。
+#
+# 需 Karpenter 开启 --set settings.featureGates.nodeOverlay=true，否则本对象被忽略。
+# NodeOverlay 目前为 alpha (v1alpha1)。
+apiVersion: karpenter.sh/v1alpha1
+kind: NodeOverlay
+metadata:
+  name: gpu-fractional-capacity
+spec:
+  requirements:
+    - key: karpenter.k8s.aws/instance-family
+      operator: In
+      values: ["g6f", "gr6f"]
+  capacity:
+    nvidia.com/gpu: "1"
