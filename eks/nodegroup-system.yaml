@@ -29,5 +29,19 @@ managedNodeGroups:
     spot: true
     labels:
       role: system
+    # 排斥业务负载。托管节点组不参与 Karpenter 的 consolidation，
+    # desiredSize 会一直维持，适合放生命周期需要稳定的系统组件；
+    # 而 Karpenter 节点会因整合或换更便宜的 Spot 被主动替换。
+    #
+    # 用 CriticalAddonsOnly 这个 K8s 惯例 taint：coredns、metrics-server、
+    # EBS/EFS CSI controller 默认自带对应 toleration，无需改它们的配置。
+    # ALB controller 与 S3 CSI controller 不自带，已在各自配置中补上。
+    #
+    # NoSchedule 只阻止新调度、不驱逐已有 Pod，因此加 taint 不造成中断，
+    # 已在此的业务 Pod 会随自然重建逐步迁出。
+    taints:
+      - key: CriticalAddonsOnly
+        value: "true"
+        effect: NoSchedule
     tags:
       nodegroup-role: system

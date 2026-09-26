@@ -1,0 +1,34 @@
+# AWS Load Balancer Controller 的 Helm values。
+#
+# 只放与集群无关的配置。集群身份（clusterName、region、vpcId）用 --set 传入。
+#
+# 用文件而非散落的 --set：参数只存在于命令行时，多集群部署之间会悄悄漂移，
+# 且无从比对。用 `helm get values aws-load-balancer-controller -n kube-system` 核对。
+
+serviceAccount:
+  create: true
+  name: aws-load-balancer-controller
+  # 不设 annotations：认证走 Pod Identity Association，不用 IRSA。
+
+# controller 为 leader election 模式，两副本落在同一节点时只有一个在工作，
+# 该节点故障即失去服务。chart 默认只给 preferred 级反亲和，实测不足以拆开
+# （权重敌不过"优先选资源更空的节点"），故强制按主机分散。
+# 节点不足时第二副本 Pending —— 它本来也不工作，不损失可用性。
+#
+# 注意：DoNotSchedule 会与滚动更新形成死锁 —— 旧副本占着节点不退，
+# 新副本因违反约束无处可去，`helm upgrade --wait` 会超时。
+# 首次启用或后续升级时需手动删除旧副本放行：
+#   kubectl delete pod -n kube-system <旧 ReplicaSet 的 Pod>
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: aws-load-balancer-controller
+
+# chart 不自带 CriticalAddonsOnly toleration，而系统节点组用该 taint 排斥业务负载，
+# 不补则 controller 进不去、只能落在会被 consolidation 替换的 Karpenter 节点上。
+tolerations:
+  - key: CriticalAddonsOnly
+    operator: Exists

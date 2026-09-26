@@ -46,7 +46,7 @@ iam:
   withOIDC: true
 
   # Pod Identity 关联。前三个使用跨集群共用角色，
-  # 由 eks/shared-pod-identity-roles.cfn.yaml 创建，两个集群共用同一角色。
+  # 由 eks/shared-pod-identity-roles.cfn.yaml 创建，多集群共用同一角色。
   # 变更角色前用 eks/compare-role-permissions.py 校验权限一致性。
   podIdentityAssociations:
     - namespace: kube-system
@@ -94,8 +94,30 @@ addons:
   # 迁至 EC2 节点组后不再需要
   - name: coredns
     version: latest
+    # 默认只有 preferred 级的 podAntiAffinity，两台系统节点负载接近时不足以拆开：
+    # 实测两个副本曾同时落在一台，该节点若被 Spot 回收 DNS 会短暂全断。
+    # DoNotSchedule 在单节点时会让第二个副本 Pending —— 对 DNS 而言，
+    # 一个可用副本仍能解析，优于两个副本同生共死。
+    configurationValues: |-
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              k8s-app: kube-dns
   - name: metrics-server
     version: latest
+    # 默认只有 preferred 级反亲和，敌不过调度器"优先选更空节点"的倾向，
+    # 两副本会落在同一节点；见 coredns 同段说明。
+    configurationValues: |-
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: metrics-server
   - name: eks-pod-identity-agent
     version: latest
   - name: vpc-cni
@@ -116,8 +138,22 @@ addons:
           limits:
             cpu: 200m
             memory: 256Mi
+        # leader election 模式，见 coredns 同段说明
+        topologySpreadConstraints:
+          - maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: DoNotSchedule
+            labelSelector:
+              matchLabels:
+                app: efs-csi-controller
   - name: aws-mountpoint-s3-csi-driver
     version: latest
+    # 不自带 CriticalAddonsOnly toleration，见 eks/nodegroup-system.yaml 的 taint 说明
+    configurationValues: |-
+      controller:
+        tolerations:
+          - key: CriticalAddonsOnly
+            operator: Exists
 
 # CloudWatch 日志
 cloudWatch:
