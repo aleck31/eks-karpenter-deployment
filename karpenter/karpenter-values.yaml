@@ -1,0 +1,38 @@
+# Karpenter controller 的 Helm values。
+#
+# 只放与集群无关的配置。集群身份（名称、端点、中断队列）用 --set 从环境变量传入，
+# 见 karpenter/deployment-guide.md。
+#
+# 用文件而非散落的 --set：feature gate 与资源配置若只存在于命令行，
+# 多集群部署之间会悄悄漂移且无从比对 —— 实际就出现过 spotToSpotConsolidation
+# 与 nodeOverlay 在不同集群上开关不一致、长期无人察觉。
+
+settings:
+  featureGates:
+    # Spot→Spot 整合：允许用更便宜的 Spot 替换现有 Spot 节点。
+    # 上游默认关闭。
+    spotToSpotConsolidation: true
+
+    # NodeOverlay（alpha）默认关闭，只在需要的集群用 --set 开启：
+    #   --set settings.featureGates.nodeOverlay=true
+    # 它为 EC2 元数据不准确的机型补充容量声明（g6f/gr6f 这类 vGPU 分片机型被
+    # 报告为 GPU Count=0，不开则永不被调度），见 gpu/base/nodepool-gpu.yaml。
+    #
+    # 不要在未安装 NodeOverlay CRD 的集群上开启：controller 会等 CRD 缓存同步
+    # 超时并 panic 进入 CrashLoopBackOff。CRD 随 gpu/ 模块一起安装。
+    nodeOverlay: false
+
+serviceAccount:
+  create: true
+  name: karpenter
+  # 不设 annotations：认证走 Pod Identity Association，不用 IRSA。
+
+controller:
+  resources:
+    # 实测稳态约 38m / 190Mi。CPU 可压缩，request 只决定争抢时的保底份额。
+    requests:
+      cpu: 100m
+      memory: 512Mi
+    limits:
+      cpu: 1
+      memory: 1Gi

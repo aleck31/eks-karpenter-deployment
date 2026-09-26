@@ -29,7 +29,7 @@ Karpenter 运行在 EC2 节点上时使用 Pod Identity。**仅当 Karpenter 被
 - 参考：[GitHub Issue #2274 - Enable EKS Pod Identities on EKS Fargate](https://github.com/aws/containers-roadmap/issues/2274)
 
 **因此**：
-1. 系统组件跑在 EC2 节点组上（本项目两个集群均如此）→ 用 Pod Identity，
+1. 系统组件跑在 EC2 节点组上（本项目各集群均如此）→ 用 Pod Identity，
    ServiceAccount 上**不要**保留 `eks.amazonaws.com/role-arn` 注解
 2. 若因特殊原因 Karpenter 仍在 Fargate 上 → 用 IRSA 注解，且不能创建 Pod Identity Association
 3. 判断当前用的是哪种：Pod 内有 `AWS_CONTAINER_CREDENTIALS_FULL_URI` 环境变量即为 Pod Identity
@@ -51,6 +51,9 @@ export ROLE_SUFFIX=XXX
 
 export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --profile ${AWS_PROFILE})
 export CLUSTER_ENDPOINT=$(aws eks describe-cluster --name ${CLUSTER_NAME} --query "cluster.endpoint" --output text --profile ${AWS_PROFILE})
+
+# Spot 中断队列，与 karpenter-interruption-handling-guide.md 中创建的同名
+export QUEUE_NAME=karpenter-${CLUSTER_NAME}
 
 echo "集群: ${CLUSTER_NAME}"
 echo "区域: ${AWS_DEFAULT_REGION}"
@@ -114,21 +117,22 @@ aws iam put-role-policy --role-name "KarpenterIRSA-${ROLE_SUFFIX}" \
 
 ```bash
 # 安装 Karpenter（版本请对照上游最新稳定版）
+# 与集群无关的配置在 karpenter-values.yaml 里，只有集群身份用 --set 传入。
 helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter \
   --version "1.9.2" \
   --namespace "karpenter" \
   --create-namespace \
+  -f karpenter/karpenter-values.yaml \
   --set "settings.clusterName=${CLUSTER_NAME}" \
   --set "settings.clusterEndpoint=${CLUSTER_ENDPOINT}" \
-  --set "settings.featureGates.spotToSpotConsolidation=true" \
-  --set "serviceAccount.create=true" \
-  --set "serviceAccount.name=karpenter" \
-  --set controller.resources.requests.cpu=100m \
-  --set controller.resources.requests.memory=512Mi \
-  --set controller.resources.limits.cpu=1 \
-  --set controller.resources.limits.memory=1Gi
+  --set "settings.interruptionQueue=${QUEUE_NAME}"
 ```
 
+> feature gate 只在 values 文件里声明。用 `--set` 逐项传会漂移：
+> 曾出现 `spotToSpotConsolidation` 在一个集群始终未生效、
+> 而 `nodeOverlay` 只在另一个集群开启，两边都无人察觉。
+> 用 `helm get values karpenter -n karpenter` 可核对线上与文件是否一致。
+>
 > 不设 `serviceAccount.annotations`：认证走 Pod Identity，由 Pod Identity Association 提供凭据。
 > 残留的 IRSA 注解不会报错（凭据链中 container credentials 优先于 web identity），
 > 但会指向可能已删除的角色，属误导性配置，应清除。
