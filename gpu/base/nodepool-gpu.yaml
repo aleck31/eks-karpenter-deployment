@@ -13,7 +13,11 @@ spec:
     # 不用 WhenEmptyOrUnderutilized：它会为整合利用率驱逐推理 Pod，
     # 而模型重新加载需数分钟
     consolidationPolicy: WhenEmpty
-    consolidateAfter: 15m
+    # WhenEmpty 下这不是整合延迟，而是空节点的保留时长。渲染任务成批到达
+    # （实测一批 8 个落在 2 分钟内），而 Karpenter 看不到 GPU 时间切片，
+    # 每个 Pod 都会换来一个 NodeClaim。留久一点，同批后续任务就能落到
+    # 已有节点的空切片上，省掉冷启动——冷启动比渲染本身还长。
+    consolidateAfter: 45m
     # 必须显式声明：默认 10%，节点数不足 10 时向下取整为 0，回收被完全禁止
     budgets:
       - nodes: "1"
