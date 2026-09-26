@@ -6,7 +6,7 @@ Description: 跨集群共用的 Pod Identity 角色
 # 权限与集群无关的组件可以共用一个角色，减少角色与策略数量。
 #
 # 适用判断：
-#   可共用   VPC CNI、EBS CSI —— 仅挂 AWS 托管策略，两集群完全相同
+#   可共用   VPC CNI、EBS CSI —— 仅挂 AWS 托管策略，各集群配置相同
 #            ALB Controller  —— 80 个 action 及 Resource/Condition 完全相同
 #   不可共用 Loki / S3 CSI   —— 策略限定具体 S3 桶
 #            EFS CSI        —— 限定文件系统
@@ -64,7 +64,7 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy
 
-  # 原先两集群各有一份内容完全相同的内联策略，此处合并为一个客户托管策略
+  # 原先各集群各有一份内容相同的内联策略，此处合并为一个客户托管策略
   SharedALBControllerRole:
     Type: AWS::IAM::Role
     Properties:

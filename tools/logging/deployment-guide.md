@@ -286,13 +286,13 @@ kubectl get ingress -n logging loki-ingress \
 
 ```logql
 # 某 namespace 全部日志
-{namespace="hostwo"}
+{namespace="your-namespace"}
 
 # 某应用的错误
-{namespace="klimt"} |= "error"
+{namespace="your-namespace"} |= "error"
 
 # 按 Pod 聚合错误率
-sum by (pod) (rate({namespace="hostwo"} |= "error" [5m]))
+sum by (pod) (rate({namespace="your-namespace"} |= "error" [5m]))
 
 # 节点系统日志
 {job="journal", unit="kubelet.service"}

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 从 karpenter-policy.json 模板渲染并更新指定集群的 Karpenter 控制器策略。
 #
-# 模板按集群参数化，两个集群共用同一份来源，避免各自漂移。
+# 模板按集群参数化，各集群共用同一份来源，避免各自漂移。
 # 策略作用域按 Karpenter 官方推荐收紧：EC2 操作限定 region + cluster tag，
 # PassRole 限定该集群的节点角色，SQS 限定该集群的中断队列。
 #

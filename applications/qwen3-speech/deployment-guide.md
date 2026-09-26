@@ -110,7 +110,7 @@ kubectl get node -l node-type=gpu -o jsonpath='{.items[*].status.allocatable.nvi
 根据需要创建 Namespace, 例如:
 
 ```bash
-kubectl create namespace hosthree
+kubectl create namespace <你的命名空间>
 ```
 
 ### 3. 准备 overlay

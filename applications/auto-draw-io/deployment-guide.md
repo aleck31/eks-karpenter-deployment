@@ -175,7 +175,7 @@ aws cloudfront create-vpc-origin \
 1. **Origin 配置** - 使用 `VpcOriginConfig` 而非 `CustomOriginConfig`：
 ```json
 {
-  "DomainName": "internal-k8s-hostwo-autodraw-xxx.elb.amazonaws.com",
+  "DomainName": "internal-k8s-<ns>-autodraw-xxx.elb.amazonaws.com",
   "VpcOriginConfig": {
     "VpcOriginId": "vo_xxxxxxxxxxxxx",
     "OriginReadTimeout": 30,
@@ -232,8 +232,8 @@ aws route53 change-resource-record-sets \
 ## 📝 访问方式
 
 ### 内网访问
-- **ALB 地址**: `http://internal-k8s-hostwo-autodraw-xxx.elb.amazonaws.com`
-- **集群内**: `http://auto-draw-io-service.hostwo.svc.cluster.local`
+- **ALB 地址**: `http://internal-k8s-<ns>-autodraw-xxx.elb.amazonaws.com`
+- **集群内**: `http://auto-draw-io-service.<你的命名空间>.svc.cluster.local`
 
 ### 公网访问
 - **自定义域名**: `https://autodraw.yourdomain.com`
@@ -312,7 +312,7 @@ kubectl exec -it -n <namespace> deployment/auto-draw-io -- /bin/sh
 
 # 测试内网连接
 kubectl run test-curl --image=curlimages/curl:latest --rm -it --restart=Never -- \
-  curl -I http://auto-draw-io-service.hostwo.svc.cluster.local
+  curl -I http://auto-draw-io-service.<你的命名空间>.svc.cluster.local
 
 # 检查环境变量
 kubectl exec -n <namespace> deployment/auto-draw-io -- env | grep -E "AWS_|AI_"

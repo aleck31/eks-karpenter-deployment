@@ -234,7 +234,7 @@ graph LR
 | **成本效率** | 小规模高效 | 大规模高效 |
 | **管理复杂度** | 低 | 中等 |
 
-> 注: 两个集群均已从 Fargate 迁移至 EC2 Spot System Node Group。
+> 注: 集群均已从 Fargate 迁移至 EC2 Spot System Node Group。
 > eks-karpenter-env 成本降低约 85%；inference-env 从约 $144/月降至约 $56/月。
 > 迁移的另一动因是 Pod Identity 不支持 Fargate（其 Agent 为 DaemonSet）。
 
