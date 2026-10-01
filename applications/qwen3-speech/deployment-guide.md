@@ -68,19 +68,30 @@ ASR 容器（`vllm serve` + adapter 同容器）：
 | CPU | 请求 500m / 上限 2 |
 | 内存 | 请求 3Gi / 上限 8Gi |
 | `nvidia.com/gpu` | 1（Time-Slicing 虚拟槽位） |
-| 显存 | `--gpu-memory-utilization 0.35` |
+| 显存 | `--kv-cache-memory-bytes 3G` + `--gpu-memory-utilization 0.28`（仅作启动门槛） |
 
-**`--gpu-memory-utilization` 是总显存的比例，不是绝对值。** 换显卡或机型时实际
-占用会跟着变，这一点容易被忽略：
+**KV cache 按绝对字节设置，不再按比例。** 比例会随显卡变：0.35 在 L4 (23.0 GB)
+上是 8.0 GiB，在 RTX PRO 4500 (32.6 GB) 上是 11.2 GiB，并且 KV 会填满整个比例
+（大卡上 5.93 GiB / 55,472 token），而实测峰值只有 0.75 GiB（4 请求并发，12.3%）。
 
-| 显卡 | 0.35 对应 | KV cache |
-|------|----------|----------|
-| L4 (23.0 GB) | 8.0 GiB | 2.68 GiB / 约 25k token |
-| RTX PRO 4500 (32.6 GB) | 11.2 GiB | 5.93 GiB / 55,472 token |
+| 组成 | 显存 |
+|------|------|
+| 权重 | 3.9 GiB |
+| profile 激活（编码器等） | ~1.15 GiB |
+| KV cache | 3.0 GiB / 28,080 token |
+| 启动后分配器增长 | ~1 GiB（单次观测） |
+| **合计** | **~9 GiB，与显卡型号无关** |
 
-实际负载是 adapter 的 4 段并发 × 每段约 2000 audio token ≈ 8k token，所以大卡上
-多出来的预算是闲置的。节点显存紧张时降低此值即可回收，功能与速度都不受影响
-（L4 上的 2.68 GiB 已跑通一小时录音）。
+3 GiB 约容纳 12 个 120 秒段并发（3 个长音频满并发，或 3 个 8192 token 的
+WebSocket 段）。超出时 vLLM 排队而非报错。
+
+设了 `--kv-cache-memory-bytes` 后，`--gpu-memory-utilization` 只剩启动检查：空闲
+显存须 ≥ 比例 × 总显存，否则拒绝启动。0.28 × 31.38 GiB = 8.79 GiB，略高于启动
+所需的 8.05 GiB，显卡被挤满时会明确报错而不是加载中途 OOM。该门槛仍按比例计算，
+换到 L4 上（约 6.2 GiB）会低于实际需求而失去作用。
+
+Time-Slicing 不隔离显存，同卡各租户的实际占用之和必须小于总显存。2026-10-01
+的 OOM 即因此：ASR 12.0 + breeze2-tts 9.0 + 同节点另一租户 11.1 GiB 占满 32 GB 卡。
 
 同节点的 `breeze2-tts` 相反：Breeze 后端无显存预算参数，占用固定约 9.0 GiB，
 不随卡变化，也无法在不牺牲 RTF 和 seed 可复现性的前提下降低。

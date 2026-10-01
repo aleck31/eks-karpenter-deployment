@@ -48,18 +48,34 @@ spec:
         args:
         - --model
         - /models/Qwen3-ASR-1.7B
+        # KV cache is sized in bytes, not as a share of the card. A fraction
+        # tied the footprint to whichever GPU Karpenter landed on (0.35 is 8.4
+        # GiB on an L4, 11 GiB on a 32 GB card) and filled the whole share with
+        # KV: 5.93 GiB reserved against a measured peak of 0.75 GiB (12.3% with
+        # 4 requests running). 3 GiB holds ~28k tokens -- ~12 concurrent 120s
+        # segments, three long uploads at full fan-out -- and past that vLLM
+        # queues requests rather than failing.
+        #
+        # Steady-state footprint is ~9 GiB: weights 3.9 + profiled activations
+        # ~1.15 + KV 3.0 + ~1 of allocator growth observed after startup. The
+        # GPU is time-sliced with TTS and other tenants and nothing isolates
+        # memory, so the sum across tenants is what has to fit.
+        - --kv-cache-memory-bytes
+        - "3G"
+        # With kv-cache-memory-bytes set this no longer sizes anything; vLLM
+        # only checks at startup that free memory >= fraction x total, and
+        # refuses to start otherwise. 0.28 of a 31.38 GiB card is 8.79 GiB,
+        # just above the 8.05 GiB startup needs, so a crowded card fails fast
+        # with a clear message instead of OOMing mid-load.
         - --gpu-memory-utilization
-        - "0.35"
+        - "0.28"
         # Sized for one VAD segment, not a whole recording: the adapter splits at
         # silence and sends at most 120s, which is ~2030 tokens at the measured
         # 13.0 audio tokens per second.
         #
         # Both ceilings have to move together. vLLM sets encoder_cache_size from
         # max_num_batched_tokens verbatim, while audio tokens also count toward
-        # max_model_len -- raising only one just relocates the rejection. They
-        # share the gpu-memory-utilization budget, so an oversized max_model_len
-        # reserves KV cache for sequences that cannot occur and starves the
-        # encoder cache.
+        # max_model_len -- raising only one just relocates the rejection.
         - --max-model-len
         - "8192"
         # Left at vLLM's default; a 120s segment needs ~1560 audio tokens.
@@ -80,6 +96,19 @@ spec:
         - --no-async-scheduling
         - --hf-overrides
         - '{"architectures": ["Qwen3ASRRealtimeGeneration"]}'
+        env:
+        # The 2026-10-01 OOM failed a 370 MiB allocation with 364 MiB reserved
+        # by PyTorch but unusable, split across fragments. Expandable segments
+        # let the allocator grow mappings in place instead of stranding them.
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: expandable_segments:True
+        # Read by the adapter's uvicorn through click's UVICORN_ env prefix, so
+        # no image rebuild is needed. uvicorn's default is 5s against the ALB's
+        # 1800s idle timeout; AWS requires the target to outlast the ALB, or
+        # the ALB can reuse a connection the target already closed and return
+        # a 502.
+        - name: UVICORN_TIMEOUT_KEEP_ALIVE
+          value: "1830"
         ports:
         - containerPort: 8001
           name: http
@@ -101,9 +130,15 @@ spec:
             cpu: "2"
             memory: 8Gi
             nvidia.com/gpu: 1
+        # Startup and readiness gate on /ready, which checks vLLM; liveness stays
+        # on /health, which only checks the adapter. On /health alone the pod
+        # went Ready 63s before vLLM finished loading (09:29:51 vs 09:30:54 on
+        # 2026-10-01), so the ALB routed requests into a backend that could not
+        # serve them. Liveness must not follow: during a reload vLLM is down by
+        # design, and restarting the container then would only restart the load.
         startupProbe:
           httpGet:
-            path: /health
+            path: /ready
             port: 8001
           periodSeconds: 10
           timeoutSeconds: 5
@@ -117,7 +152,7 @@ spec:
           failureThreshold: 3
         readinessProbe:
           httpGet:
-            path: /health
+            path: /ready
             port: 8001
           periodSeconds: 10
           timeoutSeconds: 5

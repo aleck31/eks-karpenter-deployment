@@ -38,8 +38,19 @@ curl -X POST http://<ALB>:8000/v1/audio/transcriptions \
 调小后的兜底。`limit_seconds` 按实测的 13.0 audio token/秒 换算得出。
 
 `GET /health` 与 `GET /ready` 的区别：前者只表示 adapter 存活，
-后者确认 vLLM 后端可达。**startupProbe 探的是 adapter 的 `:8001`**，
-所以 Pod 显示 `1/1 Running` 时 vLLM 仍可能已死，排障时用 `/ready` 或直连 `:8000`。
+后者确认 vLLM 后端可达。startupProbe 与 readinessProbe 探 `/ready`，
+livenessProbe 探 `/health`：后端重载期间 Pod 不接流量，但容器不会被反复重启。
+
+**后端不可用**（vLLM 崩溃后容器重载模型，约 1-2 分钟）时 HTTP 返回：
+
+```
+HTTP 503
+Retry-After: 30
+{"error": {"type": "backend_unavailable", "message": "..."}}
+```
+
+调用方应按 `Retry-After` 重试。重启后最初的一两个请求会慢约 60 秒
+（vLLM 首次推理时 JIT 编译 Triton kernel），之后恢复正常。
 
 ## ASR 流式 (WebSocket Realtime)
 
@@ -72,9 +83,16 @@ curl -X POST http://<ALB>:8000/v1/audio/transcriptions \
 - **buffer 不累积**：每次 `commit {final: true}` 后 buffer 自动清空，下一段从零开始
 - **必须有初始 commit**：append 之前必须先发一个不带 final 的 commit，否则音频不被处理
 - **单连接可复用**：不需要每段重连，在同一连接中循环 commit→append→final 即可
-- **每段只有 1 个 done**：收到 `transcription.done` 即表示本段结束
+- **每段恰好 1 个 completed**：每次 `commit {final: true}` 都会收到一个
+  `conversation.item.input_audio_transcription.completed`，未识别出内容（如静音）时
+  `transcript` 为 `""`、`language` 为 `null`。以它作为本段结束的唯一信号
+- **等 completed 再开下一段**：上一段仍在生成时发来的 commit 会被后端忽略
+  （日志 `Generation already in progress, ignoring commit`），该段永远不会有结果
+- **子句以换行分隔**：模型在一段内可能分多个子句输出，`transcript` 中以 `\n` 连接
 - **无 VAD**：服务端不会自动断句，分段完全由客户端决定
 - **没有 `input_audio_buffer.clear`**：不需要手动清空，final 自动处理
+- **后端不可用**：服务端先发 `{"type": "error", "error": {"type": "backend_unavailable", ...}}`，
+  再以关闭码 1013（Try Again Later）断开，稍后重连即可
 
 ### 稳定性依赖后端的 `--no-async-scheduling`
 

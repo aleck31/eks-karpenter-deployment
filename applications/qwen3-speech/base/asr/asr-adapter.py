@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import httpx
 from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -63,16 +64,27 @@ VAD_MIN_GAP_SECONDS = float(os.getenv("ASR_VAD_MIN_GAP_SECONDS", "0.35"))
 
 BACKEND_URL = os.getenv("ASR_BACKEND_URL", "http://localhost:8000")
 BACKEND_WS = os.getenv("ASR_BACKEND_WS", "ws://localhost:8000")
+# vLLM reloads the model in roughly a minute after its engine dies; tell
+# callers to come back after a fraction of that rather than hammering it.
+BACKEND_RETRY_AFTER_SECONDS = 30
 
 _PARSE_RE = re.compile(r"language\s+(\w+)<asr_text>")
-_STRIP_FIRST_RE = re.compile(r"^language\s+\w+<asr_text>")
-_STRIP_INLINE_RE = re.compile(r"\nlanguage\s+\w+<asr_text>")
+_STRIP_FIRST_RE = re.compile(r"^\s*language\s+\w+<asr_text>")
+# Any whitespace before the marker is optional. Requiring a newline missed the
+# realtime path, which emits "现在。language Chinese<asr_text>现在几点了？" with
+# the marker glued to the full stop, and leaked it into the transcript.
+# <asr_text> is a special token, so no real transcript can contain the pattern.
+_STRIP_INLINE_RE = re.compile(r"\s*language\s+\w+<asr_text>")
 
 
 def _parse_asr_text(raw: str) -> tuple[str, str | None]:
     """Strip all 'language XXX<asr_text>' markers, return clean text + first language."""
     m = _PARSE_RE.search(raw)
     language = m.group(1).lower() if m else None
+    # Silence comes back as "language None<asr_text>": no language detected,
+    # not a language called "none".
+    if language == "none":
+        language = None
     # Strip leading marker
     text = _STRIP_FIRST_RE.sub("", raw)
     # Replace inline markers with newline (preserve sentence separation)
@@ -99,6 +111,12 @@ def _audio_duration(path: str) -> float | None:
 
 
 _vad_model = None
+# VAD runs in worker threads so it cannot stall the event loop, but the Silero
+# model is stateful -- get_speech_timestamps resets and then advances its
+# recurrent state chunk by chunk. Two recordings scored at once would interleave
+# that state and return wrong timestamps, so inference is serialised. Decoding
+# with ffmpeg stays outside the lock and still overlaps.
+_vad_lock = threading.Lock()
 
 
 def _load_vad():
@@ -133,7 +151,11 @@ def _speech_gaps(path: str) -> list[float]:
         import torch
         from silero_vad import get_speech_timestamps
 
-        pcm_path = f"{path}.vad.wav"
+        # Unique per call, for the same reason as _extract_segment: a path
+        # derived from the source lets one call's cleanup delete another's
+        # decoded audio mid-read.
+        fd, pcm_path = tempfile.mkstemp(prefix="vad-", suffix=".wav")
+        os.close(fd)
         try:
             subprocess.run(
                 ["ffmpeg", "-v", "error", "-y", "-i", path,
@@ -147,10 +169,11 @@ def _speech_gaps(path: str) -> list[float]:
 
         if samples.ndim > 1:
             samples = samples.mean(axis=1)
-        runs = get_speech_timestamps(
-            torch.from_numpy(np.ascontiguousarray(samples)),
-            _load_vad(), sampling_rate=VAD_SAMPLE_RATE, return_seconds=True,
-        )
+        with _vad_lock:
+            runs = get_speech_timestamps(
+                torch.from_numpy(np.ascontiguousarray(samples)),
+                _load_vad(), sampling_rate=VAD_SAMPLE_RATE, return_seconds=True,
+            )
     except Exception:
         # No VAD, no cut points: _segment_bounds falls back to the clock, which
         # is worse but still bounded.
@@ -225,6 +248,21 @@ class _BackendRejected(Exception):
         self.resp = resp
 
 
+_BACKEND_UNAVAILABLE_MESSAGE = (
+    "Transcription backend is unavailable, most likely restarting. "
+    f"Retry after {BACKEND_RETRY_AFTER_SECONDS}s."
+)
+
+
+def _backend_unavailable() -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        headers={"Retry-After": str(BACKEND_RETRY_AFTER_SECONDS)},
+        content={"error": {"message": _BACKEND_UNAVAILABLE_MESSAGE,
+                           "type": "backend_unavailable"}},
+    )
+
+
 def _backend_error_payload(resp: httpx.Response) -> dict:
     """Normalise a backend error, translating the ones callers can act on.
 
@@ -284,9 +322,15 @@ async def transcribe(file: UploadFile = File(...), model: str = Form(default="")
         fh.write(audio_bytes)
         source_path = fh.name
     try:
-        duration = _audio_duration(source_path)
-        segments = (_segment_bounds(duration, _speech_gaps(source_path))
-                    if duration and duration > SEGMENT_MIN_SECONDS else None)
+        # ffprobe and the VAD pass are blocking CPU work that runs for tens of
+        # seconds on a long recording. Run inline they froze the whole adapter
+        # -- /health, other uploads, every open WebSocket -- long enough for the
+        # readiness probe to time out and pull the pod from the ALB.
+        duration = await asyncio.to_thread(_audio_duration, source_path)
+        segments = None
+        if duration and duration > SEGMENT_MIN_SECONDS:
+            gaps = await asyncio.to_thread(_speech_gaps, source_path)
+            segments = _segment_bounds(duration, gaps)
         budget = max(TRANSCRIBE_TIMEOUT,
                      (duration or 0) * TRANSCRIBE_TIMEOUT_PER_AUDIO_SECOND)
 
@@ -334,6 +378,13 @@ async def transcribe(file: UploadFile = File(...), model: str = Form(default="")
             except _BackendRejected as rejected:
                 return JSONResponse(status_code=rejected.resp.status_code,
                                     content=_backend_error_payload(rejected.resp))
+            except httpx.TransportError:
+                # Connection refused or dropped mid-request: the backend is
+                # down, almost always because vLLM's engine died and the
+                # container is reloading the model. Uncaught this surfaced as a
+                # bare 500 "Internal Server Error", which reads as a bug in the
+                # request rather than a transient outage worth retrying.
+                return _backend_unavailable()
     finally:
         if os.path.exists(source_path):
             os.unlink(source_path)
@@ -420,8 +471,18 @@ async def realtime_info():
             "Backend emits 'language XXX<asr_text>' prefixes and vendor event "
             "names; this adapter strips the prefix, lifts the language out, and "
             "renames events to the OpenAI convention.",
-            "Transcription context accumulates over a session, so a very long "
-            "one can reach the model's max-model-len.",
+            "Each segment is input_audio_buffer.commit, then any number of "
+            "input_audio_buffer.append, then input_audio_buffer.commit with "
+            "final=true. The buffer resets after final, so segments on one "
+            "connection are independent; a single segment can grow to the "
+            "model's max-model-len (8192 tokens -- audio and transcript both "
+            "count, roughly 8 minutes of continuous speech).",
+            "Sending append before the opening commit, or a commit without "
+            "final, produces no transcript. The server does no VAD: the "
+            "client decides where segments end.",
+            "When the backend is unavailable the server sends an error event "
+            "of type backend_unavailable and closes with code 1013; reconnect "
+            "after a short delay.",
         ],
     }
 
@@ -431,10 +492,27 @@ async def realtime_proxy(client_ws: WebSocket):
     await client_ws.accept()
 
     import websockets
+    # Imported explicitly: websockets resolves submodules lazily, and on 16.0
+    # (the version in the image) `websockets.exceptions` is not reachable as an
+    # attribute until something imports it -- the except clause below would
+    # itself raise AttributeError the first time the backend is down.
+    from websockets.exceptions import InvalidHandshake
 
     backend_url = f"{BACKEND_WS}/v1/realtime"
     real_model = await _resolve_backend_model()
-    async with websockets.connect(backend_url) as backend_ws:
+    try:
+        backend_ws = await websockets.connect(backend_url)
+    except (OSError, InvalidHandshake):
+        # Same outage as the HTTP 503: say so, then close with 1013 (Try Again
+        # Later) so clients can tell it from a protocol error and reconnect.
+        await client_ws.send_text(json.dumps({
+            "type": "error",
+            "error": {"type": "backend_unavailable",
+                      "message": _BACKEND_UNAVAILABLE_MESSAGE},
+        }))
+        await client_ws.close(code=1013)
+        return
+    async with backend_ws:
         # Forward session.created to client
         msg = await backend_ws.recv()
         await client_ws.send_text(msg)
@@ -472,8 +550,10 @@ async def realtime_proxy(client_ws: WebSocket):
                         if delta.strip().startswith("language"):
                             continue
                         elif delta.strip() and "<" not in delta:
-                            # Language name token (e.g. " English")
-                            language = delta.strip().lower()
+                            # Language name token (e.g. " English"); " None"
+                            # means none was detected.
+                            name = delta.strip().lower()
+                            language = None if name == "none" else name
                             continue
                         elif "<asr_text>" in delta:
                             prefix_done = True
@@ -497,12 +577,16 @@ async def realtime_proxy(client_ws: WebSocket):
                     raw_text = data.get("text", "")
                     text, lang = _parse_asr_text(raw_text)
 
-                    if text:  # Only send non-empty segments
-                        await client_ws.send_text(json.dumps({
-                            "type": "conversation.item.input_audio_transcription.completed",
-                            "transcript": text,
-                            "language": lang or language
-                        }))
+                    # Exactly one completed per final commit, empty or not.
+                    # It is the only signal that a segment is finished:
+                    # suppressing empty ones left a client that committed
+                    # silence waiting with no way to tell "nothing heard" from
+                    # "still working".
+                    await client_ws.send_text(json.dumps({
+                        "type": "conversation.item.input_audio_transcription.completed",
+                        "transcript": text,
+                        "language": lang or language
+                    }))
 
                     # Reset state for next segment
                     prefix_done = False
@@ -522,7 +606,12 @@ async def health():
 
 @app.get("/ready")
 async def ready():
-    async with httpx.AsyncClient(timeout=5.0) as client:
+    """Ready only when vLLM can serve. Backs the startup and readiness probes.
+
+    The backend check times out well inside the probes' 5s so the adapter
+    answers 503 itself rather than letting the probe time out on it.
+    """
+    async with httpx.AsyncClient(timeout=3.0) as client:
         try:
             resp = await client.get(f"{BACKEND_URL}/health")
             if resp.status_code == 200:
