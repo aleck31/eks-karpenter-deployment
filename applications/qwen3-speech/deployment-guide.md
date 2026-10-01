@@ -61,13 +61,29 @@ applications/qwen3-speech/
 
 ## 资源分配
 
-| 容器 | CPU request | Memory request | GPU | 说明 |
-|------|------------|----------------|-----|------|
-| ASR (qwen-asr-serve) | 1 | 6Gi | 1 (虚拟) | gpu_memory_utilization=0.45, max_model_len=4096 |
-| TTS (FastAPI) | 1 | 6Gi | 1 (虚拟) | TTS_BACKEND=official, TTS_DTYPE=bfloat16 |
-| **总计** | **2 CPU** | **12Gi** | **2 (虚拟 / 1 物理)** | |
+ASR 容器（`vllm serve` + adapter 同容器）：
 
-g4dn.xlarge 可分配: ~3.9 CPU / ~14.7Gi 内存 / 1 GPU (Time-Slicing 虚拟为 2)
+| 项 | 值 |
+|---|---|
+| CPU | 请求 500m / 上限 2 |
+| 内存 | 请求 3Gi / 上限 8Gi |
+| `nvidia.com/gpu` | 1（Time-Slicing 虚拟槽位） |
+| 显存 | `--gpu-memory-utilization 0.35` |
+
+**`--gpu-memory-utilization` 是总显存的比例，不是绝对值。** 换显卡或机型时实际
+占用会跟着变，这一点容易被忽略：
+
+| 显卡 | 0.35 对应 | KV cache |
+|------|----------|----------|
+| L4 (23.0 GB) | 8.0 GiB | 2.68 GiB / 约 25k token |
+| RTX PRO 4500 (32.6 GB) | 11.2 GiB | 5.93 GiB / 55,472 token |
+
+实际负载是 adapter 的 4 段并发 × 每段约 2000 audio token ≈ 8k token，所以大卡上
+多出来的预算是闲置的。节点显存紧张时降低此值即可回收，功能与速度都不受影响
+（L4 上的 2.68 GiB 已跑通一小时录音）。
+
+同节点的 `breeze2-tts` 相反：Breeze 后端无显存预算参数，占用固定约 9.0 GiB，
+不随卡变化，也无法在不牺牲 RTF 和 seed 可复现性的前提下降低。
 
 ## 前置条件
 

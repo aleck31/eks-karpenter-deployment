@@ -36,11 +36,21 @@ applications/breeze2-tts/
 
 | 项 | 值 | 依据 |
 |---|---|---|
-| 显存 | 8.9 GiB | 实测，含三项加速参数的 CUDA Graph |
-| `nvidia.com/gpu` | 1 | Time-Slicing 下每节点 2 个槽位，故一节点最多 2 个 GPU Pod |
+| 显存 | 约 9.0 GiB | 实测，含三项加速参数的 CUDA Graph |
+| `nvidia.com/gpu` | 1 | Time-Slicing 下的虚拟槽位，数量由节点配置决定 |
 | 内存 | 请求 3Gi / 上限 8Gi | |
 | CPU | 请求 500m / 上限 2 | |
 | 模型权重 | 7.2 GB on EFS | initContainer 下载，与其它服务共享 PVC |
+
+**显存占用是固定的，不随显卡容量变化。** Breeze 后端没有任何显存预算参数
+（只有 `--host` / `--port` / `--fast-*`），占用由模型权重加 CUDA Graph 的实际
+需要决定。实测 L4（23 GB）上 8.9 GiB、RTX PRO 4500（32.6 GB）上 9.0 GiB，
+相差 0.7%。
+
+这与同节点的 `qwen3-asr` 相反：vLLM 的 `--gpu-memory-utilization` 是**总显存的
+比例**，换到更大的卡上会自动占更多。所以当这张卡显存紧张时，可回收的是 ASR 的
+预算，不是这里 —— 要降低本服务的显存只能减少 `--fast-*` 参数，而那会同时恶化
+RTF 并使所有已注册声纹的 seed 失效（见「部署契约」）。
 
 ## 构建
 
