@@ -57,6 +57,47 @@ def adapter():
     return module
 
 
+def test_ready_waits_for_warm_up(adapter):
+    """Until one real transcription has run, the pod must not take traffic."""
+    client = TestClient(adapter.app)
+    resp = client.get("/ready")
+    assert resp.status_code == 503
+    assert resp.json()["status"] == "warming up"
+    adapter._warmed_up = True
+    # Warmed but backend gone: still 503, now on the backend check.
+    assert client.get("/ready").json()["status"] == "not ready"
+
+
+def test_warm_up_retries_until_backend_serves(adapter, monkeypatch):
+    calls = []
+
+    async def flaky_transcribe(_client, audio, filename):
+        calls.append((audio, filename))
+        if len(calls) < 3:  # vLLM still loading
+            raise httpx.ConnectError("refused")
+        return "", {"language": None, "usage": None}
+
+    monkeypatch.setattr(adapter, "_transcribe_once", flaky_transcribe)
+    monkeypatch.setattr(adapter, "WARMUP_RETRY_SECONDS", 0)
+    asyncio.run(adapter._warm_up())
+
+    assert adapter._warmed_up is True
+    assert len(calls) == 3
+    with wave.open(io.BytesIO(calls[0][0])) as w:  # a real, decodable wav
+        assert (w.getframerate(), w.getnchannels(), w.getnframes()) == (16000, 1, 16000)
+
+
+def test_lifespan_starts_warm_up(adapter, monkeypatch):
+    started = threading.Event()
+
+    async def fake_warm_up():
+        started.set()
+
+    monkeypatch.setattr(adapter, "_warm_up", fake_warm_up)
+    with TestClient(adapter.app):
+        assert started.wait(5)
+
+
 def test_ready_is_503_while_backend_down_and_health_stays_up(adapter):
     """Readiness tracks vLLM; liveness must not, or a reload restarts the pod."""
     client = TestClient(adapter.app)

@@ -8,15 +8,33 @@ Proxies vLLM's raw Qwen3-ASR output to clean OpenAI-format responses:
 """
 
 import asyncio
+import io
 import json
+import logging
 import os
 import re
 import subprocess
 import tempfile
 import threading
+import time
+import wave
+from contextlib import asynccontextmanager
+
 import httpx
 from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
+
+log = logging.getLogger("uvicorn.error")
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    # Runs alongside startup rather than blocking it, so /health answers (and
+    # liveness passes) while vLLM is still loading.
+    task = asyncio.create_task(_warm_up())
+    yield
+    task.cancel()
+
 
 app = FastAPI(
     title="Qwen3-ASR OpenAI Adapter",
@@ -26,6 +44,7 @@ app = FastAPI(
         "entry under `paths` is a plain GET that returns the event protocol; "
         "the streaming endpoint itself is reached by upgrading the same path."
     ),
+    lifespan=_lifespan,
 )
 
 # Segments run concurrently, so wall time is roughly
@@ -604,6 +623,64 @@ async def health():
     return {"status": "ok"}
 
 
+# --- Warm-up ---
+#
+# The first inference after a cold start took 58-112s against ~1s warm. py-spy
+# showed the engine thread inside flash_attn_varlen_func for the whole stall,
+# in libnvidia-ptxjitcompiler: the bundled FlashAttention-2 kernels carry PTX
+# but no SASS for this GPU (sm_120), so the driver compiles them on first call.
+# vLLM's own startup warm-up never reaches that path.
+#
+# The driver caches the result (CUDA_CACHE_PATH, persisted on EFS by the
+# Deployment), so on a cache hit this takes about a second. The warm-up exists
+# for the misses -- a new driver or GPU model invalidates the cache -- so that
+# the stall lands before the pod is Ready instead of on a caller's request.
+
+WARMUP_TIMEOUT_SECONDS = float(os.getenv("ASR_WARMUP_TIMEOUT", "600"))
+WARMUP_RETRY_SECONDS = 2.0
+_warmed_up = False
+
+
+def _silent_wav(seconds: float = 1.0, rate: int = 16000) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"\x00\x00" * int(seconds * rate))
+    return buf.getvalue()
+
+
+async def _warm_up() -> None:
+    """Run one real transcription through vLLM, then mark the adapter ready.
+
+    Retries until it succeeds: until vLLM has loaded, the request fails to
+    connect. If the backend never manages a one-second transcription, /ready
+    stays 503 and the startup probe eventually restarts the container, which
+    is the right outcome for a backend that cannot serve.
+    """
+    global _warmed_up
+    audio = _silent_wav()
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            started = time.monotonic()
+            async with httpx.AsyncClient(timeout=WARMUP_TIMEOUT_SECONDS) as client:
+                await _transcribe_once(client, audio, "warmup.wav")
+        except (httpx.HTTPError, _BackendRejected):
+            # Connection refused while vLLM loads is the expected case; only
+            # say something once that stops being the likely explanation.
+            if attempt % 30 == 0:
+                log.warning("ASR warm-up still waiting for the backend "
+                            "(attempt %d)", attempt)
+            await asyncio.sleep(WARMUP_RETRY_SECONDS)
+            continue
+        log.info("ASR warm-up transcription took %.1fs", time.monotonic() - started)
+        _warmed_up = True
+        return
+
+
 @app.get("/ready")
 async def ready():
     """Ready only when vLLM can serve. Backs the startup and readiness probes.
@@ -611,6 +688,8 @@ async def ready():
     The backend check times out well inside the probes' 5s so the adapter
     answers 503 itself rather than letting the probe time out on it.
     """
+    if not _warmed_up:
+        return JSONResponse(status_code=503, content={"status": "warming up"})
     async with httpx.AsyncClient(timeout=3.0) as client:
         try:
             resp = await client.get(f"{BACKEND_URL}/health")

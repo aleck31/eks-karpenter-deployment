@@ -49,8 +49,22 @@ Retry-After: 30
 {"error": {"type": "backend_unavailable", "message": "..."}}
 ```
 
-调用方应按 `Retry-After` 重试。重启后最初的一两个请求会慢约 60 秒
-（vLLM 首次推理时 JIT 编译 Triton kernel），之后恢复正常。
+调用方应按 `Retry-After` 重试。
+
+**冷启动预热。** 本 GPU（sm_120）上 vLLM 自带的 FlashAttention-2 kernel 只有 PTX，
+首次推理时由驱动现场编译为 SASS，实测 58-112 秒。adapter 在 vLLM 就绪后先跑一次
+1 秒静音转写，完成前 `/ready` 返回 `{"status": "warming up"}`，因此编译发生在
+Pod Ready 之前，不会落到调用方请求上。驱动的编译结果缓存在 EFS
+（`CUDA_CACHE_PATH=/cache/cuda`，PVC 子目录 `cache/asr-cuda`），命中时预热约 1 秒；
+驱动版本或 GPU 型号变化后首次启动会重新编译并写回。
+
+| 重启 | 停机 → Ready | 其中预热 | Ready 后首个请求 |
+|------|-------------|---------|-----------------|
+| 缓存未命中 | 3 分 37 秒 | 99.3 秒 | 1.2 秒 |
+| 缓存命中 | 1 分 44 秒 | 1.2 秒 | 1.2 秒 |
+
+单副本部署下，Pod Ready 后 ALB 还需通过 2 次健康检查（间隔 15 秒）才转发流量，
+其间 ALB 返回 503。
 
 ## ASR 流式 (WebSocket Realtime)
 

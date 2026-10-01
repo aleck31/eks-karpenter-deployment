@@ -109,6 +109,17 @@ spec:
         # a 502.
         - name: UVICORN_TIMEOUT_KEEP_ALIVE
           value: "1830"
+        # Driver JIT cache for the FlashAttention-2 kernels, which ship as PTX
+        # only for this GPU (sm_120) and otherwise compile on first inference
+        # after every restart (58-112s, measured). The default location,
+        # ~/.nv/ComputeCache, is container scratch and dies with it. Entries
+        # are keyed on driver version and GPU, so an AMI or instance-type change
+        # misses once and the driver writes the new result back here.
+        - name: CUDA_CACHE_PATH
+          value: /cache/cuda
+        # ~51 MB today. Set explicitly because the default varies by driver.
+        - name: CUDA_CACHE_MAXSIZE
+          value: "1073741824"
         ports:
         - containerPort: 8001
           name: http
@@ -116,6 +127,11 @@ spec:
         - name: models
           mountPath: /models
           readOnly: true
+        # Same volume again, writable but scoped to one subdirectory: the model
+        # tree above stays read-only. kubelet creates the directory if missing.
+        - name: models
+          mountPath: /cache/cuda
+          subPath: cache/asr-cuda
         # Overrides the copy baked into the image.
         - name: adapter
           mountPath: /app/asr-adapter.py
