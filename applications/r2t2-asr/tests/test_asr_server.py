@@ -185,6 +185,76 @@ def test_server_vad_closes_segment_at_pause(server):
     assert kinds(events).count("speech_started") == 2
 
 
+class FrameVadStream:
+    """FireRed-like: 10 ms frames, end reported min_silence frames into a silence."""
+
+    def __init__(self, min_silence_frame=20):
+        self.min_silence, self.frame, self.silent, self.in_speech = min_silence_frame, 0, 0, False
+
+    def detect_chunk(self, pcm_int16):
+        out = []
+        for i in range(0, len(pcm_int16) - 159, 160):
+            self.frame += 1
+            loud = np.abs(pcm_int16[i:i + 160]).max() > 0
+            if loud:
+                self.silent = 0
+                if not self.in_speech:
+                    self.in_speech = True
+                    out.append(_R(start=True, frame=self.frame))
+            elif self.in_speech:
+                self.silent += 1
+                if self.silent >= self.min_silence:
+                    self.in_speech = False
+                    out.append(_R(end=True, frame=self.frame))
+        return out
+
+    def reset(self):
+        self.__init__(self.min_silence)
+
+
+class FrameVad(FakeVad):
+    def stream(self, **overrides):
+        self.overrides = overrides
+        return FrameVadStream(overrides.get("min_silence_frame", 20))
+
+
+class LoudCountEngine(FakeEngine):
+    """Records how many loud samples each segment was given."""
+
+    def __init__(self):
+        super().__init__()
+        self.loud = []
+
+    def new_state(self, language, chunk_s, context=""):
+        self.loud.append(0)
+        return super().new_state(language, chunk_s, context)
+
+    def step(self, pcm, state, max_new_tokens):
+        self.loud[-1] += int((np.abs(pcm) > 0).sum())
+        return super().step(pcm, state, max_new_tokens)
+
+
+def test_server_vad_cut_keeps_next_turn_onset(server):
+    # The pause is detected 200 ms into the gap, mid-chunk, and the next phrase
+    # starts in that same chunk. Its onset must go to the next turn, not be
+    # decoded into the closing one and then lost.
+    eng = LoudCountEngine()
+    s = server.Session(eng, FrameVad(), None, 480, server_vad=True, vad_overrides={"min_silence_frame": 20})
+    first, second = tone(0.83), tone(1.2)
+    events = s.feed(np.concatenate([first, silence(0.25), second, silence(0.6)]))
+    assert kinds(events).count("completed") == 2
+    assert eng.loud[0] == int((np.abs(first) > 0).sum())
+    assert eng.loud[1] == int((np.abs(second) > 0).sum())
+
+
+def test_short_pause_does_not_end_turn_at_default_silence(server):
+    s = server.Session(FakeEngine(), FrameVad(), None, 480, server_vad=True,
+                       vad_overrides={"min_silence_frame": server.VAD_SILENCE_MS // 10})
+    events = s.feed(np.concatenate([tone(0.6), silence(0.33), tone(1.0), silence(0.45),
+                                    tone(0.6), silence(0.3), tone(0.8), silence(1.5)]))
+    assert kinds(events).count("completed") == 1  # comma pauses stay inside the turn
+
+
 def test_finalize_padding_never_adds_a_second_completed(server):
     s = server.Session(FakeEngine(), FakeVad(), None, 160, server_vad=True)
     events = s.feed(tone(0.6)) + s.finalize()  # padding would read as a pause
@@ -422,7 +492,8 @@ def test_realtime_manual_commit_flow(server):
         created = json.loads(ws.receive_text())
         assert created["type"] == "session.created"
         assert created["session"]["type"] == "transcription"
-        assert created["session"]["audio"]["input"]["turn_detection"] == {"type": "server_vad"}
+        assert created["session"]["audio"]["input"]["turn_detection"] == {
+            "type": "server_vad", "silence_duration_ms": 500, "prefix_padding_ms": 300}
         upd = _session(ws, format={"type": "audio/pcm", "rate": 16000}, turn_detection=None,
                        transcription={"model": "gpt-4o-transcribe", "language": "zh"})
         assert upd["session"]["audio"]["input"]["turn_detection"] is None
@@ -462,17 +533,17 @@ def test_realtime_server_vad_default_and_24k_input(server):
     assert kinds_.index("input_audio_buffer.speech_started") < kinds_.index("input_audio_buffer.speech_stopped") \
         < kinds_.index("input_audio_buffer.committed")
     assert events[-1]["transcript"]
-    assert server._vad.overrides == {}
+    assert server._vad.overrides == {"min_silence_frame": 50}  # OpenAI's 500 ms default
 
 
 def test_realtime_vad_params_and_prompt_reach_session(server):
     with TestClient(server.app) as c, c.websocket_connect("/v1/realtime") as ws:
         ws.receive_text()
-        _session(ws, turn_detection={"type": "server_vad", "threshold": 0.6, "silence_duration_ms": 500},
+        _session(ws, turn_detection={"type": "server_vad", "threshold": 0.6, "silence_duration_ms": 1300},
                  transcription={"prompt": "AWS Karpenter"})
         _append(ws, np.concatenate([tone(1.0), silence(1.0)]), rate=24000)
         _recv_until(ws, "conversation.item.input_audio_transcription.completed")
-    assert server._vad.overrides == {"speech_threshold": 0.6, "min_silence_frame": 50}
+    assert server._vad.overrides == {"speech_threshold": 0.6, "min_silence_frame": 130}
     assert server._engine.last_context == "AWS Karpenter"
 
 

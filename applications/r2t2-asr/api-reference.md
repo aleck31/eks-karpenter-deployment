@@ -47,7 +47,7 @@ multipart/form-data：
   "audio": {"input": {
     "format": {"type": "audio/pcm", "rate": 24000},
     "transcription": {"model": "gpt-4o-transcribe", "language": "zh", "prompt": ""},
-    "turn_detection": {"type": "server_vad", "threshold": 0.5, "silence_duration_ms": 200}
+    "turn_detection": {"type": "server_vad", "silence_duration_ms": 500}
   }}
 }}
 ```
@@ -58,6 +58,9 @@ multipart/form-data：
 | `transcription.language` / `languages` | `zh`、`en`；二者只能给一个，多种语言时自动识别 |
 | `transcription.prompt` | 上下文提示 |
 | `turn_detection` | `{"type": "server_vad", ...}` 或 `null`（客户端 commit） |
+| `turn_detection.silence_duration_ms` | 静音多久结束一轮，默认 **500**（同 OpenAI）。调大则轮次更长、`completed` 更晚，delta 不受影响 |
+| `turn_detection.prefix_padding_ms` | 接受并回显，默认 300。轮次音频首尾相接，前一轮结束点之后的音频全部归下一轮，不会丢段首 |
+| `turn_detection.threshold` | FireRed VAD 的语音概率阈值，默认 0.4 |
 
 ### 客户端事件
 

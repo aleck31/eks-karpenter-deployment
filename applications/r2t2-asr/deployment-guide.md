@@ -48,7 +48,8 @@ applications/r2t2-asr/
 | `ASR_FILE_STEP_MS` | 2000 | 480-2000 ms 扫描准确率持平，86 个文件耗时 183 s → 84 s |
 | `ASR_FILE_PAUSE_CUT_SECONDS` / `_HARD_SECONDS` | 10 / 30 | 批处理：段满 10 s 后遇停顿即切，30 s 强切 |
 | `ASR_STREAM_PAUSE_CUT_SECONDS` / `_HARD_SECONDS` | 15 / 30 | 实时、未开 server_vad |
-| `ASR_VAD_PAUSE_CUT_SECONDS` / `_HARD_SECONDS` | 0 / 30 | 实时、开 server_vad：每个停顿都切 |
+| `ASR_VAD_PAUSE_CUT_SECONDS` / `_HARD_SECONDS` | 0 / 30 | 实时、开 server_vad：每次 VAD 判停都切 |
+| `ASR_VAD_SILENCE_MS` | 500 | server_vad 未指定 `silence_duration_ms` 时的静音时长（OpenAI 默认值）。原先沿用 VAD 的 200 ms，逗号处就断轮，轮次碎片化 |
 | `R2T2_KV_CACHE_GIB` | 3 | 约 28k token；按字节设置，占用不随显卡型号变化 |
 | `R2T2_GPU_MEMORY_UTILIZATION` | 0.3 | 设了 KV 字节数后只作启动门槛 |
 | `ASR_MAX_SESSIONS` | 16 | 超出时 WebSocket 以 1013 关闭 |
@@ -59,6 +60,12 @@ FLEURS 上会整句漏识别（60 s 段三个文件里两次）。段太短则�
 
 **VAD 只决定切点、不丢音频**：FireRed VAD 对音量敏感（-47 dBFS 的英文录音只认出
 6% 的语音）。批处理的段首尾相连；VAD 的输入按 3 秒窗口做增益，模型听到的仍是原音。
+
+**实时切轮在判停点拆块**：VAD 判停时所在的 480 ms 块里可能已有下一句的开头。
+早先整块归给正在结束的轮次，下一句首字随之丢失（「这是…」成了「是…」）。现在块在判停点
+拆开，前半归本轮、后半归下一轮；结束的轮次另补 0.5 s 静音再收尾，与客户端 commit 一致，
+否则末字常不输出（「第一句」成了「第一」）。修正后 FLEURS 12 个文件 server_vad 错误率
+11.4% → 6.5%。
 
 ## 前置条件
 
