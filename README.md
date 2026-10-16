@@ -150,8 +150,7 @@ tools/logging/deployment-guide.md
 
 ### 5. 部署 AI 推理服务 (可选)
 ```bash
-# Qwen3 语音套件（ASR + TTS + 共享 EFS PVC）
-# base/shared 的 PVC 被 voxcpm2-tts 与 breeze2-tts 复用，需先部署
+# Qwen3 语音套件（ASR + TTS + EFS 模型存储）
 applications/qwen3-speech/deployment-guide.md
 
 # VoxCPM2 TTS 语音合成 (OpenAI兼容接口)
@@ -161,7 +160,6 @@ applications/voxcpm2-tts/deployment-guide.md
 applications/r2t2-asr/deployment-guide.md
 
 # Breeze TTS 2 语音合成 (OpenAI兼容接口)
-# 与 voxcpm2-tts 共用同一 ALB 端口与声纹目录，两者不能同时挂载 Ingress
 applications/breeze2-tts/deployment-guide.md
 ```
 

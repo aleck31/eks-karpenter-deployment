@@ -119,7 +119,7 @@ spec:
       volumes:
       - name: models
         persistentVolumeClaim:
-          claimName: qwen3-models-pvc
+          claimName: models-pvc
       - name: adapter
         configMap:
           name: breeze2-tts-adapter
@@ -131,38 +131,6 @@ spec:
         effect: NoSchedule
       nodeSelector:
         node-type: gpu
-      affinity:
-        nodeAffinity:
-          # 硬约束: 仅调度到 24GB 显存 GPU (L4/A10G)
-          # g4dn 保留给其他小模型 GPU 应用使用
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-            - matchExpressions:
-              - key: node.kubernetes.io/instance-type
-                operator: In
-                values: ["g7.2xlarge", "g7.4xlarge", "g6.xlarge", "g6.2xlarge", "g6.4xlarge", "g5.xlarge", "g5.2xlarge", "g5.4xlarge"]
-          preferredDuringSchedulingIgnoredDuringExecution:
-          # g7 优先：Spot 容量评分四个 AZ 均为最高档（g6 仅 2~4），
-          # 32GB 显存可与另两个推理服务共用一张卡
-          - weight: 90
-            preference:
-              matchExpressions:
-              - key: node.kubernetes.io/instance-type
-                operator: In
-                values: ["g7.2xlarge", "g7.4xlarge"]
-          - weight: 50
-            preference:
-              matchExpressions:
-              - key: node.kubernetes.io/instance-type
-                operator: In
-                values: ["g6.xlarge", "g6.2xlarge", "g6.4xlarge"]
-          - weight: 30
-            preference:
-              matchExpressions:
-              - key: node.kubernetes.io/instance-type
-                operator: In
-                values: ["g5.xlarge", "g5.2xlarge", "g5.4xlarge"]
-
       restartPolicy: Always
 
 ---

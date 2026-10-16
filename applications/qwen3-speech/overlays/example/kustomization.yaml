@@ -18,8 +18,8 @@ patches:
   - path: efs-patch.yaml
 
   # ALB 入站来源限制。不设则控制器托管的安全组默认放开 0.0.0.0/0。
-  # 该注解按 listen-port 生效：本模块 (8000) 与 voxcpm2-tts (8880) 共享
-  # 同一 ALB，两边 overlay 需各自声明。
+  # 多个服务共享一个 ALB 时再加 alb.ingress.kubernetes.io/group.name；
+  # 来源限制按 listen-port 生效，共享 ALB 的各服务需各自声明。
   - target:
       kind: Ingress
       name: qwen3-asr-ingress

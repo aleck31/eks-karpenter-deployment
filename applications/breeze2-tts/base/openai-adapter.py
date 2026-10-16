@@ -210,7 +210,7 @@ def _split_sentences(text: str) -> list[str]:
         merged.append(piece)
     return merged
 
-# Shared with voxcpm2-tts on the same volume.
+# Registry schema versions:
 #   v2  marked presets as builtin
 #   v3  added created_at / updated_at / audio.sha256 / audio loudness, so a
 #       client can key a cache on content rather than on size_bytes, which a
@@ -1432,8 +1432,7 @@ class CloneRequest(BaseModel):
     input: str
     reference_audio: str  # base64 encoded audio
     reference_format: str = "wav"
-    # Required rather than optional as it was for voxcpm2-tts: Breeze rejects a
-    # reference clip supplied without its transcript.
+    # Required: Breeze rejects a reference clip supplied without its transcript.
     prompt_text: str
     response_format: str = "mp3"
     cfg_value: float | None = None

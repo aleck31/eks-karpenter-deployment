@@ -1,7 +1,7 @@
 # Breeze TTS 2 语音合成 (OpenAI 兼容接口)
 
-单容器内跑两个进程：Breeze 自带的 `breeze_infer` 推理服务 (`:8000`，仅监听 127.0.0.1) 与 OpenAI 兼容 adapter (`:8880`，对外)。声纹存放在 `/shared/voices`，
-与 `voxcpm2-tts` 共用同一 PVC 与同一份 `registry.json`。
+单容器内跑两个进程：Breeze 自带的 `breeze_infer` 推理服务 (`:8000`，仅监听 127.0.0.1) 与 OpenAI 兼容 adapter (`:8880`，对外)。模型权重与声纹（`/shared/voices`，
+索引为 `registry.json`）放在同一个 RWX PVC 上。
 
 接口、字段、错误码与响应头见 [api-reference.md](api-reference.md)。兼容基线为 OpenAI
 Audio API 的 GA 规范（2026-10 对齐，`openai` Python SDK 3.31.0 实测）。
@@ -29,9 +29,9 @@ applications/breeze2-tts/
 | 依赖 | 说明 |
 |------|------|
 | GPU NodePool | 见 `gpu/deployment-guide.md`，需 Time-Slicing |
-| 24 GB 显存机型 | Deployment 硬约束 g6/g5 系列；g4dn 的 16 GB 不够 |
-| `qwen3-models-pvc` | 复用 qwen3-speech 的 EFS PVC，**须先部署** `applications/qwen3-speech/base/shared` |
-| ALB :8880 空闲 | 同一 listen-port 只能由一个 Ingress 声明，见「接管 :8880」 |
+| GPU 显存 | 服务固定占用约 9 GiB，与其它负载同卡时需留足余量；机型约束按环境在 overlay 中设置 |
+| 模型 PVC | RWX（如 EFS），在 overlay 中指定名称；声纹目录须属于 uid 10001 |
+| ALB :8880 空闲 | 同一 ALB group 内一个 listen-port 只能由一个 Ingress 声明 |
 
 ## 资源分配
 
@@ -41,17 +41,16 @@ applications/breeze2-tts/
 | `nvidia.com/gpu` | 1 | Time-Slicing 下的虚拟槽位，数量由节点配置决定 |
 | 内存 | 请求 3Gi / 上限 8Gi | |
 | CPU | 请求 500m / 上限 2 | |
-| 模型权重 | 7.2 GB on EFS | initContainer 下载，与其它服务共享 PVC |
+| 模型权重 | 7.2 GB | initContainer 下载到模型 PVC |
 
 **显存占用是固定的，不随显卡容量变化。** Breeze 后端没有任何显存预算参数
 （只有 `--host` / `--port` / `--fast-*`），占用由模型权重加 CUDA Graph 的实际
-需要决定。实测 L4（23 GB）上 8.9 GiB、RTX PRO 4500（32.6 GB）上 9.0 GiB，
-相差 0.7%。
+需要决定。实测 24 GB 卡上 8.9 GiB、32 GB 卡上 9.0 GiB，相差 0.7%。
 
-这与同节点的 `qwen3-asr` 相反：vLLM 的 `--gpu-memory-utilization` 是**总显存的
-比例**，换到更大的卡上会自动占更多。所以当这张卡显存紧张时，可回收的是 ASR 的
-预算，不是这里 —— 要降低本服务的显存只能减少 `--fast-*` 参数，而那会同时恶化
-RTF 并使所有已注册声纹的 seed 失效（见「部署契约」）。
+与 vLLM 类服务同卡时情况相反：`--gpu-memory-utilization` 是**总显存的比例**，换到
+更大的卡上会自动占更多。所以显存紧张时可回收的是那一方的预算，不是这里 ——
+要降低本服务的显存只能减少 `--fast-*` 参数，而那会同时恶化 RTF 并使所有已注册
+声纹的 seed 失效（见「部署契约」）。
 
 ## 构建
 
@@ -109,31 +108,11 @@ kubectl exec deploy/breeze2-tts -- md5sum /opt/breeze-tts/openai-adapter.py
 md5sum base/openai-adapter.py
 ```
 
-### 接管 :8880
+### ALB 端口
 
-该端口原由 `voxcpm2-tts` 占用。同一 ALB group 内一个 listen-port 只能由一个
-Ingress 声明，**两者不能同时存在**，否则 aws-load-balancer-controller 会因监听器
-冲突拒绝调和。切换顺序：
-
-```bash
-# 1. 先只部署工作负载，不含 Ingress，确认 Pod Ready
-kubectl apply -k overlays/<env-name> --prune=false
-kubectl delete ingress breeze2-tts-ingress -n <ns>   # 若已随 apply 创建
-kubectl rollout status deploy/breeze2-tts -n <ns>
-
-# 2. 集群内直连验证，确认声纹可用
-kubectl run curl-probe --rm -it --image=curlimages/curl --restart=Never -n <ns> -- \
-  curl -s http://breeze2-tts-service/v1/audio/voices
-
-# 3. 摘掉旧 Ingress，挂上新 Ingress
-kubectl delete ingress voxcpm2-tts-ingress -n <ns>
-kubectl apply -k overlays/<env-name>
-
-# 4. 回滚：反向执行第 3 步
-```
-
-切换前需确认所有要用的声纹都已具备 `ref_text`，否则合成会返回 422。
-可用集群内的 `qwen3-asr` 批量转写参考音频来回填。
+同一 ALB group 内一个 listen-port 只能由一个 Ingress 声明，否则
+aws-load-balancer-controller 会因监听器冲突拒绝调和。与其它服务共享 ALB 时，
+先确认 :8880 未被占用；要从别的服务接管该端口，先删除对方的 Ingress 再部署本模块。
 
 ## 验证部署
 
@@ -167,7 +146,7 @@ curl -s "http://<alb>:8880/v1/audio/voices" | head -c 200
 --fast-depth-decoder --fast-backbone-decode --fast-codec
 ```
 
-实测（L4 24GB，中文 60 字，RTF = 生成耗时 / 音频时长）：
+实测（24 GB 显存卡，中文 60 字，RTF = 生成耗时 / 音频时长）：
 
 | 配置 | 显存 | RTF | 启动 |
 |---|---|---|---|
@@ -248,5 +227,5 @@ GPU 槽位，导致新 Pod 落到另一个节点。
 
 ## 成本
 
-单个 g6.xlarge Spot 约 $0.22/小时。与 `qwen3-asr` 共享节点时通过 Time-Slicing
-同用一张 L4（8.9 + 7.7 GiB，24 GB 内可容纳），不需要额外节点。
+服务固定占用约 9 GiB 显存，可通过 Time-Slicing 与其它推理服务同卡部署而不必单开
+节点，前提是同卡各服务的实测占用之和小于总显存。

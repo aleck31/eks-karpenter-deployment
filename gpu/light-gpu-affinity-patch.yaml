@@ -11,7 +11,7 @@ spec:
       affinity:
         nodeAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
-            # 与 ASR/TTS 同为 g7 优先，三者共用一张 32GB 卡的三个切片
+            # 与语音服务取相同的首选机型，汇聚到同一张卡的不同切片
             - weight: 90
               preference:
                 matchExpressions:

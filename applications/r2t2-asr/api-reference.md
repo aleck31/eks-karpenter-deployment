@@ -12,6 +12,24 @@ Python SDK **3.31.0** 实测 HTTP 与 Realtime 两种接口。Realtime 只实现
 
 与 OpenAI 的差异见文末。
 
+## 选哪种用法
+
+FLEURS 普通话 / 英文实测字错误率（`openai` Python SDK 3.31.0，测法与明细见
+[deployment-guide.md](deployment-guide.md#实测fleurs-普通话--英文)）：
+
+| 用法 | 中文短句 | 英文短句 | 中文长段 | 英文长段 |
+|------|------|------|------|------|
+| HTTP 批处理 | 5.56% | 7.44% | 6.26% | 5.80% |
+| 实时，server_vad 默认参数 | 5.50% | 8.61% | 6.26% | 8.07% |
+| 实时，客户端 commit | 5.62% | 8.82% | 6.63% | 11.39% |
+
+- 录音已完整在手：用 HTTP，英文明显更准。
+- 实时：用 server_vad 默认参数（`silence_duration_ms` 500）。客户端 commit 的长段
+  明显更差；只在需要自己控制轮次边界时用。
+- 实时首字约 1.4-2.4 秒，轮次结束后约 0.3-0.4 秒给出 `completed`；delta 只追加、不回改。
+- 调大 `silence_duration_ms` 会让轮次更长、`completed` 更晚；在中文测试句上 500 与
+  1300 ms 识别结果相同，更大的值未在 FLEURS 上测过。
+
 ## POST /v1/audio/transcriptions
 
 multipart/form-data：
