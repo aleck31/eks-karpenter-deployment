@@ -192,16 +192,31 @@ toolkit，镜像体积翻倍（实测 28.7GB），而 inductor 只需 gcc，不�
 
 ## 已知限制
 
-**单并发。** 后端一次只服务一个请求，并发请求会收到 HTTP 409。adapter 把它转成
-明确的 429 + `Retry-After`（见「并发」一节），**不排队**。所以本模块适合单用户或
-低频调用场景。副本数扩容无法解决：多副本无法共享 GPU 上的单份模型，且时间切片下
-每节点只有 2 个 GPU 槽位。真并发需要独占节点 —— 单实例占 8.9 GiB，24 GB 卡可容纳
-两个，但当前节点与 `qwen3-asr` 共享，仅余约 3.5 GiB。
+**单并发，且这是推理引擎层的约束，不是模型或显存。** 后端一次只服务一个请求，
+并发请求收到 HTTP 409，adapter 转成明确的 429 + `Retry-After`（见接口参考的
+「并发」一节），**不排队**。
 
-**长文本由 adapter 分句。** 后端上下文 2048 位置 ÷ 12.5 Hz 帧率 ≈ 164 秒音频上限，
-而质量在触限之前就开始下降（重复片段、语速漂移），这是自回归 TTS 的共性。
-adapter 用 `pysbd` 切句并贪心打包到 `MAX_SEGMENT_CHARS`（160），逐段合成后以
-`SEGMENT_PAUSE_MS`（250ms）静音拼接，调用方不必自行切分。分句数见
+根因在 `FastBreezeStreamingRuntime.iter_audio_chunks`：单请求的解码状态挂在运行时
+实例上（`self._backbone_graph` 连同其 KV cache、`self._codec_runtime`），两个并发
+请求会互相覆写；解码循环还硬编码 `token[0]` / `depth_tokens[0]` 的单请求索引，而
+batch 维度已被 CFG 的正负双分支占用（`branch_batch_size = 2 if single_cfg else 1`）。
+所以那把 `threading.Lock` 是必需的，去掉会产出错乱音频而非更高吞吐。
+
+不是模型的限制：输入准备层本就支持批（`prepare_inputs(..., requests: list[Request])`
+内有 `for request in requests` 与 `_prepare_segment_batches`），`api.py` 只是传了
+单元素列表。也不是 CUDA Graph 的限制：图按 batch size 存字典
+（`self._backbone_graphs: dict[int, BackboneGraph]`），本就能同时持有多个尺寸。
+
+显存只是**变通方案的**约束：多副本每个都要完整一份约 9 GiB，无法共享。
+
+换其它开源 TTS 解决不了这一条：流式解码循环持有单请求状态是这一代自回归 TTS 的
+普遍做法（调研时见到的同类项目在 A100-40GB 上同样只能跑 1–2 路）。要真并发需要
+带批处理调度的服务化实现，类似 vLLM 对 LLM 所做的，当前开源 TTS 生态中尚不成熟。
+
+**长文本由 adapter 分句，实测不随长度退化。** 后端上下文 2048 位置 ÷ 12.5 Hz 帧率
+≈ 164 秒音频上限，而质量在触限之前就开始下降（重复片段、语速漂移），这是自回归
+TTS 的共性。adapter 用 `pysbd` 切句并贪心打包到 `MAX_SEGMENT_CHARS`（160），逐段
+合成后以 `SEGMENT_PAUSE_MS`（250ms）静音拼接，调用方不必自行切分。分句数见
 `X-Breeze-Segments` 响应头。
 
 分句用 `pysbd` 而非自行实现：手写规则在 `3.14 和 e 是 2.718。`、`Dr. Smith went
