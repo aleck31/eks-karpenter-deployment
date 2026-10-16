@@ -426,6 +426,10 @@ class Session:
         self.look = int(round(LOOKAHEAD_MS / 1000 * SR))
         self.chunk_s = step_ms / 1000
         self.vad = vad_factory.stream(**(vad_overrides or {})) if vad_factory else None
+        # Frames of silence the VAD waits before reporting an end; the speech
+        # itself ended that long before the frame it reports.
+        self.vad_silence_frames = (vad_overrides or {}).get(
+            "min_silence_frame", VAD_CONFIG["min_silence_frame"])
         self.first_max_new = max(1, int((self.step + self.look) / 1280))
         self.max_new: float = self.first_max_new
         self.floor = min(32, max(4, 2 * int(self.step / 1280)))
@@ -437,8 +441,12 @@ class Session:
         # this is the stream position (ms) they are relative to.
         self.vad_base_ms = 0
         self.audio_ms = 0
-        # Samples the VAD has seen since its last reset, to place its frames.
+        # Samples the VAD has seen since its last reset, to place its frames,
+        # and where finalize() padding sits among them. That padding is not
+        # client audio; counted as such, every commit shifted later
+        # timestamps 0.5 s.
         self.vad_samples = 0
+        self.vad_pads: list[tuple[int, int]] = []  # (vad sample, length)
         # Start of the next turn held back from a split chunk, decoded with
         # the next chunk because it is too short to decode alone.
         self.carry = np.zeros(0, dtype=np.float32)
@@ -520,9 +528,12 @@ class Session:
         gain = vad_gain(self.peak.update(seg))
         for r in self.vad.detect_chunk(_to_int16(seg * gain)):
             if r.is_speech_start:
-                events.append(Event("speech_started", ms=self.vad_base_ms + max(0, r.speech_start_frame - 1) * 10))
+                events.append(Event("speech_started", ms=self._client_ms(max(0, r.speech_start_frame - 1) * 10)))
             if r.is_speech_end:
-                events.append(Event("speech_stopped", ms=self.vad_base_ms + max(0, r.speech_end_frame - 1) * 10))
+                # OpenAI's audio_end_ms is where speech ended, not where the
+                # silence after it was long enough to be sure.
+                spoke = max(0, r.speech_end_frame - 1 - self.vad_silence_frames) * 10
+                events.append(Event("speech_stopped", ms=self._client_ms(spoke)))
                 # speech_end_frame is where the end was *detected*, after
                 # min_silence frames of silence; the smoothing window lags it
                 # by a few frames more, so step back by that margin.
@@ -531,6 +542,12 @@ class Session:
                 if cut < MIN_DECODE_SAMPLES:
                     cut = 0  # too little to decode alone; it goes to the next turn
         return events, cut
+
+    def _client_ms(self, vad_ms: int) -> int:
+        """A VAD position (ms since its reset) as a position in the client's audio."""
+        pos = vad_ms * SR // 1000
+        skip = sum(min(n, max(0, pos - start)) for start, n in self.vad_pads)
+        return self.vad_base_ms + (pos - skip) * 1000 // SR
 
     def _decode(self, seg: np.ndarray) -> list[Event]:
         events: list[Event] = []
@@ -578,12 +595,19 @@ class Session:
         events: list[Event] = []
         if self.fed:
             self._closing = True
+            pad = int(pad_s * SR)
+            pad_at = self.vad_samples + len(self.pending)
             try:
-                events = [e for e in self.feed(np.zeros(int(pad_s * SR), dtype=np.float32))
+                events = [e for e in self.feed(np.zeros(pad, dtype=np.float32))
                           if e.kind == "delta"]
             finally:
                 self._closing = False
                 self.audio_ms -= int(pad_s * 1000)  # padding is not client audio
+                # The VAD saw everything fed except what is left in pending,
+                # which goes straight to the engine below: pad - len(pending)
+                # more samples than the client sent.
+                if self.vad is not None and pad > len(self.pending):
+                    self.vad_pads.append((pad_at, pad - len(self.pending)))
         if len(self.carry):
             self.pending = np.concatenate([self.carry, self.pending])
             self.carry = self.carry[:0]
@@ -602,6 +626,7 @@ class Session:
             self.vad.reset()
             self.vad_base_ms = self.audio_ms
             self.vad_samples = 0
+            self.vad_pads = []
         self._new_segment()
         return []
 

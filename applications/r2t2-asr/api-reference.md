@@ -76,7 +76,7 @@ multipart/form-data：
 | 事件 | 说明 |
 |------|------|
 | `session.created` / `session.updated` | 当前会话配置 |
-| `input_audio_buffer.speech_started` / `speech_stopped` | 带 `audio_start_ms` / `audio_end_ms`、`item_id` |
+| `input_audio_buffer.speech_started` / `speech_stopped` | 带 `audio_start_ms` / `audio_end_ms`、`item_id`。时间为客户端音频中的位置（commit 时内部补的静音不计入）；`audio_end_ms` 是语音结束处，事件本身在其后 `silence_duration_ms` 才发出 |
 | `input_audio_buffer.committed` | 轮次提交（客户端 commit 或 VAD），带 `item_id`、`previous_item_id` |
 | `conversation.item.input_audio_transcription.delta` | `item_id`、`content_index`、`delta` |
 | `conversation.item.input_audio_transcription.completed` | `item_id`、`content_index`、`transcript`、`languages: [{"code": "zh"}]` |

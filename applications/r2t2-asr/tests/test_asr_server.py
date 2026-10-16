@@ -247,6 +247,21 @@ def test_server_vad_cut_keeps_next_turn_onset(server):
     assert eng.loud[1] == int((np.abs(second) > 0).sum())
 
 
+def test_vad_timestamps_are_client_audio_positions_across_commits(server):
+    s = server.Session(FakeEngine(), FrameVad(), None, 480, server_vad=True,
+                       vad_overrides={"min_silence_frame": 20})
+    s.feed(tone(1.0))
+    s.finalize()  # its 0.5 s of padding is not client audio
+    events = s.feed(np.concatenate([silence(1.0), tone(1.0), silence(1.0)]))
+    started = [e.ms for e in events if e.kind == "speech_started"]
+    stopped = [e.ms for e in events if e.kind == "speech_stopped"]
+    assert len(started) == 1 and abs(started[0] - 2000) <= 10
+    # Where speech ended, not where the 200 ms of silence confirmed it.
+    # The committed turn's end is confirmed only after the commit; its
+    # position is still the client's 1.0 s, not shifted by the padding.
+    assert len(stopped) == 2 and all(abs(a - b) <= 10 for a, b in zip(stopped, (1000, 3000)))
+
+
 def test_short_pause_does_not_end_turn_at_default_silence(server):
     s = server.Session(FakeEngine(), FrameVad(), None, 480, server_vad=True,
                        vad_overrides={"min_silence_frame": server.VAD_SILENCE_MS // 10})
