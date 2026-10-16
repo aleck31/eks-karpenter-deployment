@@ -70,8 +70,8 @@ ASR 容器（`vllm serve` + adapter 同容器）：
 | `nvidia.com/gpu` | 1（Time-Slicing 虚拟槽位） |
 | 显存 | `--kv-cache-memory-bytes 3G` + `--gpu-memory-utilization 0.28`（仅作启动门槛） |
 
-**KV cache 按绝对字节设置，不再按比例。** 比例会随显卡变：0.35 在 L4 (23.0 GB)
-上是 8.0 GiB，在 RTX PRO 4500 (32.6 GB) 上是 11.2 GiB，并且 KV 会填满整个比例
+**KV cache 按绝对字节设置，不再按比例。** 比例会随显卡变：0.35 在 24 GB 卡上约
+8 GiB，在 32 GB 卡上约 11 GiB，并且 KV 会填满整个比例
 （大卡上 5.93 GiB / 55,472 token），而实测峰值只有 0.75 GiB（4 请求并发，12.3%）。
 
 | 组成 | 显存 |
@@ -86,14 +86,14 @@ ASR 容器（`vllm serve` + adapter 同容器）：
 WebSocket 段）。超出时 vLLM 排队而非报错。
 
 设了 `--kv-cache-memory-bytes` 后，`--gpu-memory-utilization` 只剩启动检查：空闲
-显存须 ≥ 比例 × 总显存，否则拒绝启动。0.28 × 31.38 GiB = 8.79 GiB，略高于启动
-所需的 8.05 GiB，显卡被挤满时会明确报错而不是加载中途 OOM。该门槛仍按比例计算，
-换到 L4 上（约 6.2 GiB）会低于实际需求而失去作用。
+显存须 ≥ 比例 × 总显存，否则拒绝启动。以 32 GB 卡为例，0.28 × 31.38 GiB = 8.79 GiB，
+略高于启动所需的 8.05 GiB，显卡被挤满时会明确报错而不是加载中途 OOM。该门槛仍按比例
+计算，换到 24 GB 卡上（约 6.2 GiB）会低于实际需求而失去作用，需在 overlay 中调高。
 
-Time-Slicing 不隔离显存，同卡各租户的实际占用之和必须小于总显存。2026-10-01
-的 OOM 即因此：ASR 12.0 + breeze2-tts 9.0 + 同节点另一租户 11.1 GiB 占满 32 GB 卡。
+Time-Slicing 不隔离显存，同卡所有 Pod 的实际占用之和必须小于总显存，否则后启动或
+后增长的一方 OOM。规划同卡部署时按各服务的实测占用相加核算。
 
-同节点的 `breeze2-tts` 相反：Breeze 后端无显存预算参数，占用固定约 9.0 GiB，
+与 `breeze2-tts` 同卡时注意：Breeze 后端无显存预算参数，占用固定约 9.0 GiB，
 不随卡变化，也无法在不牺牲 RTF 和 seed 可复现性的前提下降低。
 
 ## 前置条件

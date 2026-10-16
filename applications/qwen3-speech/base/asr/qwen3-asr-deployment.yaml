@@ -57,14 +57,14 @@ spec:
         # queues requests rather than failing.
         #
         # Steady-state footprint is ~9 GiB: weights 3.9 + profiled activations
-        # ~1.15 + KV 3.0 + ~1 of allocator growth observed after startup. The
-        # GPU is time-sliced with TTS and other tenants and nothing isolates
-        # memory, so the sum across tenants is what has to fit.
+        # ~1.15 + KV 3.0 + ~1 of allocator growth observed after startup. A
+        # time-sliced GPU does not isolate memory, so the sum across every pod
+        # on the card is what has to fit.
         - --kv-cache-memory-bytes
         - "3G"
         # With kv-cache-memory-bytes set this no longer sizes anything; vLLM
         # only checks at startup that free memory >= fraction x total, and
-        # refuses to start otherwise. 0.28 of a 31.38 GiB card is 8.79 GiB,
+        # refuses to start otherwise. 0.28 of a 32 GB (31.38 GiB) card is 8.79 GiB,
         # just above the 8.05 GiB startup needs, so a crowded card fails fast
         # with a clear message instead of OOMing mid-load.
         - --gpu-memory-utilization
@@ -90,14 +90,14 @@ spec:
         # underflows num_output_placeholders when a streaming segment's final
         # prefill chunk is appended mid-generation, killing the EngineCore
         # (vllm-project/vllm#35755, still unfixed on main; the fix PR #50692 is
-        # open). Measured here: 19s of audio gives 4 assertion failures and a
+        # open). Measured: 19s of audio gives 4 assertion failures and a
         # truncated transcript with async scheduling on, 0 with it off.
         # Costs 3-8% throughput. Drop this once a release carries the fix.
         - --no-async-scheduling
         - --hf-overrides
         - '{"architectures": ["Qwen3ASRRealtimeGeneration"]}'
         env:
-        # The 2026-10-01 OOM failed a 370 MiB allocation with 364 MiB reserved
+        # A crowded card has failed a 370 MiB allocation with 364 MiB reserved
         # by PyTorch but unusable, split across fragments. Expandable segments
         # let the allocator grow mappings in place instead of stranding them.
         - name: PYTORCH_CUDA_ALLOC_CONF
@@ -110,7 +110,7 @@ spec:
         - name: UVICORN_TIMEOUT_KEEP_ALIVE
           value: "1830"
         # Driver JIT cache for the FlashAttention-2 kernels, which ship as PTX
-        # only for this GPU (sm_120) and otherwise compile on first inference
+        # only for Blackwell GPUs (sm_120) and otherwise compile on first inference
         # after every restart (58-112s, measured). The default location,
         # ~/.nv/ComputeCache, is container scratch and dies with it. Entries
         # are keyed on driver version and GPU, so an AMI or instance-type change
@@ -148,8 +148,8 @@ spec:
             nvidia.com/gpu: 1
         # Startup and readiness gate on /ready, which checks vLLM; liveness stays
         # on /health, which only checks the adapter. On /health alone the pod
-        # went Ready 63s before vLLM finished loading (09:29:51 vs 09:30:54 on
-        # 2026-10-01), so the ALB routed requests into a backend that could not
+        # went Ready about a minute before vLLM finished loading, so the ALB
+        # routed requests into a backend that could not
         # serve them. Liveness must not follow: during a reload vLLM is down by
         # design, and restarting the container then would only restart the load.
         startupProbe:
@@ -191,8 +191,7 @@ spec:
         node-type: gpu
       affinity:
         nodeAffinity:
-          # 硬约束: 仅调度到 24GB 显存 GPU (L4/A10G)
-          # g4dn 保留给其他小模型 GPU 应用使用
+          # 硬约束：显存 ≥ 24 GB 的机型；16 GB 卡（g4dn）不满足
           requiredDuringSchedulingIgnoredDuringExecution:
             nodeSelectorTerms:
             - matchExpressions:
@@ -200,8 +199,8 @@ spec:
                 operator: In
                 values: ["g7.2xlarge", "g7.4xlarge", "g6.xlarge", "g6.2xlarge", "g6.4xlarge", "g5.xlarge", "g5.2xlarge", "g5.4xlarge"]
           preferredDuringSchedulingIgnoredDuringExecution:
-          # g7 优先：Spot 容量评分四个 AZ 均为最高档（g6 仅 2~4），
-          # 32GB 显存可与另两个推理服务共用一张卡
+          # g7 优先：32 GB 显存可与其它语音服务同卡。各区域 Spot 供给不同，
+          # 机型偏好可在 overlay 中按实际调整
           - weight: 90
             preference:
               matchExpressions:
