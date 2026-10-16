@@ -1,0 +1,34 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 示例 overlay：展示需要按环境提供哪些值。
+# 用法：复制本目录为 overlays/<环境名>/，填入真实值。
+
+namespace: your-namespace
+
+resources:
+  - ../../base
+
+images:
+  - name: 123456789012.dkr.ecr.us-west-2.amazonaws.com/r2t2-asr
+    newName: <your-account-id>.dkr.ecr.<your-region>.amazonaws.com/r2t2-asr
+    newTag: latest
+
+patches:
+  # 模型存储：一个 RWX 的 PVC（如 EFS），存放权重与驱动 JIT 缓存。
+  - target:
+      kind: Deployment
+      name: r2t2-asr
+    patch: |
+      - op: replace
+        path: /spec/template/spec/volumes/0/persistentVolumeClaim/claimName
+        value: your-models-pvc
+  # ALB：入站来源限制；不设则控制器托管的安全组默认放开 0.0.0.0/0。
+  # 多个服务共享一个 ALB 时再加 alb.ingress.kubernetes.io/group.name。
+  - target:
+      kind: Ingress
+      name: r2t2-asr-ingress
+    patch: |
+      - op: add
+        path: /metadata/annotations/alb.ingress.kubernetes.io~1security-group-prefix-lists
+        value: pl-xxxxxxxxxxxxxxxxx

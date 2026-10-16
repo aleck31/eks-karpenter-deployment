@@ -1,0 +1,187 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: r2t2-asr
+  labels:
+    app: r2t2-asr
+spec:
+  replicas: 1
+  # The GPU is time-sliced with other services and nothing isolates memory, so
+  # a surge pod loading a second copy of the model beside the old one can OOM
+  # the card. Recreate stops the old pod before starting the new one.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: r2t2-asr
+  template:
+    metadata:
+      labels:
+        app: r2t2-asr
+    spec:
+      initContainers:
+      - name: model-downloader
+        image: 123456789012.dkr.ecr.us-west-2.amazonaws.com/r2t2-asr:latest
+        command:
+        - python3
+        - -c
+        - |
+          # Revisions are pinned; a marker records the one on disk so a
+          # changed pin re-downloads and an interrupted download retries.
+          import os
+          from huggingface_hub import snapshot_download
+
+          WANT = [
+              ("netease-youdao/Confucius4-R2T2", "185ce639118ad1362d049ca0d8ed04b6ec5cd6c9",
+               "/models/Confucius4-R2T2", None),
+              ("FireRedTeam/FireRedVAD", "7990aaccc6b7aec1e527743bd30201f2c4a03b8c",
+               "/models/FireRedVAD", ["Stream-VAD/*"]),
+          ]
+          for repo, rev, path, patterns in WANT:
+              marker = os.path.join(path, ".revision")
+              if os.path.exists(marker) and open(marker).read().strip() == rev:
+                  print(f"{repo}@{rev[:8]} present")
+                  continue
+              print(f"downloading {repo}@{rev[:8]}", flush=True)
+              snapshot_download(repo, revision=rev, local_dir=path, allow_patterns=patterns)
+              with open(marker, "w") as fh:
+                  fh.write(rev)
+        env:
+        # The image runs offline; the downloader is the one place that needs the Hub.
+        - name: HF_HUB_OFFLINE
+          value: "0"
+        volumeMounts:
+        - name: models
+          mountPath: /models
+        resources:
+          requests:
+            cpu: 500m
+            memory: 2Gi
+          limits:
+            cpu: "1"
+            # The Hub client buffers chunks of the 4 GB weight file in memory;
+            # 2Gi was OOMKilled mid-download.
+            memory: 6Gi
+
+      containers:
+      - name: asr
+        image: 123456789012.dkr.ecr.us-west-2.amazonaws.com/r2t2-asr:latest
+        env:
+        - name: R2T2_MODEL_PATH
+          value: /models/Confucius4-R2T2
+        - name: VAD_MODEL_PATH
+          value: /models/FireRedVAD/Stream-VAD
+        # KV cache sized in bytes; ~28k tokens. Measured footprint with it:
+        # 9.56 GiB loaded, 9.57 GiB at 8 concurrent streams.
+        - name: R2T2_KV_CACHE_GIB
+          value: "3"
+        # Startup gate only: vLLM refuses to start unless this share of the
+        # card is free. 0.3 x 31.4 GiB = 9.4 GiB, just under the footprint.
+        - name: R2T2_GPU_MEMORY_UTILIZATION
+          value: "0.3"
+        - name: ASR_MAX_SESSIONS
+          value: "16"
+        # Block size for file uploads. Swept 480-2000 ms on FLEURS through the
+        # ALB (2026-10-16): accuracy flat across the range (6.3-7.5% overall,
+        # 480 ms 7.06%, 2000 ms 6.53%), wall time 182.8 s -> 83.7 s for the 86
+        # files. Uploads are cut into <=30 s segments, which is what keeps large
+        # blocks from dropping sentences -- unsegmented 76 s files did at 1-2 s.
+        - name: ASR_FILE_STEP_MS
+          value: "2000"
+        # uvicorn's default keep-alive is 5s against the ALB's 1800s idle
+        # timeout; the target must outlast the ALB or it returns 502s.
+        - name: UVICORN_TIMEOUT_KEEP_ALIVE
+          value: "1830"
+        # Driver JIT cache on EFS: kernels without SASS for this GPU compile on
+        # first use, and container scratch loses the result on every restart.
+        - name: CUDA_CACHE_PATH
+          value: /cache/cuda
+        - name: CUDA_CACHE_MAXSIZE
+          value: "1073741824"
+        ports:
+        - containerPort: 8000
+          name: http
+        volumeMounts:
+        - name: models
+          mountPath: /models
+          readOnly: true
+        # Same volume, writable but scoped to one subdirectory.
+        - name: models
+          mountPath: /cache/cuda
+          subPath: cache/r2t2-cuda
+        # Overrides the copy baked into the image.
+        - name: server
+          mountPath: /app/asr-server.py
+          subPath: asr-server.py
+          readOnly: true
+        resources:
+          requests:
+            cpu: "1"
+            memory: 4Gi
+            nvidia.com/gpu: 1
+          limits:
+            # Feature extraction for every chunk, FireRed VAD and the
+            # tokenizer run on CPU in this process, one stream per thread.
+            cpu: "4"
+            memory: 12Gi
+            nvidia.com/gpu: 1
+        # The server loads the model and warms up before it accepts connections,
+        # so the startup probe covers load time; liveness starts after it.
+        # Readiness and startup use /ready, liveness /health: a dead engine
+        # fails both, a loading one fails neither for liveness.
+        startupProbe:
+          httpGet:
+            path: /ready
+            port: 8000
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8000
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+
+      volumes:
+      - name: models
+        persistentVolumeClaim:
+          # 模型与驱动 JIT 缓存所在的 RWX 卷（如 EFS），由 overlay 指定。
+          claimName: models-pvc
+      - name: server
+        configMap:
+          name: r2t2-asr-server
+
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+      nodeSelector:
+        node-type: gpu
+      restartPolicy: Always
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: r2t2-asr-service
+  labels:
+    app: r2t2-asr
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 8000
+    protocol: TCP
+    name: http
+  selector:
+    app: r2t2-asr
