@@ -3,7 +3,8 @@
 单容器内跑两个进程：Breeze 自带的 `breeze_infer` 推理服务 (`:8000`，仅监听 127.0.0.1) 与 OpenAI 兼容 adapter (`:8880`，对外)。声纹存放在 `/shared/voices`，
 与 `voxcpm2-tts` 共用同一 PVC 与同一份 `registry.json`。
 
-接口、字段、错误码与响应头见 [api-reference.md](api-reference.md)。
+接口、字段、错误码与响应头见 [api-reference.md](api-reference.md)。兼容基线为 OpenAI
+Audio API 的 GA 规范（2026-10 对齐，`openai` Python SDK 3.31.0 实测）。
 
 ## 文件结构
 
@@ -154,6 +155,7 @@ curl -s "http://<alb>:8880/v1/audio/voices" | head -c 200
 | `BREEZE_BACKEND_URL` | `http://localhost:8000` | 后端地址。后端只监听 127.0.0.1，不对外暴露 |
 | `VOICES_DIR` | `/shared/voices` | 声纹目录，与 `registry.json` 同级 |
 | `BREEZE_MODEL_ID` | `breeze-tts-2` | `/v1/models` 返回的 id |
+| `ASR_TRANSCRIBE_URL` | `http://r2t2-asr-service/v1/audio/transcriptions` | 注册声纹未给 `ref_text` 时调用的 OpenAI 兼容转写接口。不可达或置空时 `ref_text` 必填 |
 | `BREEZE_QUEUE_REJECT_SECONDS` | `0` | `0` 表示忙时立即 429 不排队；正数表示预估等待在该值以内则排队 |
 | `BREEZE_QUEUE_TIMEOUT` | `120` | 仅在启用排队时生效，限制排队者的最长等待 |
 

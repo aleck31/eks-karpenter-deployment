@@ -3,7 +3,12 @@
 遵循 OpenAI Audio API 的 [`/v1/audio/transcriptions`](https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions)
 与 Realtime API（GA）的[转写会话](https://developers.openai.com/api/docs/guides/realtime-transcription)。
 可直接使用官方 SDK：`OpenAI(base_url="http://<host>:8000/v1", api_key="<任意>")`。
-已用 `openai` Python SDK 3.31 验证两种接口。
+
+**兼容基线**：OpenAI 官方 API Reference 的 GA 规范（按 2026-10 对齐），已用 `openai`
+Python SDK **3.31.0** 实测 HTTP 与 Realtime 两种接口。Realtime 只实现 GA 协议
+（`session.update` + `session.type: "transcription"`）；Beta 协议
+（`OpenAI-Beta: realtime=v1` 头、`transcription_session.update` 事件）不支持，
+后者返回 `invalid_event` 错误。
 
 与 OpenAI 的差异见文末。
 

@@ -1,12 +1,15 @@
-"""OpenAI-compatible TTS adapter for the Breeze TTS 2 breeze_infer backend.
+"""OpenAI Audio API adapter for the Breeze TTS 2 breeze_infer backend.
 
-Takes over the endpoint contract previously served by voxcpm2-tts, so the
-request fields callers already send keep working. Two fields are new and both
-exist because of how Breeze cloning works:
+Implements OpenAI POST /v1/audio/speech (voice as a string or {"id"},
+instructions, response_format, stream_format audio|sse) and Create voice
+(POST /v1/audio/voices), with OpenAI error bodies. Everything else under
+/v1/audio/voices, /v1/audio/clone and /v1/audio/speech/status is an extension.
+
+Breeze cloning differs from OpenAI's model in two ways that surface here:
 
   ref_text  Breeze requires a reference clip *and* its exact transcript as a
-            pair; passing only the audio is rejected by the backend. Stored per
-            voice so callers do not have to resend it on every request.
+            pair. Stored per voice; transcribed on registration when not given
+            and an ASR is configured.
   seed      Breeze's sampling is seeded and reproducible within one set of
             --fast-* flags, so a caller can audition seeds and persist the one
             they liked onto the voice.
@@ -21,6 +24,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import struct
 import subprocess
@@ -29,10 +33,12 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from email.utils import formatdate
 from pathlib import Path
+from typing import Literal
 
 import httpx
 import pysbd
 from fastapi import (FastAPI, File, Form, HTTPException, Request, Response, UploadFile)
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
@@ -57,25 +63,40 @@ class ApiError(HTTPException):
     """
 
     def __init__(self, status_code: int, code: str, message: str,
-                 headers: dict | None = None):
+                 headers: dict | None = None, param: str | None = None):
         super().__init__(status_code=status_code, detail=message, headers=headers)
         self.code = code
+        self.param = param
+
+
+def _error_body(status: int, message: str, code: str, param: str | None) -> dict:
+    """OpenAI error shape: {"error": {message, type, param, code}}."""
+    kind = ("invalid_request_error" if status < 500 and status != 429
+            else "rate_limit_error" if status == 429 else "server_error")
+    return {"error": {"message": message, "type": kind, "param": param, "code": code}}
 
 
 @app.exception_handler(HTTPException)
 async def _http_exception_handler(_request, exc: HTTPException):
-    # `detail` is kept alongside `error` so existing callers keep working.
     code = getattr(exc, "code", None) or _DEFAULT_ERROR_CODES.get(
         exc.status_code, "error")
     return JSONResponse(
         status_code=exc.status_code,
-        content={
-            "detail": exc.detail,
-            "error": {"code": code, "message": exc.detail,
-                      "status": exc.status_code},
-        },
+        content=_error_body(exc.status_code, str(exc.detail), code,
+                            getattr(exc, "param", None)),
         headers=getattr(exc, "headers", None),
     )
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exception_handler(_request, exc: RequestValidationError):
+    # OpenAI answers a malformed body with 400 naming the field, not 422.
+    first = (exc.errors() or [{}])[0]
+    loc = [str(x) for x in first.get("loc", ()) if x not in ("body", "query")]
+    param = ".".join(loc) or None
+    message = f"{param}: {first.get('msg', 'invalid value')}" if param else str(exc)
+    return JSONResponse(status_code=400,
+                        content=_error_body(400, message, "invalid_value", param))
 
 
 _DEFAULT_ERROR_CODES = {
@@ -538,21 +559,23 @@ def _voice_view(voice_id: str, meta: dict, registry: dict) -> dict:
             "longer describe anything on disk and cloning cannot use this voice",
             severity="error"))
 
+    # OpenAI Voice object fields first; everything after "type" is an extension.
     return {
-        "voice_id": voice_id,
+        "id": voice_id,
+        "object": "audio.voice",
         "name": meta.get("name", voice_id),
+        "created_at": _unix(meta.get("created_at")),
+        "type": "audio_sample",
         "description": meta.get("description", ""),
         "gender": meta.get("gender", "unknown"),
-        "type": "builtin" if meta.get("builtin") else "custom",
         "builtin": bool(meta.get("builtin")),
         "ref_text": meta.get("ref_text"),
         "seed": meta.get("seed"),
         "ready": bool(meta.get("ref_text")) and present,
         "reference_audio": "present" if present else "missing",
-        "created_at": meta.get("created_at"),
         # Any change to the reference clip, its transcript or the seed produces a
         # different voice, so a client can key a synthesis cache on this alone.
-        "updated_at": meta.get("updated_at"),
+        "updated_at": _unix(meta.get("updated_at")),
         "duration_seconds": audio.get("duration_seconds") if present else None,
         "sample_rate": audio.get("sample_rate") if present else None,
         "channels": audio.get("channels") if present else None,
@@ -564,6 +587,16 @@ def _voice_view(voice_id: str, meta: dict, registry: dict) -> dict:
         "snr_db": audio.get("snr_db") if present else None,
         "warnings": warnings,
     }
+
+
+def _unix(stamp) -> int | None:
+    """Stored ISO-8601 timestamp -> Unix seconds, as OpenAI objects report time."""
+    if not stamp:
+        return None
+    try:
+        return int(datetime.fromisoformat(str(stamp)).timestamp())
+    except ValueError:
+        return None
 
 
 def _touch(meta: dict, *, created: bool = False) -> dict:
@@ -1034,7 +1067,8 @@ async def _synthesize(fields: dict, ref_audio: bytes | None,
 
 async def _stream_backend(request: Request, fields: dict, ref_audio: bytes | None,
                           segments: list[tuple[str, int]],
-                          target_format: str) -> StreamingResponse:
+                          target_format: str, sse: bool = False,
+                          input_chars: int = 0) -> StreamingResponse:
     """Stream segment PCM through, transcoding on the fly when needed.
 
     Two properties this has to hold, both learned the hard way.
@@ -1175,9 +1209,27 @@ async def _stream_backend(request: Request, fields: dict, ref_audio: bytes | Non
     chars = sum(len(text) for text, _ in segments)
     pauses = sum(pause for _, pause in segments) / 1000.0
     estimate = round(chars / CHARS_PER_SECOND + pauses, 1)
+    media_type = CONTENT_TYPES[target_format]
+    if sse:
+        audio_source = source
+
+        async def sse_events():
+            # OpenAI speech SSE: speech.audio.delta {audio: base64}, then
+            # speech.audio.done {usage}. This model has no token accounting;
+            # input_tokens counts input characters and output_tokens is 0.
+            async for chunk in audio_source:
+                if chunk:
+                    yield ("data: " + json.dumps({"type": "speech.audio.delta",
+                                                  "audio": base64.b64encode(chunk).decode()})
+                           + "\n\n")
+            yield ("data: " + json.dumps({"type": "speech.audio.done", "usage": {
+                "input_tokens": input_chars, "output_tokens": 0,
+                "total_tokens": input_chars}}) + "\n\n")
+
+        source, media_type = sse_events(), "text/event-stream"
     return StreamingResponse(
         source,
-        media_type=CONTENT_TYPES[target_format],
+        media_type=media_type,
         headers={
             "X-Breeze-Segments": str(len(segments)),
             "X-Audio-Duration-Estimate": str(estimate),
@@ -1266,79 +1318,84 @@ async def _transcode_stream(pcm_iter, target_format: str):
 
 # --- TTS endpoint ---
 
+class VoiceRef(BaseModel):
+    id: str
+
+
 class SpeechRequest(BaseModel):
-    model: str = "tts-1"
+    """OpenAI POST /v1/audio/speech.
+
+    `voice` is a registered voice id, as a string or as {"id": ...}. Leaving it
+    out is an extension: with `instructions` alone Breeze designs a voice from
+    the description (timbre varies between calls; register one to keep it).
+    `cfg_value` and `seed` are extensions too.
+    """
+    model: str
     input: str
-    voice: str = "alloy"
-    response_format: str = Field(default="mp3")
-    # Accepted for OpenAI compatibility and ignored: Breeze exposes no rate
-    # control, and silently resampling would change the pitch it was asked to
-    # preserve. Use voice_description to direct delivery instead.
+    voice: str | VoiceRef | None = None
+    instructions: str | None = None
+    response_format: Literal["mp3", "opus", "aac", "flac", "wav", "pcm"] = "mp3"
     speed: float = Field(default=1.0, ge=0.25, le=4.0)
-    stream: bool = Field(default=False)
-    # Carried over from the voxcpm2-tts contract so existing callers keep
-    # working; forwarded to Breeze as --cfg-scale.
+    stream_format: Literal["audio", "sse"] | None = None
     cfg_value: float | None = Field(
-        default=None, description="Guidance scale. Raises instruction adherence; 4 is "
-                                  "upstream's suggestion for voice_description."
-    )
+        default=None, description="Guidance scale (Breeze --cfg-scale). Upstream "
+                                  "suggests 4 to strengthen instruction-following.")
     seed: int | None = Field(
-        default=None, description="Overrides the voice's stored seed for this request. "
-                                  "Reproducible only within one set of backend --fast-* "
-                                  "flags."
-    )
-    voice_description: str | None = Field(
-        default=None,
-        description="Generate from a description instead of a registered voice. Timbre "
-                    "varies between calls; register a voice to get a stable one.",
-    )
+        default=None, description="Overrides the voice's stored seed for this request.")
 
 
 @app.post("/v1/audio/speech")
 async def create_speech(req: SpeechRequest, request: Request):
+    if req.speed != 1.0:
+        # Breeze has no rate control, and resampling would shift the pitch.
+        # Rejected rather than silently ignored, so the caller knows.
+        raise ApiError(400, "unsupported_value", "speed other than 1.0 is not supported",
+                       param="speed")
     segments = segment_text(req.input)
     if not segments:
-        raise HTTPException(status_code=400, detail="input is empty")
+        raise ApiError(400, "invalid_value", "input is empty", param="input")
 
     fields: dict = {}
     ref_audio: bytes | None = None
-
-    # Voice Design must be asked for explicitly. Inferring it from an
-    # unrecognised voice value means a typo'd or stale voice id answers 200
-    # with an arbitrary timbre, and the caller has no way to notice.
     _validate_seed(req.seed)
+    instructions = (req.instructions or "").strip() or None
+    voice_id = req.voice.id if isinstance(req.voice, VoiceRef) else req.voice
 
-    if req.voice_description is not None:
-        fields["instruction"] = req.voice_description
+    if voice_id is None:
+        if not instructions:
+            raise ApiError(400, "invalid_value",
+                           "voice is required (or instructions alone, to design a voice "
+                           "from a description)", param="voice")
+        # Voice design: no reference, the description is the voice.
+        fields["instruction"] = instructions
         seed = req.seed
     else:
         registry = _load_registry()
-        if req.voice not in registry:
+        if voice_id not in registry:
             raise ApiError(
-                404, "voice_not_found",
-                f"Voice '{req.voice}' is not registered. List available voices at "
-                       "GET /v1/audio/voices, or pass voice_description to generate from a "
-                       "description instead.",
-            )
-        meta = registry[req.voice]
-        ref_path = _reference_path(req.voice, registry)
+                400, "voice_not_found",
+                f"Voice '{voice_id}' is not registered. List available voices at "
+                "GET /v1/audio/voices.", param="voice")
+        meta = registry[voice_id]
+        ref_path = _reference_path(voice_id, registry)
         if not ref_path.exists():
             raise ApiError(
                 424, "reference_audio_missing",
-                f"Voice '{req.voice}' is registered but its reference audio is "
-                       "unavailable, so the timbre it promises cannot be reproduced.",
-            )
+                f"Voice '{voice_id}' is registered but its reference audio is "
+                "unavailable, so the timbre it promises cannot be reproduced.",
+                param="voice")
         ref_text = meta.get("ref_text")
         if not ref_text:
             raise ApiError(
                 424, "ref_text_missing",
-                f"Voice '{req.voice}' has no ref_text. Breeze clones from a "
-                       "reference clip paired with its exact transcript and rejects the "
-                       "clip alone. Set it with PUT /v1/audio/voices/"
-                       f"{req.voice} (field ref_text).",
-            )
+                f"Voice '{voice_id}' has no ref_text. Breeze clones from a reference "
+                "clip paired with its exact transcript. Set it with PUT "
+                f"/v1/audio/voices/{voice_id} (field ref_text).", param="voice")
         ref_audio = ref_path.read_bytes()
         fields["ref_text"] = ref_text
+        if instructions:
+            # Voice direction: keep the reference timbre, steer the delivery.
+            fields["instruction"] = instructions
         stored = _validate_seed(meta.get("seed"))
         seed = req.seed if req.seed is not None else (
             stored if stored is not None else SEED_DEFAULT
@@ -1349,9 +1406,10 @@ async def create_speech(req: SpeechRequest, request: Request):
     if req.cfg_value is not None:
         fields["cfg_scale"] = req.cfg_value
 
-    if req.stream:
+    if req.stream_format is not None:
         return await _stream_backend(request, fields, ref_audio, segments,
-                                     req.response_format)
+                                     req.response_format, sse=req.stream_format == "sse",
+                                     input_chars=len(req.input))
 
     pcm = await _synthesize(fields, ref_audio, segments)
     audio_bytes = _pcm_to_format(pcm, req.response_format)
@@ -1414,49 +1472,81 @@ async def clone_speech(req: CloneRequest):
 @app.get("/v1/audio/voices")
 async def list_voices():
     registry = _load_registry()
-    return {"voices": [_voice_view(vid, meta, registry)
-                       for vid, meta in registry.items()]}
+    return {"object": "list",
+            "data": [_voice_view(vid, meta, registry) for vid, meta in registry.items()]}
+
+
+ASR_TRANSCRIBE_URL = os.getenv("ASR_TRANSCRIBE_URL", "")
+
+
+async def _transcribe_reference(wav: bytes) -> str | None:
+    """Transcript of a reference clip from an OpenAI-compatible ASR, if one is set.
+
+    Breeze needs the exact transcript next to the clip. OpenAI's Create voice
+    takes only the audio, so when ref_text is not given it is derived here.
+    """
+    if not ASR_TRANSCRIBE_URL:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(ASR_TRANSCRIBE_URL, data={"model": "asr"},
+                                     files={"file": ("ref.wav", wav, "audio/wav")})
+            resp.raise_for_status()
+            return (resp.json().get("text") or "").strip() or None
+    except (httpx.HTTPError, ValueError):
+        return None
 
 
 @app.post("/v1/audio/voices")
 async def create_voice(
-    voice_id: str = Form(...),
-    name: str = Form(None),
+    name: str = Form(...),
+    audio_sample: UploadFile = File(...),
+    consent: str = Form(None),
+    voice_id: str = Form(None),
     description: str = Form(None),
     gender: str = Form("unknown"),
-    ref_text: str = Form(...),
+    ref_text: str = Form(None),
     seed: int = Form(SEED_DEFAULT),
-    audio: UploadFile = File(...),
 ):
+    """OpenAI Create voice: name + audio_sample (+ consent, accepted and not checked).
+
+    Extensions: voice_id (otherwise generated), description, gender, seed, and
+    ref_text -- the clip's exact transcript, transcribed automatically when
+    omitted and ASR_TRANSCRIBE_URL is configured.
+    """
     registry = _load_registry()
+    voice_id = voice_id or f"voice_{secrets.token_hex(8)}"
     _validate_voice_id(voice_id)
     _validate_gender(gender)
     _validate_seed(seed)
-
-    # Guard: never let a POST silently overwrite a built-in preset
     _assert_not_builtin(registry, voice_id, "overwriting via registration")
-    # Nor a custom one. The id namespace is flat and shared, so a repeated POST
-    # used to replace another caller's reference recording with no way back.
     if voice_id in registry:
         raise ApiError(
             409, "voice_exists",
-            f"Voice '{voice_id}' already exists. Registration never replaces a "
-            "stored recording; use PUT /v1/audio/voices/{voice_id} to update it, "
-            "or choose another id.",
-        )
+            f"Voice '{voice_id}' already exists. Registration never replaces a stored "
+            "recording; use PUT /v1/audio/voices/{voice_id} or choose another id.",
+            param="voice_id")
 
-    audio_bytes = await audio.read()
-    fmt = audio.filename.rsplit(".", 1)[-1].lower() if audio.filename else "wav"
+    audio_bytes = await audio_sample.read()
+    fmt = (audio_sample.filename.rsplit(".", 1)[-1].lower()
+           if audio_sample.filename and "." in audio_sample.filename else "wav")
     normalized = _normalize_audio(audio_bytes, fmt)
+    if not ref_text:
+        ref_text = await _transcribe_reference(normalized)
+    if not ref_text:
+        raise ApiError(400, "ref_text_required",
+                       "ref_text (the exact transcript of audio_sample) is required: "
+                       "Breeze clones from the clip and its transcript together, and no "
+                       "transcription service is configured or it returned nothing.",
+                       param="ref_text")
 
     voice_dir = VOICES_DIR / voice_id
     voice_dir.mkdir(parents=True, exist_ok=True)
     (voice_dir / "ref.wav").write_bytes(normalized)
-
     audio_meta = _probe_audio(voice_dir / "ref.wav")
     registry[voice_id] = _touch({
         "file": "ref.wav",
-        "name": name or voice_id,
+        "name": name,
         "description": description or "",
         "gender": gender,
         "builtin": False,
@@ -1465,12 +1555,9 @@ async def create_voice(
         "audio": audio_meta,
     }, created=True)
     _save_registry(registry)
-    # The full view is returned rather than a bare status: the caller can act on
-    # the loudness and duration findings while the source material is still at
-    # hand, with no follow-up request.
-    return {"voice_id": voice_id, "status": "created",
-            "warnings": _audio_warnings(audio_meta),
-            "voice": _voice_view(voice_id, registry[voice_id], registry)}
+    # The Voice object, with the audio findings among its extension fields so
+    # the caller can act on them while the source material is still at hand.
+    return _voice_view(voice_id, registry[voice_id], registry)
 
 
 @app.put("/v1/audio/voices/{voice_id}")
@@ -1481,26 +1568,28 @@ async def update_voice(
     gender: str = Form(None),
     ref_text: str = Form(None),
     seed: int = Form(None),
-    audio: UploadFile = File(None),
+    audio_sample: UploadFile = File(None),
 ):
+    """Extension: update a voice's metadata or replace its reference clip."""
     _validate_voice_id(voice_id)
     registry = _load_registry()
     if voice_id not in registry:
         raise ApiError(404, "voice_not_found", f"Voice '{voice_id}' not found")
 
-    if audio:
-        # Built-in presets: metadata is editable, reference audio is not
+    if audio_sample:
         _assert_not_builtin(registry, voice_id, "replacing the reference audio")
-        if ref_text is None:
-            raise HTTPException(
-                status_code=400,
-                detail="Replacing the reference audio requires ref_text in the same "
-                       "request: the stored transcript describes the old recording and "
-                       "a mismatched pair degrades the clone.",
-            )
-        audio_bytes = await audio.read()
-        fmt = audio.filename.rsplit(".", 1)[-1].lower() if audio.filename else "wav"
+        audio_bytes = await audio_sample.read()
+        fmt = (audio_sample.filename.rsplit(".", 1)[-1].lower()
+               if audio_sample.filename and "." in audio_sample.filename else "wav")
         normalized = _normalize_audio(audio_bytes, fmt)
+        if ref_text is None:
+            # The stored transcript describes the old recording.
+            ref_text = await _transcribe_reference(normalized)
+            if not ref_text:
+                raise ApiError(400, "ref_text_required",
+                               "Replacing audio_sample requires ref_text in the same "
+                               "request (no transcription service configured).",
+                               param="ref_text")
         voice_dir = VOICES_DIR / voice_id
         voice_dir.mkdir(parents=True, exist_ok=True)
         (voice_dir / "ref.wav").write_bytes(normalized)
@@ -1518,8 +1607,7 @@ async def update_voice(
         registry[voice_id]["seed"] = _validate_seed(seed)
     _touch(registry[voice_id])
     _save_registry(registry)
-    return {"voice_id": voice_id, "status": "updated",
-            "voice": _voice_view(voice_id, registry[voice_id], registry)}
+    return _voice_view(voice_id, registry[voice_id], registry)
 
 
 @app.get("/v1/audio/voices/{voice_id}")
@@ -1545,7 +1633,7 @@ async def delete_voice(voice_id: str):
         shutil.rmtree(voice_dir)
     del registry[voice_id]
     _save_registry(registry)
-    return {"voice_id": voice_id, "status": "deleted"}
+    return {"id": voice_id, "object": "audio.voice", "deleted": True}
 
 
 @app.get("/v1/audio/voices/{voice_id}/preview")
@@ -1612,6 +1700,7 @@ async def list_models():
             "projected_wait_seconds": round(_BACKEND_SLOT.projected_wait(), 1),
             "response_formats": sorted(CONTENT_TYPES),
             "streaming_formats": sorted(CONTENT_TYPES),
+            "stream_formats": ["audio", "sse"],
             "sample_rate": BACKEND_SAMPLE_RATE,
             "seed": {"min": SEED_MIN, "max": SEED_MAX, "default": SEED_DEFAULT},
             "text": {"max_segment_chars": MAX_SEGMENT_CHARS,
