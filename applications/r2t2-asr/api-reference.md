@@ -43,6 +43,7 @@ multipart/form-data：
 | `response_format` | `json`（默认）、`text`、`verbose_json`、`srt`、`vtt` |
 | `stream` | `true` 时以 SSE 返回 `transcript.text.delta` / `transcript.text.done`（仅 `json`、`text`） |
 | `temperature` | 接受并忽略（贪心解码） |
+| `timestamp_granularities[]` | `segment`（默认）、`word`，可同时给；仅 `verbose_json`。`word` 时返回 `words` |
 
 响应：
 
@@ -50,8 +51,49 @@ multipart/form-data：
 {"text": "……", "usage": {"type": "duration", "seconds": 83}}
 ```
 
-`verbose_json` 另含 `task`、`language`、`duration` 与 `segments`（`id`、`start`、`end`、`text`）。
-音频在停顿处切段，`segments` 即这些段。长度无上限。
+`verbose_json` 另含 `task`、`language`、`duration` 与 `segments`（`id`、`start`、`end`、`text`）；
+`timestamp_granularities[]=word` 时另含 `words`（`word`、`start`、`end`，单位秒）。长度无上限。
+
+`verbose_json` / `srt` / `vtt` 的 `segments` 是**字幕粒度**：按识别文本的句末标点切句，
+超过 7 秒的句子再在逗号或词间停顿处切开；起止时间取该段首词与末词的强制对齐时间。
+`words` 的单位是中文单字、英文单词，不含标点；时间分辨率 80 ms。识别仍按停顿切成
+10-30 秒的段进行（切短会降低准确率），对齐在识别之后另做一遍，每分钟音频约增加 0.15 秒。
+部署未加载对齐模型时，`segments` 退回识别段，请求 `word` 返回 400 `unsupported_value`。
+
+```json
+{"task": "transcribe", "language": "chinese", "duration": 72.18, "text": "……",
+ "words": [{"word": "州", "start": 1.36, "end": 1.6}, …],
+ "segments": [{"id": 0, "start": 1.36, "end": 5.44, "text": "州长办公室表示，伤者中有十九人是警察。"}, …],
+ "usage": {"type": "duration", "seconds": 73}}
+```
+
+## POST /v1/audio/alignments（扩展）
+
+已知文本的强制对齐：给出音频与其中说的文本，返回每句、每词的时间。**不做识别**，
+返回的文字就是传入的文本，不会出现识别错误。用于给合成语音或已有文稿的录音配字幕、
+跟读高亮。OpenAI 没有对应接口。
+
+| 字段 | 说明 |
+|------|------|
+| `file` | 必填。任意 ffmpeg 可解码的音频 |
+| `text` | 必填。音频中说的文本，可含标点（用于切句） |
+| `language` | `zh`、`en`；不填按文本是否含汉字判断 |
+| `response_format` | `json`（默认）、`srt`、`vtt` |
+| `timestamp_granularities[]` | `segment`（默认）、`word`，可同时给 |
+
+```json
+{"duration": 14.6, "language": "zh", "text": "……",
+ "segments": [{"id": 0, "start": 0.0, "end": 3.12, "text": "有一种说法认为，早起的人效率更高。"}, …],
+ "words": [{"word": "有", "start": 0.0, "end": 0.24}, …]}
+```
+
+- `segments` 的切法与转写相同（句末标点，超 7 秒再按逗号或停顿切）。
+- 同步返回：14.6 秒合成语音约 1.3 秒，72 秒录音约 0.8 秒，150 秒约 4 秒。
+- 超过 120 秒的音频分窗对齐：先识别、用识别结果确定文本在各窗的位置，再在每窗内
+  对齐给定文本。整段直接对齐在 217 秒处已漂移约 9 秒。
+- 文本须与所说内容一致。不一致处（如文本写 `nineteen`、实际说 `19`，或文本有
+  音频里没有的话）时间会偏，偏差局限在不一致的附近。
+- 未加载对齐模型时返回 503 `aligner_unavailable`。
 
 错误体为 `{"error": {"message", "type", "param", "code"}}`。后端不可用时返回 503 与 `Retry-After`。
 
@@ -106,7 +148,7 @@ multipart/form-data：
 
 - **delta 只追加、不改写**，在说话过程中即开始发送（早于该轮的 committed），`completed.transcript` 等于该轮 delta 依次拼接。
 - **`turn_detection: null` 时**，客户端长时间不 commit，服务端会在轮次满 15 秒后的停顿处、或 30 秒时自行提交（发 `committed` 后接 `completed`），以限制单轮计算量。
-- 不支持：`audio/pcmu`、`audio/pcma`、`semantic_vad`、`noise_reduction`、`include`（logprobs）、`keywords`、`delay`、说话人分离、词级时间戳。字段若出现则忽略，格式与 turn_detection 类型不支持时报错。
+- 不支持：`audio/pcmu`、`audio/pcma`、`semantic_vad`、`noise_reduction`、`include`（logprobs）、`keywords`、`delay`、说话人分离。字段若出现则忽略，格式与 turn_detection 类型不支持时报错。
 - 仅支持中文与英文。
 
 ## 其他

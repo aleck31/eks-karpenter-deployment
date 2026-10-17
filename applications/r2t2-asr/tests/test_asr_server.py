@@ -16,6 +16,7 @@ import base64
 import importlib.util
 import io
 import json
+import re
 import threading
 import time
 import wave
@@ -599,3 +600,178 @@ def test_realtime_session_limit(server, monkeypatch):
                 with pytest.raises(WebSocketDisconnect) as closed:
                     second.receive_text()
     assert closed.value.code == 1013
+
+
+# --- forced alignment ---
+
+def _units(text):
+    """Stand-in for the aligner's tokenizer: CJK characters and Latin words."""
+    out = []
+    for w in re.findall(r"[\u4e00-\u9fff]|[A-Za-z0-9']+", text):
+        out.append(w)
+    return out
+
+
+class FakeAligner:
+    """Spreads the text's units evenly over the audio it is given."""
+
+    def __init__(self):
+        self.calls = []
+
+    tokenize = staticmethod(_units)
+
+    def align(self, audio, text, language):
+        self.calls.append((len(audio) / SR, text, language))
+        units = _units(text)
+        step = len(audio) / SR / max(1, len(units))
+        return [(u, i * step, (i + 1) * step) for i, u in enumerate(units)]
+
+
+def _w(word, start, end):
+    return {"word": word, "start": start, "end": end}
+
+
+def test_zero_length_word_follows_the_word_before(server):
+    words = [_w("police", 3.6, 3.9), _w("officers", 8.48, 8.48), _w("Saint", 8.56, 8.8)]
+    fixed = server.fix_zero_spans(words)
+    assert fixed[1]["start"] == 3.9 and 3.9 < fixed[1]["end"] <= 8.56
+    assert fixed[0] == words[0] and fixed[2] == words[2]
+
+
+def test_word_running_into_a_pause_ends_at_it(server):
+    spans = [(1.0, 14.9), (16.1, 20.0)]
+    words = [_w("the", 14.4, 14.48), _w("terms", 14.56, 16.16), _w("The", 16.16, 16.3)]
+    out = server.tidy_words(words, spans)
+    assert out[1]["end"] == 14.9 and out[0] == words[0] and out[2] == words[2]
+
+
+def test_long_sentence_without_marks_is_cut_at_a_pause(server):
+    text = "said the victim. They are sandy"
+    t = [0.0, 0.3, 0.6, 2.0, 2.3, 2.6]  # 1.1 s pause before "They"
+    words = [_w(x, s, s + 0.2) for x, s in zip(_units(text), t)]
+    segs = server.sentence_segments("said the victim\u201d They are sandy", words, _units, max_cue=1.0)
+    assert [s["text"] for s in segs] == ["said the victim\u201d", "They are sandy"]
+    assert segs[1]["start"] == 2.0
+
+
+def test_split_sentences_keeps_every_character(server):
+    text = "第一句，这是测试。第二句！Version 3.5 shipped. Done"
+    parts = server.split_sentences(text)
+    assert "".join(parts) == text
+    assert [p.strip() for p in parts] == ["第一句，这是测试。", "第二句！", "Version 3.5 shipped.", "Done"]
+
+
+def test_sentence_segments_take_their_words_and_reject_a_mismatch(server):
+    text = "你好。再见。"
+    words = [{"word": w, "start": i * 0.5, "end": i * 0.5 + 0.4} for i, w in enumerate("你好再见")]
+    segs = server.sentence_segments(text, words, _units)
+    assert [(s["text"], s["start"], s["end"]) for s in segs] == [("你好。", 0.0, 0.9), ("再见。", 1.0, 1.9)]
+    assert server.sentence_segments(text, words[:3], _units) is None
+
+
+def test_abbreviation_is_not_a_sentence_end(server):
+    assert [p.strip() for p in server.split_sentences("St. Petersburg is big. Dr. Who left.")] == \
+        ["St. Petersburg is big.", "Dr. Who left."]
+
+
+def test_punctuation_inside_a_token_does_not_split_it(server):
+    text = "Between 10:00-11:00 pm, a fire started. Next."
+    units = _units(text)
+    words = [{"word": w, "start": float(i), "end": i + 0.5} for i, w in enumerate(units)]
+    segs = server.sentence_segments(text, words, lambda t: [server._norm_token(x) for x in _units(t)], max_cue=60)
+    assert segs is not None and [s["text"] for s in segs] == ["Between 10:00-11:00 pm, a fire started.", "Next."]
+
+
+def test_long_comma_run_is_packed_into_short_cues(server):
+    text = "甲乙，丙丁，戊己，庚辛。"
+    words = [{"word": w, "start": i * 1.0, "end": i * 1.0 + 0.9} for i, w in enumerate("甲乙丙丁戊己庚辛")]
+    segs = server.sentence_segments(text, words, _units, max_cue=4.0)
+    assert [s["text"] for s in segs] == ["甲乙，丙丁，", "戊己，庚辛。"]
+    assert all(s["end"] - s["start"] <= 4.0 for s in segs)
+    assert len(server.sentence_segments(text, words, _units, max_cue=60)) == 1
+
+
+def _two_segment_upload(server, monkeypatch):
+    monkeypatch.setattr(server, "FILE_POLICY", server.SegmentPolicy(1.0, 30.0))
+    texts = iter(["第一句。第二句。", "Hello world. Bye."] * 10)
+    monkeypatch.setattr(server, "transcribe_span",
+                        lambda *a, **k: (next(texts), "chinese"))
+    return np.concatenate([tone(2.0), silence(1.0), tone(2.0)])
+
+
+def test_http_word_timestamps_and_sentence_segments(server, monkeypatch):
+    audio = _two_segment_upload(server, monkeypatch)
+    with TestClient(server.app) as c:
+        server._vad = FakeVad(spans=[(0.0, 2.0), (3.0, 5.0)])
+        server._aligner = FakeAligner()
+        v = c.post("/v1/audio/transcriptions",
+                   data={"response_format": "verbose_json",
+                         "timestamp_granularities[]": ["word", "segment"]},
+                   files={"file": ("a.wav", wav_bytes(audio), "audio/wav")}).json()
+        srt = _post(c, audio, response_format="srt").text
+    assert [w["word"] for w in v["words"]] == list("第一句第二句") + ["Hello", "world", "Bye"]
+    assert all(a["start"] <= b["start"] for a, b in zip(v["words"], v["words"][1:]))
+    assert v["words"][6]["start"] == pytest.approx(2.5)  # second segment offset
+    assert [s["text"] for s in v["segments"]] == ["第一句。", "第二句。", "Hello world.", "Bye."]
+    assert v["segments"][1]["end"] <= 2.5 + 1e-6 and v["segments"][2]["start"] >= 2.5 - 1e-6
+    assert srt.count("-->") == 4  # one cue per sentence
+
+
+def test_http_words_only_and_granularity_errors(server, monkeypatch):
+    audio = _two_segment_upload(server, monkeypatch)
+    with TestClient(server.app) as c:
+        server._vad = FakeVad(spans=[(0.0, 2.0), (3.0, 5.0)])
+        server._aligner = FakeAligner()
+        only = c.post("/v1/audio/transcriptions",
+                      data={"response_format": "verbose_json", "timestamp_granularities[]": "word"},
+                      files={"file": ("a.wav", wav_bytes(audio), "audio/wav")}).json()
+        on_json = c.post("/v1/audio/transcriptions",
+                         data={"timestamp_granularities[]": "word"},
+                         files={"file": ("a.wav", wav_bytes(audio), "audio/wav")})
+        server._aligner = None
+        missing = c.post("/v1/audio/transcriptions",
+                         data={"response_format": "verbose_json", "timestamp_granularities[]": "word"},
+                         files={"file": ("a.wav", wav_bytes(audio), "audio/wav")})
+        plain = _post(c, audio, response_format="verbose_json").json()
+    assert "words" in only and "segments" not in only
+    assert on_json.status_code == 400 and on_json.json()["error"]["param"] == "timestamp_granularities"
+    assert missing.status_code == 400 and missing.json()["error"]["code"] == "unsupported_value"
+    assert len(plain["segments"]) == 2 and "words" not in plain  # pause-cut without the aligner
+
+
+def _align(c, audio, **data):
+    return c.post("/v1/audio/alignments", data=data,
+                  files={"file": ("a.wav", wav_bytes(audio), "audio/wav")})
+
+
+def test_alignments_returns_the_script_timed(server):
+    script = "有一句话。Then another one!"
+    with TestClient(server.app) as c:
+        server._aligner = FakeAligner()
+        r = _align(c, tone(4.0), text=script, **{"timestamp_granularities[]": ["word", "segment"]})
+        srt = _align(c, tone(4.0), text=script, response_format="srt").text
+        server._aligner = None
+        off = _align(c, tone(1.0), text=script)
+    body = r.json()
+    assert r.status_code == 200, r.text
+    assert [w["word"] for w in body["words"]] == ["有", "一", "句", "话", "Then", "another", "one"]
+    assert [s["text"] for s in body["segments"]] == ["有一句话。", "Then another one!"]
+    assert body["segments"][-1]["end"] == pytest.approx(4.0)
+    assert srt.count("-->") == 2
+    assert off.status_code == 503 and off.json()["error"]["code"] == "aligner_unavailable"
+
+
+def test_alignments_long_audio_is_windowed_by_recognised_text(server, monkeypatch):
+    monkeypatch.setattr(server, "ALIGN_WINDOW_S", 3.0)
+    monkeypatch.setattr(server, "FILE_POLICY", server.SegmentPolicy(1.0, 30.0))
+    heard = iter(["甲乙丙", "丁戊己"])  # what recognition hears in each half
+    monkeypatch.setattr(server, "transcribe_span", lambda *a, **k: (next(heard), "chinese"))
+    with TestClient(server.app) as c:
+        server._vad = FakeVad(spans=[(0.0, 2.0), (2.5, 4.5)])
+        server._aligner = fa = FakeAligner()
+        r = _align(c, np.concatenate([tone(2.0), silence(0.5), tone(2.0)]), text="甲乙丙。丁戊己。",
+                   **{"timestamp_granularities[]": "word"})
+    assert r.status_code == 200, r.text
+    assert [t for _, t, _ in fa.calls] == ["甲 乙 丙", "丁 戊 己"]  # script split at the window
+    words = r.json()["words"]
+    assert words[3]["word"] == "丁" and words[3]["start"] >= 2.25 - 1e-6

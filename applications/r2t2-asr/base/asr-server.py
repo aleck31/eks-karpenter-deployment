@@ -649,6 +649,7 @@ def transcribe_span(engine: Engine, audio: np.ndarray, language: str | None,
 
 _engine: Engine | None = None
 _vad: VadFactory | None = None
+_aligner: "Aligner | None" = None  # defined with the HTTP helpers below
 _batcher: Batcher | None = None
 _ready = False
 _pool = ThreadPoolExecutor(max_workers=WORKER_THREADS, thread_name_prefix="r2t2")
@@ -657,7 +658,7 @@ _sessions = asyncio.Semaphore(MAX_SESSIONS)
 
 def _load_runtime() -> None:
     """Load model and VAD, then warm up. Replaced wholesale in tests."""
-    global _engine, _vad, _batcher
+    global _engine, _vad, _batcher, _aligner
     from r2t2 import R2T2ASRModel
 
     asr = R2T2ASRModel.LLM(model=MODEL_PATH, gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
@@ -667,6 +668,12 @@ def _load_runtime() -> None:
     asr.model = _batcher
     _engine = Engine(asr)
     _vad = VadFactory(VAD_MODEL_PATH)
+    if ALIGNER_PATH and os.path.isdir(ALIGNER_PATH):
+        # After vLLM, whose startup check needs the free memory this would take.
+        _aligner = Aligner(ALIGNER_PATH, ALIGNER_DEVICE)
+        _aligner.align(np.zeros(SR, dtype=np.float32), "你好", "Chinese")
+    else:
+        log.warning("forced aligner not found at %r; segments stay pause-cut", ALIGNER_PATH)
     # First inference JIT-compiles kernels (cached on EFS via CUDA_CACHE_PATH);
     # absorb it before the pod is Ready, on both block sizes.
     started = time.monotonic()
@@ -800,6 +807,216 @@ def _tuned_policy(raw, default: SegmentPolicy) -> SegmentPolicy:
 
 
 RESPONSE_FORMATS = ("json", "text", "verbose_json", "srt", "vtt")
+TIMESTAMP_GRANULARITIES = ("word", "segment")
+
+
+# --- forced alignment: word times, and sentence segments built from them ---
+
+# Qwen3-ForcedAligner-0.6B. Upload segments are cut at pauses for recognition
+# and stay 10-30 s long, which is right for accuracy and wrong for subtitles:
+# a 7 s clip with three sentences came back as one cue. The aligner puts a
+# time on every word of the recognised text; sentences are then cut at the
+# text's own punctuation. Measured on a 32 GB card: ~30 ms per 12 s segment on
+# GPU (0.15 s per minute of audio) for 2.4 GiB of memory; ~1.4 s per segment on
+# CPU. Disabled when the path is empty or missing.
+ALIGNER_PATH = os.getenv("ASR_ALIGNER_PATH", "/models/Qwen3-ForcedAligner-0.6B")
+ALIGNER_DEVICE = os.getenv("ASR_ALIGNER_DEVICE", "cuda")
+# Sentence ends: CJK and ASCII terminal marks, optionally followed by closing
+# quotes or brackets, so "3.5" and "e.g" stay whole.
+# ASCII marks count only before whitespace or the end: inside a token
+# ("10:00-11:00", "a,b") they would split one aligned word in two.
+_CLOSE = "”’\"'）)】」』》"
+_SENTENCE_END = re.compile(rf"[。！？；…]+[{_CLOSE}]*|[.!?;]+[{_CLOSE}]*(?=\s|$)")
+_CLAUSE_END = re.compile(rf"[，、：—]+[{_CLOSE}]*|[,:]+[{_CLOSE}]*(?=\s|$)")
+# Within an over-long clause, a gap this long between words also ends a cue.
+CUE_PAUSE_SECONDS = 0.4
+# "St. Petersburg" is not two sentences.
+_ABBREVIATIONS = {"mr", "mrs", "ms", "dr", "st", "jr", "sr", "prof", "vs", "etc", "no", "mt"}
+# R2T2 often punctuates a run of sentences with commas, so a "sentence" can be
+# 30-50 s. Past this a cue is split again at clause marks; ~7 s is the usual
+# ceiling for one subtitle.
+MAX_CUE_SECONDS = float(os.getenv("ASR_MAX_CUE_SECONDS", "7"))
+
+
+class Aligner:
+    """Qwen3-ForcedAligner behind one lock: one GPU forward at a time, ~30 ms each."""
+
+    def __init__(self, path: str, device: str):
+        import torch
+        from qwen_asr import Qwen3ForcedAligner
+
+        self._torch = torch
+        dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
+        self._fa = Qwen3ForcedAligner.from_pretrained(path, dtype=dtype, device_map=device)
+        self._lock = threading.Lock()
+
+    def tokenize(self, text: str) -> list[str]:
+        """The units align() returns times for: CJK characters and Latin words."""
+        return self._fa.aligner_processor.tokenize_space_lang(text)
+
+    def align(self, audio: np.ndarray, text: str, language: str) -> list[tuple[str, float, float]]:
+        with self._lock, self._torch.inference_mode():
+            result = self._fa.align(audio=(audio, SR), text=text, language=language)[0]
+        return [(i.text, float(i.start_time), float(i.end_time)) for i in result.items]
+
+
+def clip_to_speech(words: list[dict], spans: list[tuple[float, float]]) -> list[dict]:
+    """End a word at the pause it runs into.
+
+    The aligner places no silence between sentences: a sentence-final word
+    ends where the next sentence starts ("terms" 14.56-16.16 s across a 0.6 s
+    gap), so its cue overlapped the pause. A word whose end lies past the end
+    of the VAD speech span it starts in, and past the start of the next span,
+    is cut back to that span's end.
+    """
+    out = []
+    for w in words:
+        end = w["end"]
+        for (a, b), nxt in zip(spans, spans[1:] + [(float("inf"), 0.0)]):
+            if a - 0.05 <= w["start"] < b and end > nxt[0] and end > b:
+                end = round(max(w["start"], b), 3)
+                break
+        out.append({**w, "end": end})
+    return out
+
+
+def fix_zero_spans(words: list[dict]) -> list[dict]:
+    """Place the aligner's zero-length words right after the word before them.
+
+    The aligner gives some words a zero-length span (upstream Qwen3-ASR #197),
+    and a sentence-final one can land seconds late, next to the following
+    sentence -- "officers" at 8.48 s after "police" ended at 4.08 s -- which
+    stretched the cue across the pause. Such a word gets the typical word
+    length, starting where the previous one ended.
+    """
+    lengths = sorted(w["end"] - w["start"] for w in words if w["end"] > w["start"])
+    typical = lengths[len(lengths) // 2] if lengths else 0.25
+    out: list[dict] = []
+    for k, w in enumerate(words):
+        if w["end"] <= w["start"]:
+            start = out[-1]["end"] if out else w["start"]
+            nxt = next((x["start"] for x in words[k + 1:] if x["end"] > x["start"]), None)
+            end = start + typical if nxt is None else min(start + typical, max(start, nxt))
+            w = {**w, "start": round(start, 3), "end": round(end, 3)}
+        out.append(w)
+    return out
+
+
+def tidy_words(words: list[dict], spans: list[tuple[float, float]]) -> list[dict]:
+    return fix_zero_spans(clip_to_speech(words, spans))
+
+
+def _split_at(pattern: re.Pattern, text: str) -> list[str]:
+    out, start = [], 0
+    for m in pattern.finditer(text):
+        out.append(text[start:m.end()])
+        start = m.end()
+    if text[start:].strip():
+        out.append(text[start:])
+    elif out:
+        out[-1] += text[start:]
+    return out
+
+
+def split_sentences(text: str) -> list[str]:
+    """Sentences of `text` with their punctuation; concatenated they give `text` back."""
+    out: list[str] = []
+    for part in _split_at(_SENTENCE_END, text):
+        last = re.findall(r"([A-Za-z]+)\.\s*$", part)
+        if out and out[-1].endswith("\x00"):
+            out[-1] = out[-1][:-1] + part
+        else:
+            out.append(part)
+        if last and last[0].lower() in _ABBREVIATIONS:
+            out[-1] += "\x00"  # join the next part onto this one
+    return [p.rstrip("\x00") for p in out]
+
+
+def _split_at_pauses(clause: str, span: list[dict], tokenize) -> list[tuple[str, list[dict]]]:
+    """Cut a clause where its words pause; text is cut between the words."""
+    cuts = [k for k in range(1, len(span))
+            if span[k]["start"] - span[k - 1]["end"] >= CUE_PAUSE_SECONDS]
+    if not cuts:
+        return [(clause, span)]
+    # Cut each piece just before the first character of its first word, so
+    # punctuation and spaces stay with the words before them.
+    starts, p = [], 0
+    for k in cuts:
+        while p < len(clause) and len(tokenize(clause[:p + 1])) <= k:
+            p += 1
+        starts.append(p)
+    bounds = [0] + starts + [len(clause)]
+    return [(clause[bounds[j]:bounds[j + 1]], span[([0] + cuts)[j]:(cuts + [len(span)])[j]])
+            for j in range(len(bounds) - 1)]
+
+
+def sentence_segments(text: str, words: list[dict], tokenize,
+                      max_cue: float = MAX_CUE_SECONDS) -> list[dict] | None:
+    """Subtitle-sized segments of `text`, timed by their first and last word.
+
+    A segment is a sentence, or, for a sentence longer than `max_cue`, a run of
+    its clauses packed up to that length. Words are the aligner's units in
+    order; each piece of text takes as many as it tokenizes into. None if the
+    two do not line up, so the caller keeps the pause-cut segments instead of
+    mislabelling every cue after a mismatch.
+    """
+    pieces = []  # (text, start, end, ends_sentence)
+    i = 0
+    for sentence in split_sentences(text):
+        clauses = _split_at(_CLAUSE_END, sentence)
+        for k, clause in enumerate(clauses):
+            n = len(tokenize(clause))
+            last = k == len(clauses) - 1
+            if n == 0:
+                if pieces:  # stray punctuation belongs to the piece before
+                    t, a, b, e = pieces[-1]
+                    pieces[-1] = (t + clause, a, b, e or last)
+                continue
+            if i + n > len(words):
+                return None
+            span = words[i:i + n]
+            i += n
+            subs = _split_at_pauses(clause, span, tokenize) \
+                if span[-1]["end"] - span[0]["start"] > max_cue else [(clause, span)]
+            for k2, (t, sp) in enumerate(subs):
+                pieces.append((t, sp[0]["start"], max(w["end"] for w in sp),
+                               last and k2 == len(subs) - 1))
+    if i != len(words):
+        return None
+
+    segments: list[dict] = []
+    cue = None
+    for text_, start, end, ends_sentence in pieces:
+        if cue is not None and end - cue["start"] > max_cue:
+            segments.append(cue)
+            cue = None
+        if cue is None:
+            cue = {"id": len(segments), "start": start, "end": end, "text": text_}
+        else:
+            cue["text"] += text_
+            cue["end"] = max(cue["end"], end)
+        if ends_sentence:
+            segments.append(cue)
+            cue = None
+    if cue is not None:
+        segments.append(cue)
+    for k, seg in enumerate(segments):
+        seg["id"], seg["text"] = k, seg["text"].strip()
+    return segments
+
+
+async def align_words(audio: np.ndarray, ranges: list[tuple[int, int]],
+                      texts: list[str], languages: list[str | None]) -> list[dict]:
+    """Word times across the whole upload, one aligner call per recognised segment."""
+    words: list[dict] = []
+    for (a, b), text, lang in zip(ranges, texts, languages):
+        if not text:
+            continue
+        items = await _run(_aligner.align, audio[a:b], text, lang or "Chinese")
+        offset, end = a / SR, b / SR
+        words += [{"word": w, "start": round(min(offset + s, end), 3),
+                   "end": round(min(offset + e, end), 3)} for w, s, e in items]
+    return words
 
 
 def _timestamp(seconds: float, sep: str) -> str:
@@ -829,11 +1046,15 @@ async def transcriptions(file: UploadFile = File(...), model: str = Form(""),
                          language: str = Form(""), prompt: str = Form(""),
                          response_format: str = Form("json"), stream: bool = Form(False),
                          temperature: float = Form(0.0),
+                         timestamp_granularities: list[str] | None = Form(
+                             None, alias="timestamp_granularities[]"),
                          x_policy: str = Form(""), x_step_ms: str = Form("")):
     """OpenAI /v1/audio/transcriptions.
 
     `model` and `temperature` are accepted and ignored: one model, greedy
-    decoding. `prompt` is passed to R2T2 as context. `x_*` fields are tuning
+    decoding. `prompt` is passed to R2T2 as context. With the aligner loaded,
+    verbose_json / srt / vtt segments are sentences, and
+    timestamp_granularities[]=word adds `words`. `x_*` fields are tuning
     knobs honoured only with ASR_ALLOW_TUNING=1.
     """
     if not (_ready and _alive()):
@@ -846,6 +1067,20 @@ async def transcriptions(file: UploadFile = File(...), model: str = Form(""),
         return _error_response(ApiError(
             "stream is only supported with response_format json or text",
             "invalid_value", "stream"))
+    granularities = set(timestamp_granularities or ["segment"])
+    if timestamp_granularities is not None:
+        if response_format != "verbose_json":
+            return _error_response(ApiError(
+                "timestamp_granularities requires response_format verbose_json",
+                "invalid_value", "timestamp_granularities"))
+        if not granularities <= set(TIMESTAMP_GRANULARITIES):
+            return _error_response(ApiError(
+                f"timestamp_granularities values must be {' or '.join(TIMESTAMP_GRANULARITIES)}",
+                "invalid_value", "timestamp_granularities"))
+    if "word" in granularities and _aligner is None:
+        return _error_response(ApiError(
+            "Word timestamps need the forced aligner, which this deployment does not load",
+            "unsupported_value", "timestamp_granularities"))
     audio = await _run(decode_audio, await file.read())
     if audio is None or len(audio) == 0:
         return _error_response(ApiError("Could not decode the uploaded audio.",
@@ -853,7 +1088,8 @@ async def transcriptions(file: UploadFile = File(...), model: str = Form(""),
     duration = len(audio) / SR
     policy = _tuned_policy(x_policy, FILE_POLICY)
     step_ms = int(x_step_ms) if ALLOW_TUNING and x_step_ms else FILE_STEP_MS
-    ranges = segment_bounds(duration, await _run(_vad.speech_spans, audio), policy)
+    spans = await _run(_vad.speech_spans, audio)
+    ranges = segment_bounds(duration, spans, policy)
     lang = _language(language)
     gate = asyncio.Semaphore(FILE_SEGMENT_CONCURRENCY)
 
@@ -902,11 +1138,148 @@ async def transcriptions(file: UploadFile = File(...), model: str = Form(""),
         return {"text": text, "usage": usage}
     segments = [{"id": i, "start": round(a / SR, 2), "end": round(b / SR, 2), "text": t}
                 for i, ((a, b), t) in enumerate(zip(ranges, texts)) if t]
+    words = None
+    if _aligner is not None:
+        try:
+            words = tidy_words(await align_words(audio, ranges, texts, [l for _, l in results]),
+                               spans)
+        except Exception:
+            log.exception("forced alignment failed")
+            if "word" in granularities:
+                return _error_response(ApiError(
+                    "Word alignment failed.", "alignment_failed",
+                    kind="server_error", status=500))
+        if words is not None:
+            sentences = sentence_segments(text, words, _aligner.tokenize)
+            if sentences is not None:
+                segments = sentences
+            else:
+                log.warning("sentence split did not match aligned words; keeping pause cuts")
     if response_format in ("srt", "vtt"):
         return PlainTextResponse(_subtitles(segments, response_format))
-    return {"task": "transcribe", "language": (detected or "").lower() or None,
-            "duration": round(duration, 2), "text": text, "segments": segments,
-            "usage": usage}
+    body = {"task": "transcribe", "language": (detected or "").lower() or None,
+            "duration": round(duration, 2), "text": text}
+    if "word" in granularities:
+        body["words"] = words
+    if "segment" in granularities:
+        body["segments"] = segments
+    body["usage"] = usage
+    return body
+
+
+@app.post("/v1/audio/alignments")
+async def alignments(file: UploadFile = File(...), text: str = Form(...),
+                     language: str = Form(""), response_format: str = Form("json"),
+                     timestamp_granularities: list[str] | None = Form(
+                         None, alias="timestamp_granularities[]")):
+    """Forced alignment of a known script (an extension; OpenAI has no equivalent).
+
+    The words returned are the script's, never re-recognised. Audio longer than
+    ALIGN_WINDOW_S is aligned in windows cut at pauses; recognition is used
+    only to decide which part of the script falls in which window.
+    """
+    if not (_ready and _alive()):
+        return _unavailable()
+    if _aligner is None:
+        return _error_response(ApiError("Forced aligner is not loaded in this deployment",
+                                        "aligner_unavailable", kind="server_error", status=503))
+    if response_format not in ("json", "srt", "vtt"):
+        return _error_response(ApiError("response_format must be json, srt or vtt",
+                                        "invalid_value", "response_format"))
+    granularities = set(timestamp_granularities or ["segment"])
+    if not granularities <= set(TIMESTAMP_GRANULARITIES):
+        return _error_response(ApiError(
+            f"timestamp_granularities values must be {' or '.join(TIMESTAMP_GRANULARITIES)}",
+            "invalid_value", "timestamp_granularities"))
+    script = text.strip()
+    tokens = _aligner.tokenize(script)
+    if not tokens:
+        return _error_response(ApiError("text has nothing to align", "invalid_value", "text"))
+    audio = await _run(decode_audio, await file.read())
+    if audio is None or len(audio) == 0:
+        return _error_response(ApiError("Could not decode the uploaded audio.",
+                                        "invalid_audio", "file"))
+    duration = len(audio) / SR
+    lang = _language(language) or ("Chinese" if any(_is_cjk(c) for c in script) else "English")
+    try:
+        windows = await _script_windows(audio, tokens, lang)
+        words = []
+        for (a, b), (i, j) in windows:
+            if i == j:
+                continue
+            items = await _run(_aligner.align, audio[a:b], " ".join(tokens[i:j]), lang)
+            words += [{"word": w, "start": round(min(a / SR + s, b / SR), 3),
+                       "end": round(min(a / SR + e, b / SR), 3)} for w, s, e in items]
+        words = tidy_words(words, await _run(_vad.speech_spans, audio))
+    except EngineDead:
+        return _unavailable()
+    segments = sentence_segments(script, words, _aligner.tokenize)
+    if segments is None:  # cannot happen when words come from tokens; guard anyway
+        return _error_response(ApiError("Alignment did not cover the script.",
+                                        "alignment_failed", kind="server_error", status=500))
+    if response_format in ("srt", "vtt"):
+        return PlainTextResponse(_subtitles(segments, response_format))
+    body: dict = {"duration": round(duration, 2), "language": _iso(lang), "text": script}
+    if "segment" in granularities:
+        body["segments"] = segments
+    if "word" in granularities:
+        body["words"] = words
+    return body
+
+
+# Whole-file alignment held to within 0.1 s up to 144 s of audio and drifted by
+# up to 9 s at 217 s (the model's stated limit is 5 minutes).
+ALIGN_WINDOW_S = float(os.getenv("ASR_ALIGN_WINDOW_SECONDS", "120"))
+
+
+def _norm_token(t: str) -> str:
+    return to_simplified(t).lower()
+
+
+async def _script_windows(audio: np.ndarray, tokens: list[str], lang: str
+                          ) -> list[tuple[tuple[int, int], tuple[int, int]]]:
+    """[(sample range, script token range)] covering the audio and the script.
+
+    Up to ALIGN_WINDOW_S: one window holding everything. Longer: windows cut
+    at pauses, each recognised; the recognised words are matched against the
+    script (difflib) and each window boundary maps to the script position
+    of the nearest matched word before it.
+    """
+    n = len(audio)
+    if n <= ALIGN_WINDOW_S * SR:
+        return [((0, n), (0, len(tokens)))]
+    import difflib
+
+    spans = await _run(_vad.speech_spans, audio)
+    ranges = segment_bounds(n / SR, spans, FILE_POLICY)  # <= 30 s, for recognition
+    texts = await asyncio.gather(*[_run(transcribe_span, _engine, audio[a:b], lang)
+                                   for a, b in ranges])
+    # Group recognition ranges into windows of at most ALIGN_WINDOW_S.
+    windows, cur, rec_tokens, cuts = [], None, [], []
+    for (a, b), (t, _) in zip(ranges, texts):
+        if cur is not None and b - cur[0] > ALIGN_WINDOW_S * SR:
+            windows.append(cur)
+            cuts.append(len(rec_tokens))
+            cur = None
+        cur = (cur[0] if cur else a, b)
+        rec_tokens += [_norm_token(x) for x in _aligner.tokenize(to_simplified(t))]
+    windows.append(cur)
+    matcher = difflib.SequenceMatcher(None, rec_tokens, [_norm_token(x) for x in tokens],
+                                      autojunk=False)
+    blocks = matcher.get_matching_blocks()
+
+    def script_pos(rec_pos: int) -> int:
+        best = 0
+        for blk in blocks:
+            if blk.a + blk.size <= rec_pos:
+                best = blk.b + blk.size
+            elif blk.a < rec_pos:
+                best = blk.b + (rec_pos - blk.a)
+        return best
+
+    bounds = [0] + [script_pos(c) for c in cuts] + [len(tokens)]
+    bounds = [max(bounds[:k + 1]) for k in range(len(bounds))]  # monotonic
+    return [(w, (bounds[k], bounds[k + 1])) for k, w in enumerate(windows)]
 
 
 @app.get("/v1/models")

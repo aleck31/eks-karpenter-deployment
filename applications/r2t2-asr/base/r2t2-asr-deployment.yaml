@@ -36,6 +36,8 @@ spec:
                "/models/Confucius4-R2T2", None),
               ("FireRedTeam/FireRedVAD", "7990aaccc6b7aec1e527743bd30201f2c4a03b8c",
                "/models/FireRedVAD", ["Stream-VAD/*"]),
+              ("Qwen/Qwen3-ForcedAligner-0.6B", "c7cbfc2048c462b0d63a45797104fc9db3ad62b7",
+               "/models/Qwen3-ForcedAligner-0.6B", None),
           ]
           for repo, rev, path, patterns in WANT:
               marker = os.path.join(path, ".revision")
@@ -71,6 +73,11 @@ spec:
           value: /models/Confucius4-R2T2
         - name: VAD_MODEL_PATH
           value: /models/FireRedVAD/Stream-VAD
+        # Word timestamps and sentence-level segments for verbose_json / srt /
+        # vtt. Adds ~2.4 GiB of GPU memory (weights + a CUDA context in this
+        # process); set ASR_ALIGNER_PATH to "" to run without it.
+        - name: ASR_ALIGNER_PATH
+          value: /models/Qwen3-ForcedAligner-0.6B
         # KV cache sized in bytes; ~28k tokens. Measured footprint with it:
         # 9.56 GiB loaded, 9.57 GiB at 8 concurrent streams.
         - name: R2T2_KV_CACHE_GIB

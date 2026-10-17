@@ -3,7 +3,9 @@
 基于网易有道 [Confucius4-R2T2](https://github.com/netease-youdao/Confucius4-R2T2)
 （Qwen3-ASR 架构、为流式重新训练）的语音识别服务，提供 OpenAI Audio API 的
 `/v1/audio/transcriptions` 与 Realtime API（GA）转写会话。实时与批处理共用
-同一个模型与同一条流式推理路径，单进程、约 9.6 GB 显存。
+同一个模型与同一条流式推理路径，单进程、约 9.6 GB 显存；另加载强制对齐模型
+（Qwen3-ForcedAligner-0.6B，约 2.4 GB），用于词级时间戳、字幕粒度的段和
+`/v1/audio/alignments`。
 
 接口、事件与错误码见 [api-reference.md](api-reference.md)。
 
@@ -31,6 +33,8 @@ applications/r2t2-asr/
                       └ WS   /v1/realtime ─────────────┤ Session（每路一个）
                                                        │  └ R2T2 streaming_transcribe（官方实现，原样调用）
                                                        └ Batcher → vllm.LLM.generate（多路合并为一次批调用）
+                      ├ POST /v1/audio/alignments ── Qwen3-ForcedAligner（同进程，GPU）
+                      └ verbose_json / srt / vtt 识别后再对齐一遍，切成字幕粒度
 ```
 
 - **推理算法用官方实现**：`R2T2ASRModel.streaming_transcribe` / `finish_streaming_transcribe`
@@ -53,6 +57,10 @@ applications/r2t2-asr/
 | `R2T2_KV_CACHE_GIB` | 3 | 约 28k token；按字节设置，占用不随显卡型号变化 |
 | `R2T2_GPU_MEMORY_UTILIZATION` | 0.3 | 设了 KV 字节数后只作启动门槛 |
 | `ASR_MAX_SESSIONS` | 16 | 超出时 WebSocket 以 1013 关闭 |
+| `ASR_ALIGNER_PATH` | `/models/Qwen3-ForcedAligner-0.6B` | 对齐模型目录；置空则不加载，`segments` 退回识别段 |
+| `ASR_ALIGNER_DEVICE` | `cuda` | GPU 上每 12 秒段约 30 ms、占约 2.4 GB；`cpu` 不占显存但每段约 1.4 秒 |
+| `ASR_MAX_CUE_SECONDS` | 7 | 字幕段上限，超出的句子按逗号或停顿再切 |
+| `ASR_ALIGN_WINDOW_SECONDS` | 120 | `/alignments` 超过此长度分窗。整段对齐 144 秒内误差 < 0.1 秒，217 秒处漂移约 9 秒 |
 
 **为什么要切段**：R2T2 每块都把整段从头重新喂一遍，段越长计算越多，且长段在
 FLEURS 上会整句漏识别（60 s 段三个文件里两次）。段太短则缺上下文，零碎错误增多。
@@ -71,7 +79,7 @@ FLEURS 上会整句漏识别（60 s 段三个文件里两次）。段太短则�
 
 | 依赖 | 说明 |
 |------|------|
-| GPU NodePool | 见 `gpu/deployment-guide.md`；显存 ≥ 12 GB，与其他服务共卡时需 Time-Slicing |
+| GPU NodePool | 见 `gpu/deployment-guide.md`；显存 ≥ 14 GB（含对齐模型），与其他服务共卡时需 Time-Slicing |
 | 模型存储 | 一个 RWX 的 PVC（如 EFS），在 overlay 中指定，存放权重与驱动 JIT 缓存 |
 | AWS Load Balancer Controller | Ingress 在 ALB 上监听 8000 |
 
@@ -117,6 +125,17 @@ kubectl apply -k overlays/<env-name>
 - 长段测试素材是把 8 句不同说话人的录音拼接而成，句间音量差最大超过 50 dB；
   漏句几乎都发生在小声句紧跟大声句的位置。真实的连续录音少有这种落差，
   长音频的结论需用真实会议录音复核。
+
+**字幕时间**（同一批长段，句间为 0.6 秒数字静音，作为句界真值）：
+
+| | 中文 3 个文件 | 英文 3 个文件 |
+|---|---|---|
+| 转写 `srt`：跨越句间静音的字幕条 | 0 / 38 | 1 / 41 |
+| `/alignments`（FLEURS 参考文本）：跨越的字幕条 | 0 / 38 | 3 / 39 |
+| 落在静音里的词（转写 / 对齐） | 0 / 790，0 / 767 | 0 / 471，1 / 476 |
+
+FLEURS 英文参考文本与实际读法有出入（如写 `nineteen` 读 `19`），对齐在这些位置附近偏差较大。
+修正前：识别段每段 11-13 秒，7.3 秒三句话为一条。
 
 ## 许可
 
