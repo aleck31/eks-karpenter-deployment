@@ -198,6 +198,12 @@ TTS 的共性。adapter 用 `pysbd` 切句并贪心打包到 `MAX_SEGMENT_CHARS`
 合成后以 `SEGMENT_PAUSE_MS`（250ms）静音拼接，调用方不必自行切分。分句数见
 `X-Breeze-Segments` 响应头。
 
+**不要为了细粒度时间戳调小 `MAX_SEGMENT_CHARS`。** 打包不只是规避上下文上限，
+也是韵律决策：按句合成后固定 250ms 静音会替掉模型自己产生的停顿，各句还失去彼此的
+韵律上下文。实测同一段 207 字文本，按句合成与打包的总时长只差 1%（29.65s / 29.93s），
+客观指标分辨不出，但听感明显更差。因此段边界必然横跨数句，细粒度标记要靠事后对齐
+从音频导出，归属与接口形状见 `r2t2-asr` 的 `POST /v1/audio/alignments`。
+
 分句用 `pysbd` 而非自行实现：手写规则在 `3.14 和 e 是 2.718。`、`Dr. Smith went
 to Washington.`、`Version 1.2.3 shipped on Jan. 5.` 这类输入上都会切错。
 `pysbd` 对中英混排在 `language="zh"` 与 `"en"` 下输出一致，无需语言检测。

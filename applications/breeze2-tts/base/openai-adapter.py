@@ -171,6 +171,12 @@ SEED_DEFAULT = 42
 #
 # Segmenting also shortens first-audio latency on long input, since only the
 # first segment has to be generated before bytes start flowing.
+#
+# Do not lower this to obtain finer timing marks. Packing is a prosody decision
+# as much as a context-limit one: synthesising per sentence replaces the pause
+# the model would have produced with a fixed one and drops the prosodic context
+# between neighbours. Measured on 207 characters, per-sentence and packed differ
+# by 1% in total duration (29.65s / 29.93s) yet sound clearly worse.
 MAX_SEGMENT_CHARS = 160
 # Silence inserted between segments that were split at a sentence boundary. A
 # forced split inside a sentence gets none -- a pause there would be audible as
