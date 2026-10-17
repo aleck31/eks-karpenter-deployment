@@ -821,6 +821,10 @@ TIMESTAMP_GRANULARITIES = ("word", "segment")
 # CPU. Disabled when the path is empty or missing.
 ALIGNER_PATH = os.getenv("ASR_ALIGNER_PATH", "/models/Qwen3-ForcedAligner-0.6B")
 ALIGNER_DEVICE = os.getenv("ASR_ALIGNER_DEVICE", "cuda")
+# PyTorch keeps freed blocks cached: after a few 150 s windows this process
+# held 5.6 GiB of GPU memory against 2.4 GiB at load, on a card shared with
+# other tenants and not isolated. Cache above this is returned after a call.
+ALIGNER_KEEP_GIB = float(os.getenv("ASR_ALIGNER_KEEP_GIB", "2.5"))
 # Sentence ends: CJK and ASCII terminal marks, optionally followed by closing
 # quotes or brackets, so "3.5" and "e.g" stay whole.
 # ASCII marks count only before whitespace or the end: inside a token
@@ -856,7 +860,12 @@ class Aligner:
 
     def align(self, audio: np.ndarray, text: str, language: str) -> list[tuple[str, float, float]]:
         with self._lock, self._torch.inference_mode():
-            result = self._fa.align(audio=(audio, SR), text=text, language=language)[0]
+            try:
+                result = self._fa.align(audio=(audio, SR), text=text, language=language)[0]
+            finally:
+                cuda = self._torch.cuda
+                if cuda.is_available() and cuda.memory_reserved() > ALIGNER_KEEP_GIB * 2**30:
+                    cuda.empty_cache()
         return [(i.text, float(i.start_time), float(i.end_time)) for i in result.items]
 
 
@@ -1228,8 +1237,10 @@ async def alignments(file: UploadFile = File(...), text: str = Form(...),
 
 
 # Whole-file alignment held to within 0.1 s up to 144 s of audio and drifted by
-# up to 9 s at 217 s (the model's stated limit is 5 minutes).
-ALIGN_WINDOW_S = float(os.getenv("ASR_ALIGN_WINDOW_SECONDS", "120"))
+# up to 9 s at 217 s (the model's stated limit is 5 minutes). Activation memory
+# grows with the window (2.25 GiB peak at 72 s, 2.78 at 144 s), so it is kept
+# well inside the accurate range.
+ALIGN_WINDOW_S = float(os.getenv("ASR_ALIGN_WINDOW_SECONDS", "90"))
 
 
 def _norm_token(t: str) -> str:

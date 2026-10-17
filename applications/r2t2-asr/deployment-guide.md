@@ -60,7 +60,8 @@ applications/r2t2-asr/
 | `ASR_ALIGNER_PATH` | `/models/Qwen3-ForcedAligner-0.6B` | 对齐模型目录；置空则不加载，`segments` 退回识别段 |
 | `ASR_ALIGNER_DEVICE` | `cuda` | GPU 上每 12 秒段约 30 ms、占约 2.4 GB；`cpu` 不占显存但每段约 1.4 秒 |
 | `ASR_MAX_CUE_SECONDS` | 7 | 字幕段上限，超出的句子按逗号或停顿再切 |
-| `ASR_ALIGN_WINDOW_SECONDS` | 120 | `/alignments` 超过此长度分窗。整段对齐 144 秒内误差 < 0.1 秒，217 秒处漂移约 9 秒 |
+| `ASR_ALIGN_WINDOW_SECONDS` | 90 | `/alignments` 超过此长度分窗。整段对齐 144 秒内误差 < 0.1 秒，217 秒处漂移约 9 秒；窗越长激活显存越大 |
+| `ASR_ALIGNER_KEEP_GIB` | 2.5 | 对齐后 PyTorch 显存缓存超过此值即归还。不归还时几次长窗对齐后从 2.4 涨到 5.6 GiB |
 
 **为什么要切段**：R2T2 每块都把整段从头重新喂一遍，段越长计算越多，且长段在
 FLEURS 上会整句漏识别（60 s 段三个文件里两次）。段太短则缺上下文，零碎错误增多。

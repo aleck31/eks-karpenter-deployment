@@ -124,7 +124,10 @@ spec:
         resources:
           requests:
             cpu: "1"
-            memory: 4Gi
+            # Resident memory measured at 6.7 GiB with the aligner loaded
+            # (server 4.3 + vLLM engine 4.0); the rest of the limit is page
+            # cache from reading weights, which the kernel reclaims.
+            memory: 8Gi
             nvidia.com/gpu: 1
           limits:
             # Feature extraction for every chunk, FireRed VAD and the
