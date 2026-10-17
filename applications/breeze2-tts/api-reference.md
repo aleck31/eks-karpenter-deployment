@@ -8,12 +8,18 @@
 错误体为 OpenAI 格式。已用 `openai` Python SDK **3.31.0** 实测 `audio.speech.create`
 （含 `with_streaming_response`、`stream_format` audio/sse）与 `audio.voices.create`。
 可直接 `OpenAI(base_url="http://<host>:8880/v1", api_key="<任意>")`。
-与 OpenAI 的差异见「与 OpenAI 的差异」；其余端点（声纹查询/更新/删除/试听、临时克隆、
-忙闲状态）为本服务扩展。
+与 OpenAI 的差异见「与 OpenAI 的差异」；其余端点（声纹查询/更新/删除/试听、
+临时克隆）为本服务扩展。
 
 > 不兼容变更：早期版本的字段已移除——`stream` → `stream_format`，
 > `voice_description` → `instructions`，注册字段 `audio` → `audio_sample`、`voice_id` 改为可选，
 > 错误体不再含 `detail`，未知声纹由 404 改为 400。
+>
+> 换用 vLLM-Omni 后端时又移除了三项，**均为本服务此前的扩展，规范中没有对应物**：
+> 端点 `/v1/audio/speech/status`、响应头 `X-Queue-Wait` / `X-Queue-Depth` /
+> `X-Retry-After-Seconds`、错误码 `backend_busy`(429) 与 `backend_lock_stuck`(503)。
+> 后端自行排队，不再有忙时拒绝，故三者都失去了意义。按 `Retry-After` 重试的客户端
+> 代码不会报错，只是不再被触发。
 
 Breeze 特有的两个声纹属性：
 
@@ -22,15 +28,25 @@ Breeze 特有的两个声纹属性：
 | `ref_text` | 声纹属性（注册/更新时提供） | Breeze 从「参考音频 + 其准确文字稿」成对克隆。注册时未给则调用 `ASR_TRANSCRIBE_URL` 自动转写；转写不可用时必填 |
 | `seed` | 声纹属性，也可在单次请求覆盖 | 采样种子，取值 **0–4294967295**。固定后端 deploy 配置的前提下可复现，用于选定并锁住满意的音色 |
 
-注册时若不指定 `seed`，写入后端默认值 **42**（`breeze_infer.api` 的
-`seed: int = Form(42)`）。显式写入而非留空，是因为留空并不等于"不固定种子" ——
-输出仍然是 seeded 的，只是那个值藏在后端函数签名里而不在 registry 里；
-上游一旦改动该默认值，所有声纹的音色都会变而无从追溯。
+注册时若不指定 `seed`，写入 **42**（与 deploy 配置
+`default_sampling_params.seed` 一致）。显式写入而非留空，是因为留空并不等于
+"不固定种子" —— 输出仍然是 seeded 的，只是那个值藏在后端配置里而不在 registry
+里；一旦改动该默认值，所有声纹的音色都会变而无从追溯。
 
-`seed` 上界来自后端 `set_all_seeds()` 同时播种的四个 RNG 中最窄的一个：numpy 的
-legacy MT19937 只接受无符号 32 位，先于 torch 抛异常（torch 本身文档化范围是
-`[-2**63, 2**64-1]` 且负数会被映射，但这段余量在此不可达）。超范围由 adapter
-返回 400 并说明边界，不会落到后端变成 500。
+`seed` 上界 `2**32-1` 由 adapter 校验，超范围返回 400 并说明边界，不会落到后端
+变成 500。该上界是沿用值：vLLM 的采样器接受更宽的范围，但收窄它可以保证此前
+从多个候选里挑定的 seed 继续有效。
+
+**同一 seed 的输出在 2026-10-17 变过一次。** 后端从 Breeze 自带的参考实现换为
+vLLM-Omni，采样器不同，同一 `(声纹, 文本, seed)` 走的是另一条采样轨迹 ——
+实测同一段文本在旧实现下 18.16s、新实现下 15.68s。参考音频决定说话人，故**音色
+不变**，变的是"哪一次 take"。换用后在新后端内部仍可复现（同输入同 seed 两次字节
+完全一致）。
+
+影响只有一处：**若按 `(声纹, 文本, seed)` 缓存音频，那些缓存与重新生成的结果不
+一致，且 `updated_at` 不会变**（registry 未改动，变的是后端）。需要一致性的话
+清一次缓存；混存也可以，听感上是同一个人。另外当初从多个 seed 里试听挑定音色的
+场景，那个 seed 现在指向不同的 take，值得重新试听。
 
 ## 合成
 
@@ -232,7 +248,7 @@ curl -X PUT http://<host>:8880/v1/audio/voices/norman08 \
 
 | 字段 | 用途 |
 |------|------|
-| `updated_at` | 参考音频、`ref_text`、`seed` 任一变动都会刷新。客户端把它并入合成缓存键即可自动失效 |
+| `updated_at` | 参考音频、`ref_text`、`seed` 任一变动都会刷新。客户端把它并入合成缓存键即可自动失效。**例外**：后端实现变更不会刷新它（见「Breeze 特有的声纹属性」中 seed 一节），那种情况需手动清缓存 |
 | `sample_sha256` | 参考音频的内容哈希。按体积做键时，等长替换不会变化，按哈希则必然变化 |
 | `ready` | `ref_text` 与参考音频同时就位才为 true |
 
@@ -318,4 +334,8 @@ OpenAI 格式。`type` 由状态码决定：429 为 `rate_limit_error`，5xx 为
 - `speed` 仅支持 1.0。
 - SSE 的 `usage` 无真实 token：`input_tokens` 为输入字符数，`output_tokens` 为 0。
 - Create voice 的 `consent` 不校验；Breeze 克隆需要文字稿，故多了 `ref_text`（可自动转写）。
-- 后端同时处理 4 个请求，超出者排队（见「并发」）。
+- 后端同时处理 4 个请求，超出者排队（见「并发」）。本服务不限流，因此不返回
+  429，也不提供 OpenAI 的 `x-ratelimit-*` 响应头与 `x-request-id`。官方 SDK
+  不依赖它们：实测 `openai` 3.24.0 的 `audio.speech.create`、
+  `with_streaming_response`、`with_raw_response`、`models.list` 均正常，
+  `response.request_id` 为 `None` 不影响调用。
