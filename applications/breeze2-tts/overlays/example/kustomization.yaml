@@ -24,6 +24,12 @@ patches:
       - op: replace
         path: /spec/template/spec/volumes/0/persistentVolumeClaim/claimName
         value: your-models-pvc
+      # 可选：注册声纹时自动转写 ref_text 的 OpenAI 兼容 ASR
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: ASR_TRANSCRIBE_URL
+          value: http://your-asr-service/v1/audio/transcriptions
   # ALB：入站来源限制；不设则控制器托管的安全组默认放开 0.0.0.0/0。
   # 多个服务共享一个 ALB 时再加 alb.ingress.kubernetes.io/group.name。
   - target:

@@ -1,10 +1,5 @@
 # VoxCPM2 TTS - OpenAI 兼容 TTS 服务
 
-> 同一 ALB 的 :8880 一个 listen-port 只能由一个 Ingress 声明，本模块与
-> `applications/breeze2-tts` 不能同时挂载 Ingress。两者共用 `/shared/voices`
-> 下的同一份 `registry.json`；breeze2-tts 额外要求每个声纹带 `ref_text`
-> （参考音频的准确文字稿），该字段本模块会忽略。
-
 基于 VoxCPM2 + Nano-vLLM 推理引擎，通过 OpenAI 兼容 adapter 对外提供 `/v1/audio/speech` 等语音合成接口。
 
 接口、字段、错误码与响应头见 [api-reference.md](api-reference.md)。
@@ -61,8 +56,8 @@ find /shared/voices -type f -exec chmod 664 {} \;
 早期版本用「无 `created_at` 即预置」推断 `builtin`，该推断仅对预置那批数据成立；若每次启动都重跑，
 任何因写入中断而缺 `created_at` 的用户声纹都会被永久标为预置并锁进 403。
 
-> 模型存储复用 qwen3-speech 模块的 `qwen3-models-pvc`，
-> 需先部署 `applications/qwen3-speech/base/shared/`（EFS StorageClass + PVC）。
+> 模型存储与声纹目录 `/shared/voices` 放在一个 RWX PVC（如 EFS）上，名称在 overlay 中指定。
+> 同一 ALB group 内一个 listen-port 只能由一个 Ingress 声明。
 
 ## 部署
 
@@ -73,7 +68,7 @@ applications/voxcpm2-tts/
 ├── base/
 │   ├── kustomization.yaml
 │   ├── voxcpm2-tts-deployment.yaml   # Deployment + Service
-│   └── voxcpm2-tts-ingress.yaml      # ALB Ingress (group: speech-services)
+│   └── voxcpm2-tts-ingress.yaml      # ALB Ingress :8880
 ├── overlays/
 │   ├── example/                      # 入库：示例取值，供复制
 │   └── <env-name>/                   # 不入库：真实取值

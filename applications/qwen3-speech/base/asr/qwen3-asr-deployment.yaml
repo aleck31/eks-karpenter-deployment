@@ -177,7 +177,7 @@ spec:
       volumes:
       - name: models
         persistentVolumeClaim:
-          claimName: qwen3-models-pvc
+          claimName: models-pvc
       - name: adapter
         configMap:
           name: qwen3-asr-adapter

@@ -67,10 +67,6 @@ spec:
           value: "http://localhost:8000"
         - name: VOICES_DIR
           value: "/shared/voices"
-        # 注册声纹未给 ref_text 时用于自动转写（OpenAI 兼容 ASR，r2t2-asr 模块）。
-        # 置空则 ref_text 必填。
-        - name: ASR_TRANSCRIBE_URL
-          value: "http://r2t2-asr-service/v1/audio/transcriptions"
         ports:
         - containerPort: 8880
           name: http

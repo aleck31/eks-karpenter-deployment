@@ -228,8 +228,7 @@ async def transcribe_segments(audio_segments: list[bytes], server_url: str):
 
 ## 快速调用示例
 
-本环境 TTS 使用 Breeze TTS 2（见 `applications/breeze2-tts/`），以下 TTS 示例
-适用于部署了 Qwen3-TTS 的环境。
+以下 TTS 示例需部署 `base/tts` 或 `base/tts-base`。
 
 ```bash
 ALB=<ALB_DNS_NAME>  # kubectl get ingress -n <namespace> 查看实际地址

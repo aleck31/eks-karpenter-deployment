@@ -134,7 +134,7 @@ curl -s "http://<alb>:8880/v1/audio/voices" | head -c 200
 | `BREEZE_BACKEND_URL` | `http://localhost:8000` | 后端地址。后端只监听 127.0.0.1，不对外暴露 |
 | `VOICES_DIR` | `/shared/voices` | 声纹目录，与 `registry.json` 同级 |
 | `BREEZE_MODEL_ID` | `breeze-tts-2` | `/v1/models` 返回的 id |
-| `ASR_TRANSCRIBE_URL` | `http://r2t2-asr-service/v1/audio/transcriptions` | 注册声纹未给 `ref_text` 时调用的 OpenAI 兼容转写接口。不可达或置空时 `ref_text` 必填 |
+| `ASR_TRANSCRIBE_URL` | 空 | 注册声纹未给 `ref_text` 时调用的 OpenAI 兼容转写接口（`POST .../v1/audio/transcriptions`），在 overlay 中注入。未设或不可达时 `ref_text` 必填 |
 | `BREEZE_QUEUE_REJECT_SECONDS` | `0` | `0` 表示忙时立即 429 不排队；正数表示预估等待在该值以内则排队 |
 | `BREEZE_QUEUE_TIMEOUT` | `120` | 仅在启用排队时生效，限制排队者的最长等待 |
 

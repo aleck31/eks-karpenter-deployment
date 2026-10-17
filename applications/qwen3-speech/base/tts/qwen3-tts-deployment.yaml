@@ -101,7 +101,7 @@ spec:
       volumes:
       - name: models
         persistentVolumeClaim:
-          claimName: qwen3-models-pvc
+          claimName: models-pvc
 
       tolerations:
       - key: nvidia.com/gpu
