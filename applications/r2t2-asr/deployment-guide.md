@@ -3,7 +3,7 @@
 基于网易有道 [Confucius4-R2T2](https://github.com/netease-youdao/Confucius4-R2T2)
 （Qwen3-ASR 架构、为流式重新训练）的语音识别服务，提供 OpenAI Audio API 的
 `/v1/audio/transcriptions` 与 Realtime API（GA）转写会话。实时与批处理共用
-同一个模型与同一条流式推理路径，单进程、约 9.6 GB 显存；另加载强制对齐模型
+同一个模型与同一条流式推理路径，单进程、推理引擎约 8.2 GB 显存；另加载强制对齐模型
 （Qwen3-ForcedAligner-0.6B，约 2.4 GB），用于词级时间戳、字幕粒度的段和
 `/v1/audio/alignments`。
 
@@ -54,9 +54,10 @@ applications/r2t2-asr/
 | `ASR_STREAM_PAUSE_CUT_SECONDS` / `_HARD_SECONDS` | 15 / 30 | 实时、未开 server_vad |
 | `ASR_VAD_PAUSE_CUT_SECONDS` / `_HARD_SECONDS` | 0 / 30 | 实时、开 server_vad：每次 VAD 判停都切 |
 | `ASR_VAD_SILENCE_MS` | 500 | server_vad 未指定 `silence_duration_ms` 时的静音时长（OpenAI 默认值）。原先沿用 VAD 的 200 ms，逗号处就断轮，轮次碎片化 |
-| `R2T2_KV_CACHE_GIB` | 3 | 约 28k token；按字节设置，占用不随显卡型号变化 |
-| `R2T2_GPU_MEMORY_UTILIZATION` | 0.3 | 设了 KV 字节数后只作启动门槛 |
-| `ASR_MAX_SESSIONS` | 16 | 超出时 WebSocket 以 1013 关闭 |
+| `R2T2_KV_CACHE_GIB` | 1.5 | 约 14k token；按字节设置，不随显卡型号变化。30 秒段实测 474 token，8 路实时 + 8 段上传全为 30 秒时约 8.2k；低于一个 `max_model_len`（8192）vLLM 拒绝启动 |
+| `R2T2_GPU_MEMORY_UTILIZATION` | 0.27 | 设了 KV 字节数后只作启动门槛，略高于引擎实际占用 |
+| `ASR_MAX_SESSIONS` | 8 | 实时会话上限，超出时 WebSocket 以 1013 关闭 |
+| `ASR_FILE_SEGMENT_CONCURRENCY` | 8 | 所有上传与 `/alignments` 共享的在跑分段数，超出在服务内排队 |
 | `ASR_ALIGNER_PATH` | `/models/Qwen3-ForcedAligner-0.6B` | 对齐模型目录；置空则不加载，`segments` 退回识别段 |
 | `ASR_ALIGNER_DEVICE` | `cuda` | GPU 上每 12 秒段约 30 ms、占约 2.4 GB；`cpu` 不占显存但每段约 1.4 秒 |
 | `ASR_MAX_CUE_SECONDS` | 7 | 字幕段上限，超出的句子按逗号或停顿再切 |

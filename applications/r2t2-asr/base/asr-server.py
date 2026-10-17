@@ -654,6 +654,11 @@ _batcher: Batcher | None = None
 _ready = False
 _pool = ThreadPoolExecutor(max_workers=WORKER_THREADS, thread_name_prefix="r2t2")
 _sessions = asyncio.Semaphore(MAX_SESSIONS)
+# Upload segments in flight across all requests (transcriptions and
+# alignments), not per request: per request, N simultaneous uploads put 8N
+# sequences on the engine. The KV cache is sized for MAX_SESSIONS live
+# streams plus this many segments.
+_segment_gate = asyncio.Semaphore(FILE_SEGMENT_CONCURRENCY)
 
 
 def _load_runtime() -> None:
@@ -1100,10 +1105,8 @@ async def transcriptions(file: UploadFile = File(...), model: str = Form(""),
     spans = await _run(_vad.speech_spans, audio)
     ranges = segment_bounds(duration, spans, policy)
     lang = _language(language)
-    gate = asyncio.Semaphore(FILE_SEGMENT_CONCURRENCY)
-
     async def one(a: int, b: int):
-        async with gate:
+        async with _segment_gate:
             return await _run(transcribe_span, _engine, audio[a:b], lang, step_ms, prompt)
 
     tasks = [asyncio.ensure_future(one(a, b)) for a, b in ranges]
@@ -1263,8 +1266,11 @@ async def _script_windows(audio: np.ndarray, tokens: list[str], lang: str
 
     spans = await _run(_vad.speech_spans, audio)
     ranges = segment_bounds(n / SR, spans, FILE_POLICY)  # <= 30 s, for recognition
-    texts = await asyncio.gather(*[_run(transcribe_span, _engine, audio[a:b], lang)
-                                   for a, b in ranges])
+    async def recognise(a: int, b: int):
+        async with _segment_gate:
+            return await _run(transcribe_span, _engine, audio[a:b], lang)
+
+    texts = await asyncio.gather(*[recognise(a, b) for a, b in ranges])
     # Group recognition ranges into windows of at most ALIGN_WINDOW_S.
     windows, cur, rec_tokens, cuts = [], None, [], []
     for (a, b), (t, _) in zip(ranges, texts):

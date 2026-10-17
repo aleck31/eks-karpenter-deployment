@@ -78,16 +78,23 @@ spec:
         # process); set ASR_ALIGNER_PATH to "" to run without it.
         - name: ASR_ALIGNER_PATH
           value: /models/Qwen3-ForcedAligner-0.6B
-        # KV cache sized in bytes; ~28k tokens. Measured footprint with it:
-        # 9.56 GiB loaded, 9.57 GiB at 8 concurrent streams.
+        # KV cache in bytes. A request holds KV only while it runs, so the peak
+        # is (live streams + upload segments in flight) x segment length. A
+        # 30 s segment, the longest there is, measured 474 tokens (390 audio
+        # at 13/s + prompt and text), ~512 in 16-token blocks. Worst case 8
+        # streams + 8 segments, all 30 s: ~8.2k tokens. 1.5 GiB holds 14k.
+        # vLLM refuses to start below one max_model_len (8192) of KV.
         - name: R2T2_KV_CACHE_GIB
-          value: "3"
-        # Startup gate only: vLLM refuses to start unless this share of the
-        # card is free. 0.3 x 31.4 GiB = 9.4 GiB, just under the footprint.
+          value: "1.5"
+        # Startup gate only (kv_cache_memory_bytes skips profiling): vLLM
+        # refuses to start unless this share of the card is free. 0.27 of a
+        # 32 GB card is 8.5 GiB, just above the engine's 8.2 GiB.
         - name: R2T2_GPU_MEMORY_UTILIZATION
-          value: "0.3"
+          value: "0.27"
+        # Live WebSocket sessions; the next one is closed with 1013. Uploads
+        # share ASR_FILE_SEGMENT_CONCURRENCY (8) segments across all requests.
         - name: ASR_MAX_SESSIONS
-          value: "16"
+          value: "8"
         # Block size for file uploads. Swept 480-2000 ms on FLEURS through the
         # ALB (2026-10-16): accuracy flat across the range (6.3-7.5% overall,
         # 480 ms 7.06%, 2000 ms 6.53%), wall time 182.8 s -> 83.7 s for the 86
