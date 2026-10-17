@@ -52,20 +52,20 @@ applications/breeze2-tts/
 要降低本服务的显存只能减少 `--fast-*` 参数，而那会同时恶化 RTF 并使所有已注册
 声纹的 seed 失效（见「部署契约」）。
 
-**同卡余量要按各方峰值算，不是当前值。** 2026-10-17 在 32623 MiB 卡上实测：
+**同卡余量须按各负载的峰值计算。** 2026-10-17 实测（32623 MiB 卡）：
 
-| 负载 | 当前 | 峰值 | 性质 |
-|------|------|------|------|
-| 本服务 | 9176 MiB | 9176 | 固定，权重 + CUDA Graph |
-| `r2t2-asr` | 12400 MiB | 12400 | 固定，`--gpu-memory-utilization` 预分配 |
-| `klimt-ml`（immich） | 3136 MiB | 11412 | **波动**，`MACHINE_LEARNING_MODEL_TTL=3600` 闲置卸载、有请求重载 |
+| 负载 | 当前占用 | 峰值占用 | 分配方式 |
+|------|---------|---------|---------|
+| 本服务 | 9176 MiB | 9176 MiB | 固定，权重 + CUDA Graph |
+| `r2t2-asr` | 12400 MiB | 12400 MiB | 固定，`--gpu-memory-utilization` 预分配 |
+| `klimt-ml`（immich） | 3136 MiB | 11412 MiB | 动态，`MACHINE_LEARNING_MODEL_TTL=3600` 控制闲置卸载与重载 |
 
-三方峰值之和 32988 MiB > 整卡 32623，**超 365 MiB**。当前不 OOM 只因 klimt 处于
-已卸载状态。更早一次满载实测峰值 31743 MiB、余 387 MiB 不 OOM，那时 `r2t2-asr`
-是 11.2 GiB，此后增长的 1.2 GB 正好吃掉了那点余量。
+三方峰值之和为 32988 MiB，超出总容量 365 MiB。当前未发生 OOM 的原因是
+`klimt-ml` 处于模型已卸载状态。2026-10 早期一次满载测量峰值为 31743 MiB、
+余量 387 MiB，当时 `r2t2-asr` 占用 11.2 GiB，其后增长的 1.2 GB 已消耗该余量。
 
-可回收的是 `r2t2-asr` 的预算（其 KV cache 5.93 GiB 对现有负载富余），或给
-`klimt-ml` 设显存上限。本服务这一侧无从下手，理由见上一段。
+可回收的显存位于 `r2t2-asr`（其 KV cache 为 5.93 GiB，高于现有负载需要），
+或由 immich 侧为 `klimt-ml` 设置显存上限。本服务无可调项，理由同上。
 
 ## 构建
 
@@ -203,17 +203,16 @@ batch 维度已被 CFG 的正负双分支占用（`branch_batch_size = 2 if sing
 
 显存只是**变通方案的**约束：多副本每个都要完整一份约 9 GiB，无法共享。
 
-要真并发需要换服务层（vLLM-Omni 可用同一份权重做批调度，实测数据与配置选型见
-`docs/breeze-tts-serving-layer-eval.md`），当前部署未采用。
+要真并发须更换服务层。vLLM-Omni 可对同一权重实施连续批处理调度，实测数据与
+配置选型见 `docs/breeze-tts-serving-layer-eval.md`；当前部署未采用。
 
-**长文本由 adapter 分句，实测不随长度退化。** 上限来自模型自身 ——
-`config.json` 的 `max_position_embeddings = 2048`，÷ 12.5 Hz 帧率 ≈ 164 秒音频，
-而质量在触限之前就开始下降（重复片段、语速漂移），这是自回归 TTS 的共性。
-adapter 用 `pysbd` 切句并贪心打包到 `MAX_SEGMENT_CHARS`（160），逐段合成后以
-`SEGMENT_PAUSE_MS`（250ms）静音拼接，调用方不必自行切分。分句数见
-`X-Breeze-Segments` 响应头。
+**长文本由 adapter 分句，实测不随长度退化。** 上限来自模型自身：`config.json` 的
+`max_position_embeddings = 2048`，除以 12.5 Hz 帧率约为 164 秒音频，而质量在触限
+之前即开始下降（重复片段、语速漂移），为自回归 TTS 的共性。adapter 用 `pysbd`
+切句并贪心打包至 `MAX_SEGMENT_CHARS`（160），逐段合成后以 `SEGMENT_PAUSE_MS`
+（250ms）静音拼接，调用方无需自行切分。分段数见 `X-Breeze-Segments` 响应头。
 
-2048 是权重的属性而非后端实现的，换服务层也省不掉这一层：超限不报错，而是
+该上限为权重属性而非后端实现属性，更换服务层不能消除，且超限不产生错误响应而是
 静默截断。
 
 **不要为了细粒度时间戳调小 `MAX_SEGMENT_CHARS`。** 打包不只是规避上下文上限，
