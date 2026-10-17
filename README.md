@@ -73,7 +73,8 @@
 │   └── test-gpu-nvme.yaml              # GPU + NVMe 存储测试
 ├── docs/                         # 项目文档
 │   ├── karpenter-multi-ebs-best-practices.md  # Karpenter最佳实践
-│   └── oss-tts-model-latency-benchmark.md     # TTS模型延迟对比
+│   ├── oss-tts-model-latency-benchmark.md     # TTS模型延迟对比
+│   └── breeze-tts-serving-layer-eval.md       # Breeze TTS 服务层并发评估
 └── README.md                     # 项目说明文档
 ```
 
