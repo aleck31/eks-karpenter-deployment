@@ -3,7 +3,7 @@
 Implements OpenAI POST /v1/audio/speech (voice as a string or {"id"},
 instructions, response_format, stream_format audio|sse) and Create voice
 (POST /v1/audio/voices), with OpenAI error bodies. Everything else under
-/v1/audio/voices, /v1/audio/clone and /v1/audio/speech/status is an extension.
+/v1/audio/voices and /v1/audio/clone is an extension.
 
 Breeze cloning differs from OpenAI's model in two ways that surface here:
 
@@ -21,7 +21,6 @@ import contextlib
 import hashlib
 import io
 import json
-import math
 import os
 import re
 import secrets
@@ -114,6 +113,10 @@ VOICES_DIR = Path(os.getenv("VOICES_DIR", "/shared/voices"))
 
 # Breeze emits raw little-endian signed 16-bit PCM with no container.
 MODEL_ID = os.getenv("BREEZE_MODEL_ID", "breeze-tts-2")
+# What the backend calls the model, which need not match what this service
+# advertises. Set by entrypoint.sh via --served-model-name; the backend rejects
+# a request whose `model` it does not recognise.
+BACKEND_MODEL_NAME = os.getenv("BREEZE_BACKEND_MODEL", MODEL_ID)
 
 BACKEND_SAMPLE_RATE = 24000
 BACKEND_CHANNELS = 1
@@ -237,32 +240,11 @@ REF_SNR_FLOOR_DB = 20.0
 # duration before streaming starts, where the real figure is not yet knowable.
 CHARS_PER_SECOND = 3.7
 
-# Real-time factor with the deployed --fast-* combination: generating one
-# second of audio takes this long. Measured at 0.88 on an L4.
-BACKEND_RTF = 0.88
-
-# The backend serves one request at a time and answers HTTP 409 for anything
-# concurrent. Serialising here turns that into a queue rather than an error the
-# caller has to retry, but the queue is bounded: past the wait budget a caller
-# is better off being told the service is busy than blocking indefinitely.
-# The backend serves one request at a time and answers HTTP 409 for anything
-# concurrent. Serialising here turns that into a queue rather than an error the
-# caller has to retry.
-#
-# By default nothing queues: a second request is rejected the moment it arrives,
-# with Retry-After carrying the projected remaining time. Holding the connection
-# open and failing later tells the caller nothing it can act on and is
-# indistinguishable from the service hanging, which is how a one-at-a-time
-# backend ends up looking unusable.
-#
-# Raise BREEZE_QUEUE_REJECT_SECONDS to let callers wait that many projected
-# seconds instead -- useful for a batch client that would rather block than
-# retry. BACKEND_QUEUE_TIMEOUT then caps how long anyone who does queue waits.
-BACKEND_QUEUE_TIMEOUT = float(os.getenv("BREEZE_QUEUE_TIMEOUT", "120"))
-QUEUE_REJECT_SECONDS = float(os.getenv("BREEZE_QUEUE_REJECT_SECONDS", "0"))
-# A held slot is treated as abandoned past estimate x FACTOR + GRACE seconds.
-STALE_HOLDER_FACTOR = 4.0
-STALE_HOLDER_GRACE = 300.0
+# How many segments of one request may be in flight at the backend at once.
+# Matched to the deploy config's `max_num_seqs`: going past it does not fail --
+# the backend queues -- but it inflates every caller's latency without raising
+# throughput. Raise both together, never this alone.
+BACKEND_CONCURRENCY = int(os.getenv("BREEZE_BACKEND_CONCURRENCY", "2"))
 
 # Chunks buffered between the backend reader and the caller. 4KB each, so
 # this bounds the buffer at 2MB -- enough for a player consuming at realtime
@@ -270,144 +252,7 @@ STALE_HOLDER_GRACE = 300.0
 STREAM_QUEUE_CHUNKS = 512
 # How long the buffer may sit full before the consumer is presumed gone.
 CONSUMER_STALL_SECONDS = 30.0
-_SLOT_POLL_SECONDS = 0.05
 
-
-class _BackendSlot:
-    """Single-occupancy gate for the backend, with a projected wait.
-
-    Deliberately not an asyncio.Lock. `asyncio.wait_for(lock.acquire())` can
-    leave the lock held when the timeout fires in the same loop iteration the
-    acquire completes: wait_for cancels the waiter, but the lock may already
-    have been handed to it, and that ownership is then lost with no holder left
-    to release it. On a single-occupancy backend that is a permanent outage --
-    observed once here, with the GPU idle and every request answering 503 after
-    the full queue budget.
-
-    A flag checked and set with no await in between cannot leak: the loop is
-    single-threaded, so the test and the assignment are atomic with respect to
-    other coroutines, and a waiter cancelled inside the sleep never set it.
-    """
-
-    def __init__(self) -> None:
-        self._busy = False
-        self._started_at: float | None = None
-        self._estimate = 0.0
-        self._queued: list[float] = []
-
-    @property
-    def busy(self) -> bool:
-        return self._busy
-
-    @property
-    def queued(self) -> int:
-        return len(self._queued)
-
-    def _reclaim_if_stale(self) -> None:
-        """Free a slot whose holder is long gone.
-
-        The holder releases in a generator's finally, and a streaming response
-        has several ways to unwind that never run it -- notably an exception
-        while closing the backend client during GeneratorExit. One missed release
-        used to wedge the backend for the pod's lifetime, answering every
-        subsequent request as busy with the GPU idle. The grace period is
-        deliberately far past any real request so a slow synthesis is never cut
-        off; this is a floor under a bug, not a timeout.
-        """
-        if not self._busy or self._started_at is None:
-            return
-        grace = self._estimate * STALE_HOLDER_FACTOR + STALE_HOLDER_GRACE
-        if asyncio.get_event_loop().time() - self._started_at > grace:
-            self._busy = False
-            self._started_at = None
-            self._estimate = 0.0
-
-    def projected_wait(self) -> float:
-        """Seconds before a caller arriving now could start.
-
-        The in-flight request's remaining time plus everything already queued
-        ahead of the caller. Derived from the character-count estimate, so it is
-        only as good as CHARS_PER_SECOND and BACKEND_RTF -- enough to decide
-        whether queueing is worth it, not a promise.
-        """
-        self._reclaim_if_stale()
-        if not self._busy:
-            return 0.0
-        loop = asyncio.get_event_loop()
-        elapsed = loop.time() - self._started_at if self._started_at else 0.0
-        return max(0.0, self._estimate - elapsed) + sum(self._queued)
-
-    def reject_if_busy(self) -> None:
-        """Raise 429 if a caller arriving now would not be served promptly.
-
-        Called before the response starts. Raising this from inside a streaming
-        body is useless -- the 200 headers have already gone out, so the client
-        receives a successful response with an empty payload, which for mp3 is
-        an ID3 header and zero frames.
-        """
-        projected = self.projected_wait()
-        # QUEUE_REJECT_SECONDS <= 0 means never queue, which is the default.
-        if self._busy and (QUEUE_REJECT_SECONDS <= 0
-                           or projected > QUEUE_REJECT_SECONDS):
-            retry_after = max(1, math.ceil(projected))
-            raise ApiError(
-                429, "backend_busy",
-                f"Synthesis backend is busy. Breeze serves one request at a time, "
-                f"so this request was not queued. About {projected:.0f}s remain on "
-                f"the request in flight; retry after the interval in Retry-After.",
-                headers={"Retry-After": str(retry_after),
-                         "X-Queue-Depth": str(self.queued + 1),
-                         "X-Retry-After-Seconds": str(retry_after)},
-            )
-
-    async def acquire(self, timeout: float, estimate: float = 0.0) -> float:
-        """Take the slot, returning how many seconds the caller waited."""
-        loop = asyncio.get_running_loop()
-        self.reject_if_busy()
-        self._queued.append(estimate)
-        waiting_since = loop.time()
-        deadline = waiting_since + timeout
-        try:
-            while self._busy:
-                if loop.time() >= deadline:
-                    raise ApiError(
-                        503, "backend_busy",
-                        f"Synthesis backend is busy. Breeze serves one request at a "
-                        f"time; the {timeout:g}s queue budget was exhausted.",
-                        headers={"Retry-After": str(
-                            max(1, math.ceil(self.projected_wait())))},
-                    )
-                await asyncio.sleep(_SLOT_POLL_SECONDS)
-        finally:
-            # Also runs when the caller disconnects mid-wait, so someone who gave
-            # up stops inflating the projection for everyone behind them.
-            try:
-                self._queued.remove(estimate)
-            except ValueError:
-                pass
-        self._busy = True
-        self._started_at = loop.time()
-        self._estimate = estimate
-        return loop.time() - waiting_since
-
-    def release(self) -> None:
-        self._busy = False
-        self._started_at = None
-        self._estimate = 0.0
-
-
-_BACKEND_SLOT = _BackendSlot()
-
-
-def _estimate_seconds(segments: list[tuple[str, int]]) -> float:
-    """How long synthesising these segments should take.
-
-    Characters over the measured speaking rate gives audio duration; times the
-    measured RTF gives generation time. Pauses are local silence and cost
-    nothing to produce.
-    """
-    chars = sum(len(text) for text, _ in segments)
-    return chars / CHARS_PER_SECOND * BACKEND_RTF
 
 CONTENT_TYPES = {
     "mp3": "audio/mpeg",
@@ -418,7 +263,6 @@ CONTENT_TYPES = {
     "pcm": "audio/L16",
 }
 
-# --- Voice Registry ---
 
 def _voices_json() -> Path:
     return VOICES_DIR / "registry.json"
@@ -899,30 +743,50 @@ def _pcm_to_format(pcm: bytes, target_format: str) -> bytes:
     return buf.getvalue()
 
 
-def _build_multipart(fields: dict, ref_audio: bytes | None) -> tuple[bytes, str]:
-    """Assemble the backend's multipart body.
+def _ref_data_url(ref_audio: bytes) -> str:
+    """Wrap the stored reference bytes as the data URL the backend expects.
 
-    Hand-rolled rather than delegated to httpx so the reference bytes are sent
-    exactly as stored -- the transcript must match the audio, and a re-encode
-    in between would invalidate that pairing.
+    Encoded once per request, not per segment: the clip is a few hundred KB and
+    a multi-segment synthesis would otherwise re-encode it for every segment.
+    The bytes are passed through unmodified -- the transcript must match the
+    audio, and a re-encode in between would invalidate that pairing.
     """
-    boundary = "----breeze2adapter"
-    parts = []
-    for key, value in fields.items():
-        if value is None:
-            continue
-        parts.append(
-            f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n'
-            f"{value}\r\n".encode()
-        )
-    if ref_audio is not None:
-        parts.append(
-            f'--{boundary}\r\nContent-Disposition: form-data; name="ref_audio"; '
-            f'filename="ref.wav"\r\nContent-Type: audio/wav\r\n\r\n'.encode()
-            + ref_audio + b"\r\n"
-        )
-    parts.append(f"--{boundary}--\r\n".encode())
-    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+    return "data:audio/wav;base64," + base64.b64encode(ref_audio).decode("ascii")
+
+
+def _backend_payload(fields: dict, text: str, ref_url: str | None) -> dict:
+    """Map this adapter's neutral field names onto the backend request body.
+
+    The backend is vLLM-Omni's OpenAI speech endpoint, which differs from this
+    service's own surface in three ways worth naming:
+
+    `voice` is not forwarded. There it selects one of Breeze's built-in speaker
+    slots, while here it names a registered voiceprint that has already been
+    resolved to ref_audio + ref_text. Forwarding it would silently override the
+    cloned timbre with a stock speaker.
+
+    Sampling parameters live in `extra_params`, not at the top level, and the
+    backend rejects unknown keys there.
+
+    `pcm` is requested regardless of what the caller asked for: everything
+    downstream of here assembles raw s16le at BACKEND_SAMPLE_RATE, and segment
+    joining plus transcoding happen in this process.
+    """
+    payload: dict = {
+        "model": BACKEND_MODEL_NAME,
+        "input": text,
+        "response_format": "pcm",
+    }
+    if ref_url is not None:
+        payload["ref_audio"] = ref_url
+        payload["ref_text"] = fields["ref_text"]
+    if (instruction := fields.get("instruction")) is not None:
+        payload["instructions"] = instruction
+    if (seed := fields.get("seed")) is not None:
+        payload["seed"] = seed
+    if (cfg := fields.get("cfg_scale")) is not None:
+        payload["extra_params"] = {"cfg_scale": cfg}
+    return payload
 
 
 
@@ -996,22 +860,7 @@ def _silence_pcm(duration_ms: int) -> bytes:
 
 
 def _backend_stream_error(status: int) -> ApiError:
-    """Translate a backend status seen by the reader task.
-
-    409 means the backend thinks an inference is already running. Since this
-    adapter admits one request at a time, the only way to see it is the backend's
-    own lock having leaked -- which happens when a streaming response is
-    abandoned mid-flight, and which only a restart clears. Saying so beats
-    reporting a generic upstream failure, because the action differs.
-    """
-    if status == 409:
-        return ApiError(
-            503, "backend_lock_stuck",
-            "Synthesis backend reports an inference already running while this "
-            "adapter has none. Its internal lock has not been released and only "
-            "a restart clears it.",
-            headers={"Retry-After": "30"},
-        )
+    """Translate a backend status seen by the reader task."""
     return ApiError(502, "backend_error", _backend_failure_detail(status))
 
 
@@ -1028,14 +877,13 @@ def _backend_failure_detail(status: int) -> str:
 
 
 
-async def _post_segment(client: httpx.AsyncClient, fields: dict,
-                        ref_audio: bytes | None) -> bytes:
-    """One backend request. Caller owns the backend slot."""
-    body, content_type = _build_multipart(fields, ref_audio)
+async def _post_segment(client: httpx.AsyncClient, fields: dict, text: str,
+                        ref_url: str | None) -> bytes:
+    """One backend request."""
     try:
         resp = await client.post(
             f"{BACKEND_URL}/v1/audio/speech",
-            content=body, headers={"Content-Type": content_type},
+            json=_backend_payload(fields, text, ref_url),
         )
         resp.raise_for_status()
     except httpx.HTTPStatusError as e:
@@ -1051,24 +899,36 @@ async def _post_segment(client: httpx.AsyncClient, fields: dict,
 async def _synthesize(fields: dict, ref_audio: bytes | None,
                       segments: list[tuple[str, int]],
                       timeout: float = 900.0) -> bytes:
-    """Synthesise every segment under a single slot acquisition.
+    """Synthesise every segment and join them in input order.
 
-    Taking the slot once for the whole request rather than per segment keeps a
-    multi-segment synthesis atomic: releasing between segments would let another
-    caller interleave, so a long passage could be stretched out arbitrarily and
-    the seed's effect would be the only thing holding the timbre together.
+    Segments are issued concurrently, bounded by BACKEND_CONCURRENCY to match
+    the backend's `max_num_seqs`. Exceeding it would not fail -- the backend
+    queues -- but it would inflate every caller's latency without raising
+    throughput, and this process would hold that many response bodies at once.
+
+    Concurrency is safe here in a way it was not with the previous backend:
+    each request carries its own reference audio and seed, and the backend keeps
+    per-sequence decode state, so segments cannot bleed into one another.
+
+    asyncio.gather preserves result order regardless of completion order, which
+    is what keeps the joined waveform in input order.
     """
-    await _BACKEND_SLOT.acquire(BACKEND_QUEUE_TIMEOUT, _estimate_seconds(segments))
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            out = bytearray()
-            for text, pause_ms in segments:
-                out += await _post_segment(client, {**fields, "text": text}, ref_audio)
-                if pause_ms:
-                    out += _silence_pcm(pause_ms)
-            return bytes(out)
-    finally:
-        _BACKEND_SLOT.release()
+    ref_url = _ref_data_url(ref_audio) if ref_audio is not None else None
+    limit = asyncio.Semaphore(BACKEND_CONCURRENCY)
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async def one(text: str) -> bytes:
+            async with limit:
+                return await _post_segment(client, fields, text, ref_url)
+
+        pcm_parts = await asyncio.gather(*(one(text) for text, _ in segments))
+
+    out = bytearray()
+    for pcm, (_, pause_ms) in zip(pcm_parts, segments):
+        out += pcm
+        if pause_ms:
+            out += _silence_pcm(pause_ms)
+    return bytes(out)
 
 
 async def _stream_backend(request: Request, fields: dict, ref_audio: bytes | None,
@@ -1086,26 +946,22 @@ async def _stream_backend(request: Request, fields: dict, ref_audio: bytes | Non
     first segment is therefore requested here, and its first bytes are in hand,
     before the response object exists.
 
-    A caller who disconnects frees the backend immediately. The reader task owns
-    the backend connection and closes it as soon as nobody is listening, which
-    releases the inference lock and the slot within the same event loop turn.
-    That depends on the backend patch in
-    patches/release-inference-lock-on-disconnect.py (upstream issue #20): stock
-    breeze_infer.api holds its lock when a response is abandoned mid-stream, so
-    the GPU falls idle while every request answers 409 until a restart. Without
-    the patch this code has to drain instead, which costs the caller the rest of
-    the segment.
-    """
-    _BACKEND_SLOT.reject_if_busy()
-    waited = await _BACKEND_SLOT.acquire(max(BACKEND_QUEUE_TIMEOUT, 1.0),
-                                         _estimate_seconds(segments))
+    A caller who disconnects must stop the work. The reader task owns the backend
+    connection and closes it as soon as nobody is listening. Disconnect is asked
+    of the connection rather than inferred from the generator, for the reason
+    given at the check itself.
 
+    Segments stream sequentially here, unlike the batch path: output order is the
+    wire order, so a later segment finishing first has nowhere to go. The
+    concurrency win applies to separate callers, which the backend now batches.
+    """
     client = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=10.0, read=900.0, write=30.0, pool=10.0)
     )
     queue: asyncio.Queue = asyncio.Queue(maxsize=STREAM_QUEUE_CHUNKS)
     abandoned = asyncio.Event()
     primed: asyncio.Future = asyncio.get_running_loop().create_future()
+    ref_url = _ref_data_url(ref_audio) if ref_audio is not None else None
 
     async def reader():
         """Own the backend connection from first byte to last."""
@@ -1114,11 +970,10 @@ async def _stream_backend(request: Request, fields: dict, ref_audio: bytes | Non
                 if abandoned.is_set() or await request.is_disconnected():
                     abandoned.set()
                     break
-                body, content_type = _build_multipart({**fields, "text": text},
-                                                      ref_audio)
                 async with client.stream(
                     "POST", f"{BACKEND_URL}/v1/audio/speech",
-                    content=body, headers={"Content-Type": content_type},
+                    json={**_backend_payload(fields, text, ref_url),
+                          "stream_format": "audio"},
                 ) as resp:
                     if resp.status_code != 200:
                         await resp.aread()
@@ -1134,8 +989,8 @@ async def _stream_backend(request: Request, fields: dict, ref_audio: bytes | Non
                         # generator suspended at its yield, so a finally that
                         # sets a flag there does not run until garbage
                         # collection -- and the read went on to the end of the
-                        # segment, holding this adapter's slot and answering 429
-                        # long after the caller pressed stop.
+                        # segment, wasting backend capacity long after the
+                        # caller pressed stop.
                         if abandoned.is_set() or await request.is_disconnected():
                             abandoned.set()
                             return
@@ -1163,7 +1018,6 @@ async def _stream_backend(request: Request, fields: dict, ref_audio: bytes | Non
                 primed.set_exception(ApiError(
                     502, "backend_error",
                     "Synthesis backend closed the connection unexpectedly."))
-            _BACKEND_SLOT.release()
             try:
                 await client.aclose()
             except Exception:
@@ -1179,8 +1033,8 @@ async def _stream_backend(request: Request, fields: dict, ref_audio: bytes | Non
         await primed
     except BaseException:
         abandoned.set()
-        # The reader still finishes the backend request and releases the slot;
-        # detaching rather than awaiting keeps a slow failure off this path.
+        # The reader still finishes the backend request; detaching rather than
+        # awaiting keeps a slow failure off this path.
         raise
 
     async def pcm_chunks():
@@ -1240,7 +1094,6 @@ async def _stream_backend(request: Request, fields: dict, ref_audio: bytes | Non
             "X-Breeze-Segments": str(len(segments)),
             "X-Audio-Duration-Estimate": str(estimate),
             "X-Audio-Sample-Rate": str(BACKEND_SAMPLE_RATE),
-            "X-Queue-Wait": f"{waited:.2f}",
         },
     )
 
@@ -1696,13 +1549,11 @@ async def list_models():
                 "voice_clone": True,
                 "voice_design": True,
                 "timing_marks": False,
-                # One at a time, and a second request is rejected rather than
-                # queued: a caller should retry on Retry-After, not block.
-                "concurrent_requests": 1,
-                "queues_when_busy": QUEUE_REJECT_SECONDS > 0,
+                # The backend batches; requests past this queue there rather
+                # than being rejected. Mirrors the deploy config's max_num_seqs.
+                "concurrent_requests": BACKEND_CONCURRENCY,
+                "queues_when_busy": True,
             },
-            "busy": _BACKEND_SLOT.busy,
-            "projected_wait_seconds": round(_BACKEND_SLOT.projected_wait(), 1),
             "response_formats": sorted(CONTENT_TYPES),
             "streaming_formats": sorted(CONTENT_TYPES),
             "stream_formats": ["audio", "sse"],
@@ -1723,21 +1574,6 @@ async def list_models():
     }
 
 
-@app.get("/v1/audio/speech/status")
-async def speech_status():
-    """Whether a synthesis request would be accepted right now.
-
-    Cheap enough to poll: a client can check before sending a long request
-    instead of discovering the rejection after uploading it.
-    """
-    projected = round(_BACKEND_SLOT.projected_wait(), 1)
-    return {
-        "busy": _BACKEND_SLOT.busy,
-        "accepting": not _BACKEND_SLOT.busy or QUEUE_REJECT_SECONDS > 0,
-        "projected_wait_seconds": projected,
-        "retry_after_seconds": max(1, math.ceil(projected)) if projected else 0,
-        "concurrent_requests": 1,
-    }
 
 
 # --- Health ---
@@ -1749,12 +1585,14 @@ async def health():
 
 @app.get("/ready")
 async def ready():
-    # breeze_infer exposes no dedicated readiness route; /docs is served only
-    # once startup (model load plus CUDA graph capture) has finished, which is
-    # exactly the condition this probe needs.
+    # Probes the backend's model list rather than /docs: it is the route that
+    # proves the model is registered and servable. A FastAPI app answers /docs
+    # as soon as the process is up, which for a backend that spends minutes
+    # loading weights and capturing CUDA graphs would report ready too early --
+    # the failure mode being a 1/1 Running pod with a dead engine behind it.
     async with httpx.AsyncClient(timeout=5.0) as client:
         try:
-            resp = await client.get(f"{BACKEND_URL}/docs")
+            resp = await client.get(f"{BACKEND_URL}/v1/models")
             if resp.status_code == 200:
                 return {"status": "ready"}
         except httpx.RequestError:

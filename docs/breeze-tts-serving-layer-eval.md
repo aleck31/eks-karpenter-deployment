@@ -11,11 +11,17 @@
 提高 `applications/breeze2-tts` 的并发能力，约束条件为模型权重、声纹注册表与
 输出音色均不变。
 
-现有部署的单并发是**推理引擎层**限制，非模型或显存限制：
+迁移前的单并发是**推理引擎层**限制，非模型或显存限制。
 `FastBreezeStreamingRuntime.iter_audio_chunks` 将单请求的解码状态
 （`self._backbone_graph` 及其 KV cache、`self._codec_runtime`）持有于运行时实例，
-并发请求相互覆写，故 `api.py` 中的 `threading.Lock` 为必需项。完整根因分析见
-`applications/breeze2-tts/deployment-guide.md`「已知限制」。
+两个并发请求相互覆写；解码循环另硬编码 `token[0]` / `depth_tokens[0]` 的单请求
+索引，batch 维度已被 CFG 的正负双分支占用（`branch_batch_size = 2 if single_cfg
+else 1`）。故 `api.py` 中的 `threading.Lock` 为必需项，移除只会产出错乱音频。
+
+非模型限制：输入准备层本就支持批
+（`prepare_inputs(..., requests: list[Request])` 内含 `for request in requests`
+与 `_prepare_segment_batches`），`api.py` 仅传入单元素列表。亦非 CUDA Graph 限制：
+图按 batch size 存字典（`self._backbone_graphs: dict[int, BackboneGraph]`）。
 
 vLLM-Omni 提供 `vllm_omni/entrypoints/openai/tts_adapters/breeze_tts_2.py`
 及两份 deploy 配置，对同一权重实施连续批处理调度，支持 `ref_audio` + `ref_text`
@@ -128,7 +134,19 @@ vLLM-Omni 提供 `vllm_omni/entrypoints/openai/tts_adapters/breeze_tts_2.py`
 | `Dockerfile.base` | 删除 | 改用 `vllm/vllm-omni` 镜像，不再从源码构建 |
 | 分段合成 | 串行改并发 | `max_num_seqs=2` 下预期提升约 2 倍 |
 
-迁移后须重新执行长文本分段验证（含 ASR 回转内容核对）与全部已注册声纹的听辨确认。
+## 9. 迁移后验证（2026-10-17 已执行）
+
+| 项 | 结果 |
+|---|---|
+| 单元测试 | 7 passed（容器内） |
+| 并发 2 / 4 | 全部 200，无 429 |
+| 长文本分段 | 410 字 3 段，ASR 回转标记 10/10，转写/原文 0.946 |
+| 三种输出模式 | 字节一致（batch / `stream_format=audio` / `sse`） |
+| 同 seed 复现 | 两次字节完全一致 |
+| 声纹注册表 | 26 个完好，预置声纹可直接调用 |
+| 多段 RTF | 0.205（单段 0.417），分段并发生效 |
+| 显存 | 整卡 24094 MiB 已用、8036 MiB 空闲 |
+| 冷启动 | 512s（缓存未命中）/ 379s（命中） |
 
 ## 附录：评估环境配置约束
 

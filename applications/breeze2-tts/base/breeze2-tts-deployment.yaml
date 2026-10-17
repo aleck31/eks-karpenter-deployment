@@ -59,12 +59,21 @@ spec:
         env:
         - name: BREEZE_MODEL_PATH
           value: "/shared/Breeze-TTS-2"
-        # 固定的加速参数组合。改动会使所有已注册声纹存下的 seed 失效，
-        # 依据见部署指南「部署契约」。
-        - name: BREEZE_FAST_FLAGS
-          value: "--fast-depth-decoder --fast-backbone-decode --fast-codec"
         - name: BREEZE_BACKEND_URL
           value: "http://localhost:8000"
+        # 后端批容量与 adapter 的分段并发须一致，依据见部署指南「部署契约」。
+        - name: BREEZE_BACKEND_CONCURRENCY
+          value: "4"
+        - name: BREEZE_OMNI_CONFIG
+          value: "/opt/breeze-tts/deploy/vllm-omni-deploy-config.yaml"
+        # 两处缓存都要落在模型 PVC 上，否则 Pod 重建即丢、每次冷启动重做：
+        #   VLLM_CACHE_ROOT  torch.compile 产物与 flashinfer autotune，约 30s
+        #   TRITON_CACHE_DIR 后端 warmup 期间 JIT 编译的 Triton kernel，实测 269s
+        # 后者默认写 /root/.triton，是冷启动耗时的最大单项。
+        - name: VLLM_CACHE_ROOT
+          value: "/shared/cache/vllm"
+        - name: TRITON_CACHE_DIR
+          value: "/shared/cache/breeze-triton"
         - name: VOICES_DIR
           value: "/shared/voices"
         ports:
@@ -80,17 +89,20 @@ spec:
           mountPath: /opt/breeze-tts/openai-adapter.py
           subPath: openai-adapter.py
           readOnly: true
+        - name: deploy-config
+          mountPath: /opt/breeze-tts/deploy
+          readOnly: true
         resources:
           requests:
-            cpu: 500m
-            memory: 3Gi
-            nvidia.com/gpu: 1
-          limits:
             cpu: "2"
             memory: 8Gi
             nvidia.com/gpu: 1
-        # CUDA Graph 捕获与 inductor 编译约 40s，加上首次模型加载，
-        # failureThreshold 需覆盖冷启动全过程。
+          limits:
+            cpu: "4"
+            memory: 16Gi
+            nvidia.com/gpu: 1
+        # 缓存未命中时后端启动约 220s（两级引擎各做 mode:3 的 torch.compile
+        # 与 CUDA Graph 捕获），加上首次模型加载。60 × 10s = 600s 覆盖冷启动。
         startupProbe:
           httpGet:
             path: /ready
@@ -119,6 +131,9 @@ spec:
       - name: adapter
         configMap:
           name: breeze2-tts-adapter
+      - name: deploy-config
+        configMap:
+          name: breeze2-tts-deploy-config
 
       tolerations:
       - key: nvidia.com/gpu

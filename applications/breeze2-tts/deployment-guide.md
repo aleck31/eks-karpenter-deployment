@@ -1,7 +1,13 @@
 # Breeze TTS 2 语音合成 (OpenAI 兼容接口)
 
-单容器内跑两个进程：Breeze 自带的 `breeze_infer` 推理服务 (`:8000`，仅监听 127.0.0.1) 与 OpenAI 兼容 adapter (`:8880`，对外)。模型权重与声纹（`/shared/voices`，
-索引为 `registry.json`）放在同一个 RWX PVC 上。
+单容器内跑两个进程：vLLM-Omni 推理服务 (`:8000`，仅监听 127.0.0.1) 与 OpenAI 兼容
+adapter (`:8880`，对外)。模型权重与声纹（`/shared/voices`，索引为 `registry.json`）
+放在同一个 RWX PVC 上。
+
+**推理引擎为 vLLM-Omni，不是 Breeze 自带的 `breeze_infer` 参考实现。** 权重仍是
+BreezeBlue 的 Breeze-TTS-2，vLLM-Omni 通过自带的 `breeze_tts_2` 适配器对其做连续
+批处理调度，因此并发不再是 1。两者的实测对比与换用理由见
+[docs/breeze-tts-serving-layer-eval.md](../../docs/breeze-tts-serving-layer-eval.md)。
 
 接口、字段、错误码与响应头见 [api-reference.md](api-reference.md)。兼容基线为 OpenAI
 Audio API 的 GA 规范（2026-10 对齐，`openai` Python SDK 3.31.0 实测）。
@@ -10,14 +16,13 @@ Audio API 的 GA 规范（2026-10 对齐，`openai` Python SDK 3.31.0 实测）�
 
 ```
 applications/breeze2-tts/
-├── Dockerfile.base                  # breeze-tts 源码 + 依赖，构建慢
-├── Dockerfile                       # adapter 层，秒级
-├── patches/                         # 上游补丁，构建期应用；见其 README
-├── entrypoint.sh                    # 后端 :8000 + adapter :8880
+├── Dockerfile                       # vLLM-Omni 基础镜像 + adapter 依赖
+├── entrypoint.sh                    # vLLM-Omni :8000 + adapter :8880
 ├── base/
 │   ├── openai-adapter.py            # 以 ConfigMap 挂载，改它无需重建镜像
-│   ├── breeze2-tts-deployment.yaml  # Deployment + Service
+│   ├── breeze2-tts-deployment.yaml  # Kubernetes Deployment + Service
 │   ├── breeze2-tts-ingress.yaml     # 声明 ALB :8880
+│   ├── vllm-omni-deploy-config.yaml # 后端的 --deploy-config，以 ConfigMap 挂载
 │   └── kustomization.yaml
 └── overlays/
     ├── example/                     # 入库：示例取值，供复制
@@ -43,14 +48,14 @@ applications/breeze2-tts/
 | CPU | 请求 500m / 上限 2 | |
 | 模型权重 | 7.2 GB | initContainer 下载到模型 PVC |
 
-**显存占用是固定的，不随显卡容量变化。** Breeze 后端没有任何显存预算参数
-（只有 `--host` / `--port` / `--fast-*`），占用由模型权重加 CUDA Graph 的实际
-需要决定。实测 24 GB 卡上 8.9 GiB、32 GB 卡上 9.0 GiB，相差 0.7%。
+**显存由 deploy 配置的三项决定**，不随显卡容量自动变化：
+`kv_cache_memory_bytes`（显式字节数，非比例）、`decode_cudagraph_batch_sizes`
+与 `cudagraph_capture_sizes`（预捕获的图数量）。`gpu_memory_utilization` 虽是
+总显存的比例，但在 KV 已显式限额时不是约束项 —— 实测 32 GB 卡上该值为 0.65
+（即 21 GB 预算）而实占 9.6 GiB。
 
-与 vLLM 类服务同卡时情况相反：`--gpu-memory-utilization` 是**总显存的比例**，换到
-更大的卡上会自动占更多。所以显存紧张时可回收的是那一方的预算，不是这里 ——
-要降低本服务的显存只能减少 `--fast-*` 参数，而那会同时恶化 RTF 并使所有已注册
-声纹的 seed 失效（见「部署契约」）。
+可降低显存的唯一途径是调小 `max_num_seqs` 与随之等比的 KV 限额，代价是并发。
+各档位的实测对比见 `docs/breeze-tts-serving-layer-eval.md`。
 
 **同卡余量须按各负载的峰值计算。** 2026-10-17 实测（32623 MiB 卡）：
 
@@ -70,17 +75,14 @@ applications/breeze2-tts/
 ## 构建
 
 ```bash
-# 1. 基础镜像（含 breeze-tts 源码与依赖，构建较慢）
-docker build -f Dockerfile.base -t <repo>/breeze2-tts:base-<breeze-ref> .
-
-# 2. adapter 层（秒级）
-docker build --build-arg BASE_IMAGE=<repo>/breeze2-tts:base-<breeze-ref> \
-  -t <repo>/breeze2-tts:latest .
+docker build -t <repo>/breeze2-tts:<tag> .
 ```
 
-`Dockerfile.base` 会把 breeze-tts 的 commit 写入 `/opt/breeze-tts.commit`，
-便于核对镜像对应的上游版本，并在此阶段应用 `patches/` 下的补丁。补丁在上游源码
-不再匹配时**使构建失败**而非静默跳过，所以升级 `BREEZE_REF` 时会立刻暴露冲突。
+单阶段：基础镜像 `vllm/vllm-omni:nightly-x86_64`（约 9.1 GB 压缩、解压后约 18 GB）
+加一层 adapter 依赖。构建机根分区需预留 20 GB 以上。
+
+基础镜像为 nightly，没有稳定 tag。升级时须先核对 `vllm_omni/deploy/breeze_tts_2.yaml`
+是否变更 —— 该文件决定并发与首字节，且随镜像一起更新。
 
 ## 部署
 
@@ -92,8 +94,23 @@ kubectl config current-context                # 先确认目标集群
 kubectl apply -k overlays/<env-name>
 ```
 
-首次启动需下载 7.2 GB 权重（initContainer）加约 40 秒 CUDA Graph 捕获，
-`startupProbe` 的 `failureThreshold: 60` 已覆盖。
+首次启动需下载 7.2 GB 权重（initContainer）。之后到 `1/1 Running` 的实测耗时：
+**缓存未命中 512 秒、命中 379 秒**。`startupProbe` 的 `failureThreshold: 60` ×
+`periodSeconds: 10` = 600 秒已覆盖，但余量不大，改 deploy 配置后应复测。
+
+分段耗时（32 GB 卡，权重在 EFS）：
+
+| 阶段 | 耗时 | 可否缓存 |
+|------|------|---------|
+| 加载权重（stage 0 + 1） | 25s | 否，EFS 读取 |
+| torch.compile | 30s | 是，`VLLM_CACHE_ROOT` |
+| CUDA Graph 捕获（PIECEWISE 6 尺寸） | 92s | 否 |
+| stage 1 初始化 | 14s | 否 |
+| 后端 warmup（参考编码器、CFG 分支、Triton JIT） | 269s → 136s | 部分，`TRITON_CACHE_DIR` |
+
+两处缓存都必须落在模型 PVC 上，否则 Pod 重建即丢。`TRITON_CACHE_DIR` 默认写
+容器本地的 `/root/.triton`，是此前冷启动耗时的最大单项（191 MB，实测省 133 秒）。
+缓存键含模型、deploy 配置与 GPU 架构，三者任一变化即失效并重新编译。
 
 ### 只改 adapter
 
@@ -114,7 +131,7 @@ ConfigMap 名字带内容哈希，文件一改 Deployment 就会滚动更新，�
 |------|------|
 | 新增 Python 依赖 | 依赖装在镜像层 |
 | 修改 `entrypoint.sh` | 由 `COPY` 进镜像 |
-| 升级 breeze-tts 源码 | 属于 `Dockerfile.base` |
+| 升级 vLLM-Omni | 基础镜像 tag |
 
 验证运行中的版本：
 
@@ -145,66 +162,61 @@ curl -s "http://<alb>:8880/v1/audio/voices" | head -c 200
 | 变量 | 默认 | 说明 |
 |------|------|------|
 | `BREEZE_MODEL_PATH` | `/shared/Breeze-TTS-2` | 模型权重目录（EFS 挂载） |
-| `BREEZE_FAST_FLAGS` | 见「部署契约」 | 后端加速参数。**改动会使所有声纹存下的 seed 产出不同音色** |
+| `BREEZE_OMNI_CONFIG` | 镜像内 `breeze_tts_2.yaml` | 后端 deploy 配置。决定并发与首字节，**改动会使所有声纹存下的 seed 产出不同采样轨迹** |
+| `VLLM_CACHE_ROOT` | `/shared/cache/vllm` | torch.compile 与 CUDA Graph 缓存目录 |
 | `BREEZE_BACKEND_URL` | `http://localhost:8000` | 后端地址。后端只监听 127.0.0.1，不对外暴露 |
 | `VOICES_DIR` | `/shared/voices` | 声纹目录，与 `registry.json` 同级 |
 | `BREEZE_MODEL_ID` | `breeze-tts-2` | `/v1/models` 返回的 id |
 | `ASR_TRANSCRIBE_URL` | 空 | 注册声纹未给 `ref_text` 时调用的 OpenAI 兼容转写接口（`POST .../v1/audio/transcriptions`），在 overlay 中注入。未设或不可达时 `ref_text` 必填 |
-| `BREEZE_QUEUE_REJECT_SECONDS` | `0` | `0` 表示忙时立即 429 不排队；正数表示预估等待在该值以内则排队 |
-| `BREEZE_QUEUE_TIMEOUT` | `120` | 仅在启用排队时生效，限制排队者的最长等待 |
+| `BREEZE_BACKEND_MODEL` | 同 `BREEZE_MODEL_ID` | 后端识别的模型名，须与 `entrypoint.sh` 的 `--served-model-name` 一致 |
+| `BREEZE_BACKEND_CONCURRENCY` | `4` | 单请求分段并发上限，须与 deploy 配置的 `max_num_seqs` 一致 |
 
 ## 部署契约
 
-后端加速参数**固定为**：
+后端 deploy 配置为 `base/vllm-omni-deploy-config.yaml`，以 ConfigMap 挂载到
+`/opt/breeze-tts/deploy/` 并由 `BREEZE_OMNI_CONFIG` 指定，**覆盖镜像内的
+`vllm_omni/deploy/breeze_tts_2.yaml`**。因此调并发不必重建镜像。
 
-```
---fast-depth-decoder --fast-backbone-decode --fast-codec
-```
+关键取值：
 
-实测（24 GB 显存卡，中文 60 字，RTF = 生成耗时 / 音频时长）：
+| 项 | 值 | 作用 |
+|---|---|---|
+| `max_num_seqs` | 4 | 并发；超出者在后端排队 |
+| `kv_cache_memory_bytes` | 1 GiB | 与 `max_num_seqs` 等比 |
+| `decode_cudagraph_batch_sizes` | `[1, 2, 4]` | 同上 |
+| `initial_codec_chunk_frames` | 1 | 首字节，实测 0.066s |
+| `codec_chunk_ramp` | `[1, 2, 4, 5]` | 同上 |
+| `max_model_len` | 2048 | 模型上下文，见「已知限制」 |
 
-| 配置 | 显存 | RTF | 启动 |
-|---|---|---|---|
-| 无参数 | 8.3 GiB | 2.33 | ~15s |
-| `--fast-depth-decoder` | 9.0 GiB | 1.07 | 35s |
-| **上述三项组合** | **8.9 GiB** | **0.88** | **40s** |
-| `--fast-all` | 16.4 GiB | 0.88 | 104s |
+**改动配置会改变采样轨迹。** 同一 seed 只在同一配置下可复现。
 
-`--fast-text-encoder` 与 `--fast-backbone-prefill` 两个阶段在一次生成里各只执行
-一次，却按「batch size × 文本长度分桶」预捕获数十份静态 CUDA Graph 常驻显存，
-单开分别多占 6.7 / 10.7 GiB 且不提速，因此不用 `--fast-all`。
+**改 `max_num_seqs` 必须同步改 `BREEZE_BACKEND_CONCURRENCY`**，两者分别是后端的
+批容量与 adapter 的分段并发上限。只改前者不会报错，但长文本的分段仍按旧上限发送，
+拿不到吞吐；只改后者会让多余的分段在后端排队，拉长每个调用方的延迟。
 
-**不要改动这组参数。** 同一 seed 只在同一参数组合下可复现（实测 eager 与上述
-组合下 seed=2 输出长度分别为 268844 / 314924 字节），改动会使所有已注册声纹
-存下的 seed 产出不同音色。
+**不要为提并发去动 codec 分块参数。** 首字节与并发互不耦合：官方吞吐配置的
+`initial_codec_chunk_frames: 16` 会把首字节从 0.066s 推到 0.439s，而
+`max_num_seqs` 提到 20 时首字节仍是 0.068s。
 
-基础镜像必须含 C 编译器：`--fast-depth-decoder` 走 `torch.compile` (inductor)，
-缺 gcc 会在启动时报 `InductorError: Failed to find C compiler` 并退出，不会降级运行。
-`Dockerfile.base` 基于 `pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime`（自带 Breeze
-要求的 torch 2.9.1）并显式安装 `build-essential`。不用 devel 变体：它含完整 CUDA
-toolkit，镜像体积翻倍（实测 28.7GB），而 inductor 只需 gcc，不需要 nvcc。
+各档位的显存与吞吐实测见 `docs/breeze-tts-serving-layer-eval.md`。
+
+
 
 ## 已知限制
 
-**单并发，且这是推理引擎层的约束，不是模型或显存。** 后端一次只服务一个请求，
-并发请求收到 HTTP 409，adapter 转成明确的 429 + `Retry-After`（见接口参考的
-「并发」一节），**不排队**。
+**并发为 4，超出者在后端排队而非被拒。** 由 deploy 配置的 `max_num_seqs` 决定，
+adapter 侧的 `BREEZE_BACKEND_CONCURRENCY` 须与之一致。线上实测（与 `r2t2-asr`、
+`klimt-ml` 同卡）：
 
-根因在 `FastBreezeStreamingRuntime.iter_audio_chunks`：单请求的解码状态挂在运行时
-实例上（`self._backbone_graph` 连同其 KV cache、`self._codec_runtime`），两个并发
-请求会互相覆写；解码循环还硬编码 `token[0]` / `depth_tokens[0]` 的单请求索引，而
-batch 维度已被 CFG 的正负双分支占用（`branch_batch_size = 2 if single_cfg else 1`）。
-所以那把 `threading.Lock` 是必需的，去掉会产出错乱音频而非更高吞吐。
+| 并发 | 成功 | 总墙钟 | 单请求均值 |
+|---|---|---|---|
+| 2 | 2/2 | 7.00s | 6.92s |
+| 4 | 4/4 | 10.31s | 9.76s |
+| 6 | 6/6 | 12.25s | 9.10s |
 
-不是模型的限制：输入准备层本就支持批（`prepare_inputs(..., requests: list[Request])`
-内有 `for request in requests` 与 `_prepare_segment_batches`），`api.py` 只是传了
-单元素列表。也不是 CUDA Graph 的限制：图按 batch size 存字典
-（`self._backbone_graphs: dict[int, BackboneGraph]`），本就能同时持有多个尺寸。
-
-显存只是**变通方案的**约束：多副本每个都要完整一份约 9 GiB，无法共享。
-
-要真并发须更换服务层。vLLM-Omni 可对同一权重实施连续批处理调度，实测数据与
-配置选型见 `docs/breeze-tts-serving-layer-eval.md`；当前部署未采用。
+扩副本不划算：每副本需完整一份约 11 GiB 显存，无法共享权重。提高并发应改
+deploy 配置的 `max_num_seqs` 与 KV 限额，各档位的显存与吞吐见
+`docs/breeze-tts-serving-layer-eval.md`。
 
 **长文本由 adapter 分句，实测不随长度退化。** 上限来自模型自身：`config.json` 的
 `max_position_embeddings = 2048`，除以 12.5 Hz 帧率约为 164 秒音频，而质量在触限
@@ -235,13 +247,12 @@ BreezeBlue Research and Non-Commercial License，仅限研究与非商业用途�
 
 | 现象 | 原因 | 处理 |
 |------|------|------|
-| 启动即退出，日志 `InductorError: Failed to find C compiler` | 基础镜像缺 gcc | 用 `Dockerfile.base`，它装了 `build-essential` |
-| `ValueError: 't5_gemma_module' is already used` | `transformers` 被升级 | 不要在此镜像里装会牵动 transformers 的包 |
-| 并发请求 503 | 后端单并发，排队超 `BREEZE_QUEUE_TIMEOUT` | 降低并发；扩副本无效（见「已知限制」） |
-| 同一 seed 音色变了 | 加速参数被改动 | 恢复为部署契约里的三项组合 |
-| Pod 一直 Pending | GPU 槽位被占满或无 24GB 机型 | `kubectl describe pod` 看调度事件 |
-| 停止后持续 429，GPU 却空闲 | 后端推理锁泄漏，补丁未生效 | 容器内 `python3 patches/release-inference-lock-on-disconnect.py --check --path /opt/breeze-tts/breeze_infer/api.py`；未打上则重建基础镜像 |
-| 构建报 `refusing to patch blindly` | 上游源码已变动，补丁不再匹配 | 对照 [issue #20](https://github.com/breezeblue-ai/breeze-tts/issues/20) 确认是否已修复；已修则删补丁，未修则更新补丁 |
+| `startupProbe` 超时被杀 | 缓存未命中，编译耗时超 600 秒 | 确认 `VLLM_CACHE_ROOT` 可写且在 PVC 上；首次部署属正常，重启应命中缓存 |
+| `/ready` 返回 503 但 Pod Running | 后端未就绪，adapter 已起 | 容器内 `curl localhost:8000/v1/models`；看 `vllm-omni` 的启动日志 |
+| 后端 400 `model not recognised` | `BREEZE_BACKEND_MODEL` 与 `--served-model-name` 不一致 | 两者取同一值 |
+| 同一 seed 音色变了 | deploy 配置被改动 | 恢复为部署契约中的配置 |
+| Pod 一直 Pending | GPU 槽位被占满 | `kubectl describe pod` 看调度事件 |
+| 显存不足启动失败 | 同卡其它负载峰值叠加 | 见「资源分配」的余量测算 |
 | 换了节点后声纹丢失 | 声纹在 EFS，不会丢；检查 PVC 是否挂载 | 确认 `VOICES_DIR=/shared/voices` |
 
 重启时用 `scale --replicas=0` 等 Pod 消失后再 `--replicas=1`，或 `rollout restart`。

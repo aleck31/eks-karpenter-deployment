@@ -10,3 +10,7 @@ configMapGenerator:
   - name: breeze2-tts-adapter
     files:
       - openai-adapter.py
+  # 覆盖镜像内的 vllm_omni/deploy/breeze_tts_2.yaml，改并发不必重建镜像。
+  - name: breeze2-tts-deploy-config
+    files:
+      - vllm-omni-deploy-config.yaml

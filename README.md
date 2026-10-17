@@ -57,7 +57,7 @@
 │   ├── qwen3-speech/                   # Qwen3 语音套件(ASR, TTS) + 共享模型存储（HTTP + realtime WS）
 │   ├── r2t2-asr/                       # Confucius4-R2T2 语音识别 (OpenAI兼容，实时 + 批处理)
 │   ├── voxcpm2-tts/                    # VoxCPM2 TTS 语音合成 (OpenAI兼容)
-│   ├── breeze2-tts/                    # Breeze TTS 2 语音合成 (OpenAI兼容)
+│   ├── breeze2-tts/                    # Breeze TTS 2 语音合成 (vLLM-Omni 引擎，OpenAI兼容)
 │   ├── bitwarden/                      # Bitwarden密码管理
 │   ├── convertx/                       # ConvertX文件转换
 │   ├── firecrawl/                      # Firecrawl 网页抓取 API
@@ -160,7 +160,7 @@ applications/voxcpm2-tts/deployment-guide.md
 # R2T2 ASR 语音识别 (实时 + 批处理)
 applications/r2t2-asr/deployment-guide.md
 
-# Breeze TTS 2 语音合成 (OpenAI兼容接口)
+# Breeze TTS 2 语音合成 (vLLM-Omni 引擎，OpenAI兼容接口)
 applications/breeze2-tts/deployment-guide.md
 ```
 

@@ -1,7 +1,7 @@
 """Tests for the Breeze TTS adapter's OpenAI API surface.
 
-The breeze_infer backend is replaced by an httpx MockTransport that returns PCM
-and records the multipart fields it was sent, so these run without a GPU.
+The vLLM-Omni backend is replaced by an httpx MockTransport that returns PCM
+and records the JSON bodies it was sent, so these run without a GPU.
 
     uv run -p 3.12 --with fastapi --with httpx --with python-multipart --with pydub \
         --with pysbd --with pytest pytest applications/breeze2-tts/tests -q
@@ -73,13 +73,14 @@ def app(tmp_path, monkeypatch):
 
 
 def fields(body: bytes) -> dict:
-    """Plain form fields from a multipart body sent to the backend."""
-    out = {}
-    for part in body.split(b"--")[1:]:
-        if b'name="' not in part or b"filename=" in part:
-            continue
-        name = part.split(b'name="')[1].split(b'"')[0].decode()
-        out[name] = part.split(b"\r\n\r\n", 1)[1].rsplit(b"\r\n", 1)[0].decode()
+    """The backend request body, with ref_audio collapsed to a presence flag.
+
+    The data URL is tens of KB of base64 and no assertion needs its content,
+    only whether a reference was sent at all.
+    """
+    out = json.loads(body)
+    if "ref_audio" in out:
+        out["ref_audio"] = out["ref_audio"].startswith("data:audio/wav;base64,")
     return out
 
 
@@ -100,7 +101,7 @@ def test_instructions_direct_a_cloned_voice(app):
     with TestClient(app.app) as c:
         assert post(c, voice="alloy", instructions="Speak slowly.").status_code == 200
     f = fields(app.sent[-1])
-    assert f["instruction"] == "Speak slowly." and f["ref_text"] == "你好"
+    assert f["instructions"] == "Speak slowly." and f["ref_text"] == "你好"
 
 
 def test_instructions_without_voice_designs_one(app):
@@ -108,7 +109,7 @@ def test_instructions_without_voice_designs_one(app):
         assert post(c, instructions="A warm low voice.", response_format="wav").status_code == 200
         r = post(c)
     f = fields(app.sent[-1])
-    assert f["instruction"] == "A warm low voice." and "ref_text" not in f
+    assert f["instructions"] == "A warm low voice." and "ref_text" not in f
     assert r.status_code == 400 and r.json()["error"]["param"] == "voice"
 
 
@@ -142,6 +143,10 @@ def test_errors_are_openai_shape(app):
 
 def test_create_voice_openai_shape_and_auto_transcript(app, monkeypatch):
     with TestClient(app.app) as c:
+        # Explicitly unset: the adapter reads ASR_TRANSCRIBE_URL from the
+        # environment at import, so inheriting a configured one from the host
+        # would silently exercise the auto-transcript path instead of this one.
+        monkeypatch.setattr(app, "ASR_TRANSCRIBE_URL", "")
         r = c.post("/v1/audio/voices", data={"name": "Mine", "consent": "cons_1"},
                    files={"audio_sample": ("s.wav", wav16k(), "audio/wav")})
         assert r.status_code == 400 and r.json()["error"]["param"] == "ref_text"
@@ -159,3 +164,22 @@ def test_create_voice_openai_shape_and_auto_transcript(app, monkeypatch):
         assert listing["object"] == "list" and {x["id"] for x in listing["data"]} == {"alloy", v["id"]}
         d = c.delete(f"/v1/audio/voices/{v['id']}").json()
         assert d == {"id": v["id"], "object": "audio.voice", "deleted": True}
+
+def test_long_input_is_segmented_and_joined_in_order(app):
+    """Segments go out concurrently but the waveform must follow input order.
+
+    The mock returns a distinct PCM payload per segment keyed by the text it
+    received, so a reordered join shows up as a mismatched byte sequence rather
+    than merely a wrong length.
+    """
+    marks = "".join(f"第{i}句话在这里，说的是一件很普通的小事，没有什么特别的内容。"
+                    for i in range(1, 13))
+    with TestClient(app.app) as c:
+        r = post(c, input=marks, voice="alloy", response_format="pcm")
+    assert r.status_code == 200, r.text
+    bodies = [json.loads(b)["input"] for b in app.sent]
+    assert len(bodies) > 1, "long input should have been split"
+    # Every segment carried the same reference, and concatenating the inputs
+    # reproduces the original text: no segment lost, duplicated or reordered.
+    assert "".join(bodies) == marks
+    assert all(json.loads(b).get("ref_text") == "你好" for b in app.sent)
