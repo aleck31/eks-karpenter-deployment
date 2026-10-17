@@ -66,14 +66,21 @@ spec:
           value: "4"
         - name: BREEZE_OMNI_CONFIG
           value: "/opt/breeze-tts/deploy/vllm-omni-deploy-config.yaml"
-        # 两处缓存都要落在模型 PVC 上，否则 Pod 重建即丢、每次冷启动重做：
-        #   VLLM_CACHE_ROOT  torch.compile 产物与 flashinfer autotune，约 30s
-        #   TRITON_CACHE_DIR 后端 warmup 期间 JIT 编译的 Triton kernel，实测 269s
-        # 后者默认写 /root/.triton，是冷启动耗时的最大单项。
+        # 编译缓存须落在模型 PVC 上，否则 Pod 重建即丢：
+        #   VLLM_CACHE_ROOT          vLLM 编译产物、flashinfer autotune
+        #   TRITON_CACHE_DIR         warmup 期间 JIT 的 Triton kernel
+        #   TORCHINDUCTOR_CACHE_DIR  Inductor 产物与 max_autotune 测速结果
+        # VLLM_USE_AOT_COMPILE=0 绕开 vllm-omni#9042：AOT 缓存键每次启动都变，
+        # 产物从不复用，每次重启写入 215-400 MB。AOT 开启时 TORCHINDUCTOR_CACHE_DIR
+        # 会被覆写为含该键的路径，所以两项须同时设置；上游修复后一并移除。
+        - name: VLLM_USE_AOT_COMPILE
+          value: "0"
         - name: VLLM_CACHE_ROOT
           value: "/shared/cache/vllm"
         - name: TRITON_CACHE_DIR
           value: "/shared/cache/breeze-triton"
+        - name: TORCHINDUCTOR_CACHE_DIR
+          value: "/shared/cache/breeze-inductor"
         - name: VOICES_DIR
           value: "/shared/voices"
         ports:

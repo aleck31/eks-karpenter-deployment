@@ -95,22 +95,34 @@ kubectl apply -k overlays/<env-name>
 ```
 
 首次启动需下载 7.2 GB 权重（initContainer）。之后到 `1/1 Running` 的实测耗时：
-**缓存未命中 512 秒、命中 379 秒**。`startupProbe` 的 `failureThreshold: 60` ×
-`periodSeconds: 10` = 600 秒已覆盖，但余量不大，改 deploy 配置后应复测。
+**缓存未命中约 390 秒、命中 268 秒**。`startupProbe` 的 `failureThreshold: 60` ×
+`periodSeconds: 10` = 600 秒已覆盖。
 
-分段耗时（32 GB 卡，权重在 EFS）：
+| 配置 | 命中缓存时启动 | `max_autotune` 测速 | 每次重启写入 EFS |
+|------|---------------|--------------------|-----------------|
+| 仅 `VLLM_CACHE_ROOT` + `TRITON_CACHE_DIR` | 351s | 24 次 | 215-400 MB |
+| 再加 `VLLM_USE_AOT_COMPILE=0` | 378s | 24 次 | 10 MB |
+| 再加 `TORCHINDUCTOR_CACHE_DIR`（当前） | **268s** | **0 次** | **0** |
 
-| 阶段 | 耗时 | 可否缓存 |
+剩余耗时主要是 CUDA Graph 捕获与后端 warmup 中的实际推理，缓存无法消除。
+
+三类编译缓存都须落在模型 PVC 上，否则 Pod 重建即丢：
+
+| 变量 | 内容 | 默认位置 |
 |------|------|---------|
-| 加载权重（stage 0 + 1） | 25s | 否，EFS 读取 |
-| torch.compile | 30s | 是，`VLLM_CACHE_ROOT` |
-| CUDA Graph 捕获（PIECEWISE 6 尺寸） | 92s | 否 |
-| stage 1 初始化 | 14s | 否 |
-| 后端 warmup（参考编码器、CFG 分支、Triton JIT） | 269s → 136s | 部分，`TRITON_CACHE_DIR` |
+| `VLLM_CACHE_ROOT` | vLLM 编译产物、flashinfer autotune | `~/.cache/vllm` |
+| `TRITON_CACHE_DIR` | warmup 期间 JIT 的 Triton kernel | `/root/.triton` |
+| `TORCHINDUCTOR_CACHE_DIR` | Inductor 产物与 `max_autotune` 测速结果 | `/tmp/torchinductor_root` |
 
-两处缓存都必须落在模型 PVC 上，否则 Pod 重建即丢。`TRITON_CACHE_DIR` 默认写
-容器本地的 `/root/.triton`，是此前冷启动耗时的最大单项（191 MB，实测省 133 秒）。
-缓存键含模型、deploy 配置与 GPU 架构，三者任一变化即失效并重新编译。
+**`VLLM_USE_AOT_COMPILE=0` 是对上游缺陷的绕行**
+（[vllm-omni#9042](https://github.com/vllm-project/vllm-omni/issues/9042)）。
+AOT 路径的缓存键每次启动都不同，产物写入
+`torch_compile_cache/torch_aot_compile/<hash>/` 后从不被读取，每次重启新增
+215-400 MB。AOT 开启时 vLLM 还会把 `TORCHINDUCTOR_CACHE_DIR` 无条件覆写为该
+hash 目录，因此单独设置 `TORCHINDUCTOR_CACHE_DIR` 无效，两项须同时设置。上游修复
+后两项一并移除，并清理 `torch_aot_compile/` 下的遗留目录。
+
+缓存键含 torch / Triton 版本、deploy 配置与 GPU 架构，任一变化即重新编译一次。
 
 ### 只改 adapter
 
@@ -164,6 +176,9 @@ curl -s "http://<alb>:8880/v1/audio/voices" | head -c 200
 | `BREEZE_MODEL_PATH` | `/shared/Breeze-TTS-2` | 模型权重目录（EFS 挂载） |
 | `BREEZE_OMNI_CONFIG` | 镜像内 `breeze_tts_2.yaml` | 后端 deploy 配置。决定并发与首字节，**改动会使所有声纹存下的 seed 产出不同采样轨迹** |
 | `VLLM_CACHE_ROOT` | `/shared/cache/vllm` | torch.compile 与 CUDA Graph 缓存目录 |
+| `TRITON_CACHE_DIR` | `/shared/cache/breeze-triton` | Triton kernel 缓存目录 |
+| `TORCHINDUCTOR_CACHE_DIR` | `/shared/cache/breeze-inductor` | Inductor 与 autotune 缓存目录 |
+| `VLLM_USE_AOT_COMPILE` | `0` | 绕开 vllm-omni#9042，见「部署」中的启动耗时 |
 | `BREEZE_BACKEND_URL` | `http://localhost:8000` | 后端地址。后端只监听 127.0.0.1，不对外暴露 |
 | `VOICES_DIR` | `/shared/voices` | 声纹目录，与 `registry.json` 同级 |
 | `BREEZE_MODEL_ID` | `breeze-tts-2` | `/v1/models` 返回的 id |
@@ -248,6 +263,7 @@ BreezeBlue Research and Non-Commercial License，仅限研究与非商业用途�
 | 现象 | 原因 | 处理 |
 |------|------|------|
 | `startupProbe` 超时被杀 | 缓存未命中，编译耗时超 600 秒 | 确认 `VLLM_CACHE_ROOT` 可写且在 PVC 上；首次部署属正常，重启应命中缓存 |
+| `/shared/cache/vllm` 每次重启增长数百 MB | `VLLM_USE_AOT_COMPILE` 未设为 0（vllm-omni#9042） | 补上该变量，删除 `torch_compile_cache/torch_aot_compile/` 下的旧目录 |
 | `/ready` 返回 503 但 Pod Running | 后端未就绪，adapter 已起 | 容器内 `curl localhost:8000/v1/models`；看 `vllm-omni` 的启动日志 |
 | 后端 400 `model not recognised` | `BREEZE_BACKEND_MODEL` 与 `--served-model-name` 不一致 | 两者取同一值 |
 | 同一 seed 音色变了 | deploy 配置被改动 | 恢复为部署契约中的配置 |
