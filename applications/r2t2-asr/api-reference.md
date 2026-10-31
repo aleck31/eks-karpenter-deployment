@@ -2,7 +2,7 @@
 
 遵循 OpenAI Audio API 的 [`/v1/audio/transcriptions`](https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions)
 与 Realtime API（GA）的[转写会话](https://developers.openai.com/api/docs/guides/realtime-transcription)。
-可直接使用官方 SDK：`OpenAI(base_url="https://<host>:8000/v1", api_key="<任意>")`，实时会话为 `wss://<host>:8000/v1/realtime`。
+可直接使用官方 SDK：`OpenAI(base_url="https://<host>/v1", api_key="<任意>")`，实时会话为 `wss://<host>/v1/realtime`（443，不带端口）。
 只接受 HTTPS：`<host>` 须为证书覆盖的自定义域名，ALB 默认的 `*.elb.amazonaws.com` 名字证书不匹配。
 
 **兼容基线**：OpenAI 官方 API Reference 的 GA 规范（按 2026-10 对齐），已用 `openai`

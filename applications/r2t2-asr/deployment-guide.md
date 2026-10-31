@@ -17,7 +17,7 @@ applications/r2t2-asr/
 ├── base/
 │   ├── asr-server.py             # 服务层，以 ConfigMap 挂载，改它无需重建镜像
 │   ├── r2t2-asr-deployment.yaml  # Deployment + Service；initContainer 下载权重
-│   ├── r2t2-asr-ingress.yaml     # ALB HTTPS :8000
+│   ├── r2t2-asr-ingress.yaml     # ALB HTTPS :443，按主机名路由
 │   └── kustomization.yaml
 ├── overlays/
 │   ├── example/                  # 入库：示例取值，供复制
@@ -28,7 +28,7 @@ applications/r2t2-asr/
 ## 架构
 
 ```
-客户端 ─ ALB HTTPS :8000 ─ asr-server.py (uvicorn)
+客户端 ─ ALB HTTPS :443 ─ asr-server.py (uvicorn)
                       ├ POST /v1/audio/transcriptions ─┐
                       └ WS   /v1/realtime ─────────────┤ Session（每路一个）
                                                        │  └ R2T2 streaming_transcribe（官方实现，原样调用）
@@ -83,7 +83,7 @@ FLEURS 上会整句漏识别（60 s 段三个文件里两次）。段太短则�
 |------|------|
 | GPU NodePool | 见 `gpu/deployment-guide.md`；显存 ≥ 14 GB（含对齐模型），与其他服务共卡时需 Time-Slicing |
 | 模型存储 | 一个 RWX 的 PVC（如 EFS），在 overlay 中指定，存放权重与驱动 JIT 缓存 |
-| AWS Load Balancer Controller | Ingress 在 ALB 上监听 HTTPS 8000 |
+| AWS Load Balancer Controller | Ingress 在 ALB 上监听 HTTPS 443；与其他服务共享 ALB 时靠主机名区分 |
 | 域名与证书 | 一个解析到该 ALB 的自定义主机名，及 ALB 同区域 ACM 中覆盖它的证书，在 overlay 中注入 |
 
 ## 构建镜像
