@@ -183,3 +183,30 @@ def test_long_input_is_segmented_and_joined_in_order(app):
     # reproduces the original text: no segment lost, duplicated or reordered.
     assert "".join(bodies) == marks
     assert all(json.loads(b).get("ref_text") == "你好" for b in app.sent)
+
+
+def test_api_key_required_when_keys_file_present(app, tmp_path, monkeypatch):
+    keys = tmp_path / "api-keys"
+    keys.write_text("# comment\n\nsk-tts-good\n")
+    monkeypatch.setattr(app, "API_KEYS_FILE", keys)
+    # The middleware holds its own _ApiKeys; point that at the test file too.
+    for m in app.app.user_middleware:
+        if m.cls is app._ApiKeyMiddleware:
+            m.kwargs["keys"] = app._ApiKeys(keys)
+    app.app.middleware_stack = None
+    with TestClient(app.app) as c:
+        assert c.get("/health").status_code == 200, "probes stay unauthenticated"
+        r = c.get("/v1/models")
+        assert r.status_code == 401 and r.json()["error"]["code"] == "missing_api_key"
+        assert r.headers["www-authenticate"] == "Bearer"
+        r = c.get("/v1/models", headers={"Authorization": "Bearer sk-tts-bad"})
+        assert r.status_code == 401 and r.json()["error"]["code"] == "invalid_api_key"
+        ok = {"Authorization": "Bearer sk-tts-good"}
+        assert c.get("/v1/models", headers=ok).status_code == 200
+        assert c.post("/v1/audio/speech", headers=ok,
+                   json={"model": "tts-1", "input": "测试。", "voice": "alloy",
+                         "response_format": "pcm"}).status_code == 200
+        # Rotation: a rewritten file takes effect without a restart.
+        keys.write_text("sk-tts-new\n")
+        assert c.get("/v1/models", headers=ok).status_code == 401
+        assert c.get("/v1/models", headers={"Authorization": "Bearer sk-tts-new"}).status_code == 200

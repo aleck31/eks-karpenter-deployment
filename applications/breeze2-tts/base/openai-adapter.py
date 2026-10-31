@@ -21,6 +21,7 @@ import contextlib
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import secrets
@@ -100,6 +101,7 @@ async def _validation_exception_handler(_request, exc: RequestValidationError):
 
 _DEFAULT_ERROR_CODES = {
     400: "invalid_request",
+    401: "invalid_api_key",
     403: "forbidden",
     404: "not_found",
     409: "conflict",
@@ -107,6 +109,85 @@ _DEFAULT_ERROR_CODES = {
     502: "backend_error",
     503: "backend_unavailable",
 }
+
+# One key per line; blank lines and lines starting with # are ignored.
+API_KEYS_FILE = Path(os.getenv("BREEZE_API_KEYS_FILE", "/etc/breeze2-tts/api-keys"))
+# Probes from the ALB and the kubelet carry no credentials.
+AUTH_EXEMPT_PATHS = frozenset({"/health", "/ready"})
+_auth_log = logging.getLogger("uvicorn.error")
+
+
+class _ApiKeys:
+    """Accepted keys, re-read whenever the file changes.
+
+    No file means auth is off, so local runs and tests need no setup. In the
+    cluster the Secret volume is not optional, so a missing Secret stops the pod
+    from starting instead of serving unauthenticated. A file with no keys rejects
+    every request. Kubernetes replaces a Secret volume's contents by swapping a
+    symlink, so the inode changes and a rotated key is picked up without a restart.
+    """
+
+    def __init__(self, path: Path):
+        self._path = path
+        self._stamp: tuple | None = None
+        self._keys: tuple[bytes, ...] = ()
+
+    def current(self) -> tuple[bytes, ...] | None:
+        try:
+            st = self._path.stat()
+        except FileNotFoundError:
+            self._stamp = None
+            return None
+        stamp = (st.st_ino, st.st_mtime_ns, st.st_size)
+        if stamp != self._stamp:
+            lines = (line.strip() for line in self._path.read_text().splitlines())
+            self._keys = tuple(line.encode() for line in lines
+                               if line and not line.startswith("#"))
+            self._stamp = stamp
+        return self._keys
+
+
+class _ApiKeyMiddleware:
+    """Require `Authorization: Bearer <key>`, as the OpenAI API does.
+
+    Plain ASGI rather than BaseHTTPMiddleware, so the receive channel reaches the
+    endpoint untouched: the streaming path detects a departed caller through it.
+    """
+
+    def __init__(self, app, keys: _ApiKeys):
+        self.app = app
+        self.keys = keys
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["path"] in AUTH_EXEMPT_PATHS:
+            return await self.app(scope, receive, send)
+        keys = self.keys.current()
+        if keys is None:
+            return await self.app(scope, receive, send)
+
+        headers = dict(scope.get("headers") or ())
+        scheme, _, token = headers.get(b"authorization", b"").partition(b" ")
+        token = token.strip()
+        if scheme.lower() != b"bearer" or not token:
+            reason, message = "missing_api_key", (
+                "You didn't provide an API key. Provide it in an Authorization "
+                "header using Bearer auth (Authorization: Bearer YOUR_KEY).")
+        elif not any(secrets.compare_digest(token, key) for key in keys):
+            reason, message = "invalid_api_key", "Incorrect API key provided."
+        else:
+            return await self.app(scope, receive, send)
+
+        client = (headers.get(b"x-forwarded-for", b"").split(b",")[0].strip().decode()
+                  or (scope.get("client") or ("?",))[0])
+        _auth_log.warning("auth rejected: %s %s %s from %s",
+                          reason, scope.get("method"), scope["path"], client)
+        response = JSONResponse(status_code=401,
+                                content=_error_body(401, message, reason, None),
+                                headers={"WWW-Authenticate": "Bearer"})
+        await response(scope, receive, send)
+
+
+app.add_middleware(_ApiKeyMiddleware, keys=_ApiKeys(API_KEYS_FILE))
 
 BACKEND_URL = os.getenv("BREEZE_BACKEND_URL", "http://localhost:8000")
 VOICES_DIR = Path(os.getenv("VOICES_DIR", "/shared/voices"))
