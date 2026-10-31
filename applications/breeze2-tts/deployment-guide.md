@@ -21,7 +21,7 @@ applications/breeze2-tts/
 ├── base/
 │   ├── openai-adapter.py            # 以 ConfigMap 挂载，改它无需重建镜像
 │   ├── breeze2-tts-deployment.yaml  # Kubernetes Deployment + Service
-│   ├── breeze2-tts-ingress.yaml     # 声明 ALB :8880
+│   ├── breeze2-tts-ingress.yaml     # 声明 ALB HTTPS :8880
 │   ├── vllm-omni-deploy-config.yaml # 后端的 --deploy-config，以 ConfigMap 挂载
 │   └── kustomization.yaml
 └── overlays/
@@ -37,6 +37,7 @@ applications/breeze2-tts/
 | GPU 显存 | 服务固定占用约 9 GiB，与其它负载同卡时需留足余量；机型约束按环境在 overlay 中设置 |
 | 模型 PVC | RWX（如 EFS），在 overlay 中指定名称；声纹目录须属于 uid 10001 |
 | ALB :8880 空闲 | 同一 ALB group 内一个 listen-port 只能由一个 Ingress 声明 |
+| 域名与证书 | 一个解析到该 ALB 的自定义主机名，及 ALB 同区域 ACM 中覆盖它的证书，在 overlay 中注入 |
 
 ## 资源分配
 
@@ -163,7 +164,7 @@ aws-load-balancer-controller 会因监听器冲突拒绝调和。与其它服务
 ```bash
 kubectl get pods -n <namespace> -o wide          # 应 1/1 Running
 kubectl exec deploy/breeze2-tts -- curl -s localhost:8000/docs -o /dev/null -w '%{http_code}\n'
-curl -s "http://<alb>:8880/v1/audio/voices" | head -c 200
+curl -s "https://<host>:8880/v1/audio/voices" | head -c 200
 ```
 
 `/ready` 与 `/health` 的区别：`/health` 只表示 adapter 进程活着，`/ready` 会确认

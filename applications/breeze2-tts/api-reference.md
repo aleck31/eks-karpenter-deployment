@@ -7,13 +7,16 @@
 与 [Create voice](https://developers.openai.com/api/reference/resources/audio/subresources/voices/methods/create)，
 错误体为 OpenAI 格式。已用 `openai` Python SDK **3.31.0** 实测 `audio.speech.create`
 （含 `with_streaming_response`、`stream_format` audio/sse）与 `audio.voices.create`。
-可直接 `OpenAI(base_url="http://<host>:8880/v1", api_key="<任意>")`。
+可直接 `OpenAI(base_url="https://<host>:8880/v1", api_key="<任意>")`。
 与 OpenAI 的差异见「与 OpenAI 的差异」；其余端点（声纹查询/更新/删除/试听、
 临时克隆）为本服务扩展。
 
 > 不兼容变更：早期版本的字段已移除——`stream` → `stream_format`，
 > `voice_description` → `instructions`，注册字段 `audio` → `audio_sample`、`voice_id` 改为可选，
 > 错误体不再含 `detail`，未知声纹由 404 改为 400。
+>
+> 2026-10-31 起只接受 HTTPS：`:8880` 的 HTTP 监听器已移除，`<host>` 须为证书覆盖的
+> 自定义域名（ALB 默认的 `*.elb.amazonaws.com` 名字不再可用，证书不匹配）。
 >
 > 换用 vLLM-Omni 后端时又移除了三项，**均为本服务此前的扩展，规范中没有对应物**：
 > 端点 `/v1/audio/speech/status`、响应头 `X-Queue-Wait` / `X-Queue-Depth` /
@@ -52,24 +55,24 @@ vLLM-Omni，采样器不同，同一 `(声纹, 文本, seed)` 走的是另一条
 
 ```bash
 # 使用已注册声纹
-curl -X POST http://<host>:8880/v1/audio/speech \
+curl -X POST https://<host>:8880/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{"model":"breeze-tts-2","input":"今天天气不错。","voice":"norman08","response_format":"mp3"}' \
   --output out.mp3
 
 # voice 也可写成对象（OpenAI 自定义声纹形式）；instructions 在保留音色的前提下调整语气
-curl -X POST http://<host>:8880/v1/audio/speech \
+curl -X POST https://<host>:8880/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{"model":"breeze-tts-2","input":"今天天气不错。","voice":{"id":"norman08"},"instructions":"语速放慢，语气严肃。"}' \
   --output directed.mp3
 
 # 覆盖 seed 试听（不改动声纹）
-curl -X POST http://<host>:8880/v1/audio/speech \
+curl -X POST https://<host>:8880/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{"model":"breeze-tts-2","input":"今天天气不错。","voice":"norman08","seed":7}' --output s7.mp3
 
 # Voice Design（扩展）：省略 voice、只给 instructions，按描述生成
-curl -X POST http://<host>:8880/v1/audio/speech \
+curl -X POST https://<host>:8880/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{"model":"breeze-tts-2","input":"欢迎收听。","instructions":"一位温柔自信的年轻女性，声音清晰。","cfg_value":4}' \
   --output design.mp3
@@ -81,13 +84,13 @@ curl -X POST http://<host>:8880/v1/audio/speech \
 ## 流式
 
 ```bash
-curl -N -X POST http://<host>:8880/v1/audio/speech \
+curl -N -X POST https://<host>:8880/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{"model":"breeze-tts-2","input":"...","voice":"norman08","stream_format":"audio","response_format":"wav"}' \
   --output stream.wav
 
 # SSE：text/event-stream，事件 speech.audio.delta {audio: base64} … speech.audio.done {usage}
-curl -N -X POST http://<host>:8880/v1/audio/speech \
+curl -N -X POST https://<host>:8880/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{"model":"breeze-tts-2","input":"...","voice":"norman08","stream_format":"sse","response_format":"pcm"}'
 ```
@@ -161,7 +164,7 @@ adapter 立刻停止读取后端，不再占用批处理槽位。实测停止后
 参考音频随请求传入，用完即弃，适合一次性试听：
 
 ```bash
-curl -X POST http://<host>:8880/v1/audio/clone \
+curl -X POST https://<host>:8880/v1/audio/clone \
   -H "Content-Type: application/json" \
   -d '{"input":"要合成的文本。",
        "reference_audio":"<base64>",
@@ -225,18 +228,18 @@ curl -X POST http://<host>:8880/v1/audio/clone \
 
 ```bash
 # 注册（OpenAI 形式；ref_text 省略则自动转写）
-curl -X POST http://<host>:8880/v1/audio/voices \
+curl -X POST https://<host>:8880/v1/audio/voices \
   -F name=Alice -F consent=cons_xxx -F audio_sample=@reference.wav
 # 扩展字段：指定 id、给出文字稿
-curl -X POST http://<host>:8880/v1/audio/voices \
+curl -X POST https://<host>:8880/v1/audio/voices \
   -F name=Alice -F voice_id=alice -F gender=female \
   -F ref_text="这是参考音频的准确文字稿。" -F audio_sample=@reference.wav
 
 # 试听不同 seed 后，把选定的存入声纹
-curl -X PUT http://<host>:8880/v1/audio/voices/alice -F seed=7
+curl -X PUT https://<host>:8880/v1/audio/voices/alice -F seed=7
 
 # 为已有声纹补 ref_text
-curl -X PUT http://<host>:8880/v1/audio/voices/norman08 \
+curl -X PUT https://<host>:8880/v1/audio/voices/norman08 \
   -F ref_text="今天天气不错，我打算下去玩。妈妈，现在几点了？"
 ```
 
