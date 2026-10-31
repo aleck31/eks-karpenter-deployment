@@ -5,6 +5,15 @@
 可直接使用官方 SDK：`OpenAI(base_url="https://<host>/v1", api_key="<任意>")`，实时会话为 `wss://<host>/v1/realtime`（443，不带端口）。
 只接受 HTTPS：`<host>` 须为证书覆盖的自定义域名，ALB 默认的 `*.elb.amazonaws.com` 名字证书不匹配。
 
+## 认证
+
+与 OpenAI 相同：`Authorization: Bearer <API key>`，SDK 的 `api_key` 即此值。WebSocket 同样用该请求头；
+浏览器无法设置 WebSocket 请求头，可按 OpenAI 的做法改用子协议
+`["realtime", "openai-insecure-api-key.<API key>"]`。`/health`、`/ready` 不需要 key。
+
+缺失或错误时返回 401，带 `WWW-Authenticate: Bearer`，`error.code` 为 `missing_api_key` 或
+`invalid_api_key`。WebSocket 在握手阶段即返回 401，不建立连接。
+
 **兼容基线**：OpenAI 官方 API Reference 的 GA 规范（按 2026-10 对齐），已用 `openai`
 Python SDK **3.31.0** 实测 HTTP 与 Realtime 两种接口。Realtime 只实现 GA 协议
 （`session.update` + `session.type: "transcription"`）；Beta 协议

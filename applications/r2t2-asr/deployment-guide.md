@@ -83,6 +83,7 @@ FLEURS 上会整句漏识别（60 s 段三个文件里两次）。段太短则�
 |------|------|
 | GPU NodePool | 见 `gpu/deployment-guide.md`；显存 ≥ 14 GB（含对齐模型），与其他服务共卡时需 Time-Slicing |
 | 模型存储 | 一个 RWX 的 PVC（如 EFS），在 overlay 中指定，存放权重与驱动 JIT 缓存 |
+| API key Secret | `r2t2-asr-api-keys`，键 `api-keys`，每行一个 key；缺失时 Pod 不启动，见「部署」 |
 | AWS Load Balancer Controller | Ingress 在 ALB 上监听 HTTPS 443；与其他服务共享 ALB 时靠主机名区分 |
 | 域名与证书 | 一个解析到该 ALB 的自定义主机名，及 ALB 同区域 ACM 中覆盖它的证书，在 overlay 中注入 |
 
@@ -101,10 +102,17 @@ docker push <account>.dkr.ecr.<region>.amazonaws.com/r2t2-asr:<tag>
 ## 部署
 
 ```bash
-cp -r overlays/example overlays/<env-name>   # 填入账号、namespace、PVC、前缀列表
+cp -r overlays/example overlays/<env-name>   # 填入账号、namespace、PVC、前缀列表、域名、证书
 kubectl config current-context               # 确认目标集群
+# API key：不入库，先于 Deployment 创建
+python3 -c "import secrets;print('sk-asr-'+secrets.token_urlsafe(16))" > api-keys
+kubectl create secret generic r2t2-asr-api-keys -n <ns> --from-file=api-keys=api-keys && rm api-keys
 kubectl apply -k overlays/<env-name>
 ```
+
+- API key：除 `/health`、`/ready` 外的 HTTP 与 WebSocket 请求都要带 key。轮换或增加 key 时更新
+  Secret 即可，服务按文件变化重新读取，不必重启（kubelet 同步 Secret 约需 1 分钟）。
+  同时保留新旧两行，等调用方切换后再删旧的。
 
 - 首次启动：initContainer 下载权重（R2T2 约 4 GB + FireRed VAD），版本固定在
   Deployment 中；之后启动约 1.5 分钟，其中预热约 3 秒。

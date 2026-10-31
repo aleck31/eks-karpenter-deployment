@@ -128,6 +128,10 @@ spec:
           mountPath: /app/asr-server.py
           subPath: asr-server.py
           readOnly: true
+        # API key 文件。整目录挂载而非 subPath，Secret 更新后无需重启即可生效。
+        - name: api-keys
+          mountPath: /etc/r2t2-asr
+          readOnly: true
         resources:
           requests:
             cpu: "1"
@@ -176,6 +180,13 @@ spec:
       - name: server
         configMap:
           name: r2t2-asr-server
+      # 非 optional：Secret 缺失时 Pod 不启动，而不是不带认证对外服务。
+      - name: api-keys
+        secret:
+          secretName: r2t2-asr-api-keys
+          items:
+          - key: api-keys
+            path: api-keys
 
       tolerations:
       - key: nvidia.com/gpu

@@ -24,6 +24,7 @@ import logging
 import os
 import queue
 import re
+import secrets
 import shutil
 import string
 import subprocess
@@ -33,6 +34,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
@@ -707,6 +709,106 @@ app = FastAPI(
                  "entry under `paths` is a plain GET that returns the event protocol."),
     lifespan=_lifespan,
 )
+
+
+# --- API key auth ---
+
+# One key per line; blank lines and lines starting with # are ignored.
+API_KEYS_FILE = Path(os.getenv("ASR_API_KEYS_FILE", "/etc/r2t2-asr/api-keys"))
+# Probes from the ALB and the kubelet carry no credentials.
+AUTH_EXEMPT_PATHS = frozenset({"/health", "/ready"})
+# Browsers cannot set headers on a WebSocket; OpenAI's Realtime API accepts the
+# key as a subprotocol instead, alongside "realtime".
+_WS_KEY_PROTOCOL = "openai-insecure-api-key."
+
+
+class _ApiKeys:
+    """Accepted keys, re-read whenever the file changes.
+
+    No file means auth is off, so local runs and tests need no setup. In the
+    cluster the Secret volume is not optional, so a missing Secret stops the pod
+    from starting instead of serving unauthenticated. A file with no keys rejects
+    every request. A Secret volume update swaps a symlink, so the inode changes
+    and a rotated key is picked up without a restart.
+    """
+
+    def __init__(self, path: Path):
+        self._path = path
+        self._stamp: tuple | None = None
+        self._keys: tuple[bytes, ...] = ()
+
+    def current(self) -> tuple[bytes, ...] | None:
+        try:
+            st = self._path.stat()
+        except FileNotFoundError:
+            self._stamp = None
+            return None
+        stamp = (st.st_ino, st.st_mtime_ns, st.st_size)
+        if stamp != self._stamp:
+            lines = (line.strip() for line in self._path.read_text().splitlines())
+            self._keys = tuple(line.encode() for line in lines
+                               if line and not line.startswith("#"))
+            self._stamp = stamp
+        return self._keys
+
+
+def _presented_key(scope, headers: dict) -> bytes:
+    scheme, _, token = headers.get(b"authorization", b"").partition(b" ")
+    if scheme.lower() == b"bearer" and token.strip():
+        return token.strip()
+    if scope["type"] == "websocket":
+        for proto in scope.get("subprotocols") or ():
+            if proto.startswith(_WS_KEY_PROTOCOL):
+                return proto[len(_WS_KEY_PROTOCOL):].encode()
+    return b""
+
+
+class _ApiKeyMiddleware:
+    """Require `Authorization: Bearer <key>` on HTTP and WebSocket, as OpenAI does.
+
+    Plain ASGI so request bodies and the WebSocket channel reach the endpoint
+    untouched. A refused WebSocket gets an HTTP 401 before the upgrade, so
+    clients see the same error body as on HTTP.
+    """
+
+    def __init__(self, app, keys: _ApiKeys):
+        self.app = app
+        self.keys = keys
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] not in ("http", "websocket") or scope["path"] in AUTH_EXEMPT_PATHS:
+            return await self.app(scope, receive, send)
+        keys = self.keys.current()
+        if keys is None:
+            return await self.app(scope, receive, send)
+
+        headers = dict(scope.get("headers") or ())
+        token = _presented_key(scope, headers)
+        if not token:
+            reason, message = "missing_api_key", (
+                "You didn't provide an API key. Provide it in an Authorization "
+                "header using Bearer auth (Authorization: Bearer YOUR_KEY).")
+        elif not any(secrets.compare_digest(token, key) for key in keys):
+            reason, message = "invalid_api_key", "Incorrect API key provided."
+        else:
+            return await self.app(scope, receive, send)
+
+        client = (headers.get(b"x-forwarded-for", b"").split(b",")[0].strip().decode()
+                  or (scope.get("client") or ("?",))[0])
+        log.warning("auth rejected: %s %s %s from %s", reason,
+                    scope.get("method", "WS"), scope["path"], client)
+        response = _error_response(ApiError(message, reason, status=401),
+                                   headers={"WWW-Authenticate": "Bearer"})
+        if scope["type"] == "http":
+            return await response(scope, receive, send)
+        ws = WebSocket(scope, receive, send)
+        try:
+            await ws.send_denial_response(response)
+        except RuntimeError:  # server without the denial-response extension
+            await ws.close(code=1008)
+
+
+app.add_middleware(_ApiKeyMiddleware, keys=_ApiKeys(API_KEYS_FILE))
 
 
 def _alive() -> bool:
@@ -1473,7 +1575,9 @@ async def _close_unavailable(ws: WebSocket, message: str) -> None:
 
 @app.websocket("/v1/realtime")
 async def realtime(ws: WebSocket):
-    await ws.accept()
+    # Browser clients offer ["realtime", "openai-insecure-api-key.<key>"] and fail
+    # the handshake unless one is selected; never echo the key-bearing one.
+    await ws.accept(subprotocol="realtime" if "realtime" in ws.scope.get("subprotocols", []) else None)
     if not (_ready and _alive()):
         await _close_unavailable(ws, f"Transcription engine is unavailable, retry after {RETRY_AFTER_S}s.")
         return

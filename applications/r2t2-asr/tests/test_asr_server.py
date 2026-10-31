@@ -775,3 +775,61 @@ def test_alignments_long_audio_is_windowed_by_recognised_text(server, monkeypatc
     assert [t for _, t, _ in fa.calls] == ["甲 乙 丙", "丁 戊 己"]  # script split at the window
     words = r.json()["words"]
     assert words[3]["word"] == "丁" and words[3]["start"] >= 2.25 - 1e-6
+
+
+# --- API key auth ---
+
+@pytest.fixture
+def keyed_server(tmp_path, monkeypatch):
+    keys = tmp_path / "api-keys"
+    keys.write_text("# comment\nsk-asr-good\n")
+    monkeypatch.setenv("ASR_API_KEYS_FILE", str(keys))
+    spec = importlib.util.spec_from_file_location("asr_server_keyed", SERVER)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+
+    def fake_load():
+        m._engine = FakeEngine()
+        m._vad = FakeVad()
+
+    m._load_runtime = fake_load
+    m.keys_file = keys
+    return m
+
+
+def test_http_requires_bearer_key_and_probes_do_not(keyed_server):
+    with TestClient(keyed_server.app) as c:
+        assert c.get("/health").status_code == 200
+        r = c.get("/v1/models")
+        assert r.status_code == 401 and r.headers["www-authenticate"] == "Bearer"
+        assert r.json()["error"] == {"message": r.json()["error"]["message"], "type": "invalid_request_error",
+                                     "param": None, "code": "missing_api_key"}
+        bad = c.get("/v1/models", headers={"Authorization": "Bearer sk-asr-bad"})
+        assert bad.status_code == 401 and bad.json()["error"]["code"] == "invalid_api_key"
+        ok = {"Authorization": "Bearer sk-asr-good"}
+        assert c.get("/v1/models", headers=ok).status_code == 200
+        assert _post(c, tone(1.0)).status_code == 401
+        r = c.post("/v1/audio/transcriptions", headers=ok,
+                   files={"file": ("a.wav", wav_bytes(tone(1.0)), "audio/wav")})
+        assert r.status_code == 200 and r.json()["text"]
+
+
+def test_websocket_key_by_header_or_subprotocol(keyed_server):
+    with TestClient(keyed_server.app) as c:
+        with pytest.raises(Exception) as denied:
+            with c.websocket_connect("/v1/realtime"):
+                pass
+        assert getattr(denied.value, "status_code", None) == 401
+        with c.websocket_connect("/v1/realtime", headers={"Authorization": "Bearer sk-asr-good"}) as ws:
+            assert json.loads(ws.receive_text())["type"] == "session.created"
+        with c.websocket_connect("/v1/realtime",
+                                 subprotocols=["realtime", "openai-insecure-api-key.sk-asr-good"]) as ws:
+            assert ws.accepted_subprotocol == "realtime"
+            assert json.loads(ws.receive_text())["type"] == "session.created"
+
+
+def test_rotated_key_takes_effect_without_restart(keyed_server):
+    with TestClient(keyed_server.app) as c:
+        keyed_server.keys_file.write_text("sk-asr-new\n")
+        assert c.get("/v1/models", headers={"Authorization": "Bearer sk-asr-good"}).status_code == 401
+        assert c.get("/v1/models", headers={"Authorization": "Bearer sk-asr-new"}).status_code == 200
