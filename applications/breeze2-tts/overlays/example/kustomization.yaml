@@ -39,3 +39,10 @@ patches:
       - op: add
         path: /metadata/annotations/alb.ingress.kubernetes.io~1security-group-prefix-lists
         value: pl-xxxxxxxxxxxxxxxxx
+      # HTTPS：证书须覆盖该主机名，且与 ALB 同区域（ACM）
+      - op: add
+        path: /metadata/annotations/alb.ingress.kubernetes.io~1certificate-arn
+        value: arn:aws:acm:<region>:<account-id>:certificate/<id>
+      - op: replace
+        path: /spec/rules/0/host
+        value: tts.yourdomain.com

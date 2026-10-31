@@ -1,7 +1,6 @@
 # Breeze TTS 2 ALB Ingress
-# :8880 → Breeze TTS 2 (OpenAI 兼容接口 /v1/audio/speech)
-# 共享 ALB（group.name）、来源限制等环境取值由 overlay 注入。同一 ALB group 内
-# 一个 listen-port 只能由一个 Ingress 声明。
+# HTTPS :8880 → Breeze TTS 2 (OpenAI 兼容接口 /v1/audio/speech)，TLS 在 ALB 终止。
+# 主机名、证书、共享 ALB（group.name）与来源限制由 overlay 注入。
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -10,13 +9,15 @@ metadata:
   annotations:
     alb.ingress.kubernetes.io/scheme: internet-facing
     alb.ingress.kubernetes.io/target-type: ip
-    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":8880}]'
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":8880}]'
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
     alb.ingress.kubernetes.io/healthcheck-path: /health
     alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=1800
 spec:
   ingressClassName: alb
   rules:
-  - http:
+  - host: tts.example.com
+    http:
       paths:
       - path: /
         pathType: Prefix
