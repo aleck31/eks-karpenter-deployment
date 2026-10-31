@@ -1,5 +1,6 @@
-# R2T2 ASR ALB Ingress，:8000 → ASR。
-# 共享 ALB（group.name）、来源限制等环境取值由 overlay 注入。
+# R2T2 ASR ALB Ingress
+# HTTPS :8000 → ASR（HTTP 接口与 wss:// 实时会话），TLS 在 ALB 终止。
+# 主机名、证书、共享 ALB（group.name）与来源限制由 overlay 注入。
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -8,12 +9,16 @@ metadata:
   annotations:
     alb.ingress.kubernetes.io/scheme: internet-facing
     alb.ingress.kubernetes.io/target-type: ip
-    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":8000}]'
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":8000}]'
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
     alb.ingress.kubernetes.io/healthcheck-path: /health
+    # 实时会话是长连接；同一 ALB group 内各 Ingress 的该值须一致
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=1800
 spec:
   ingressClassName: alb
   rules:
-  - http:
+  - host: asr.example.com
+    http:
       paths:
       - path: /
         pathType: Prefix
