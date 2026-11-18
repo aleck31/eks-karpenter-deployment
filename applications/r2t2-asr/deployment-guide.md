@@ -14,15 +14,17 @@
 ```
 applications/r2t2-asr/
 ├── Dockerfile                    # 官方 qwenllm/qwen3-asr 镜像 + R2T2 + FireRed VAD
+├── diarizer/Dockerfile           # 说话人分离 sidecar 镜像（NeMo，CPU）
 ├── base/
 │   ├── asr-server.py             # 服务层，以 ConfigMap 挂载，改它无需重建镜像
+│   ├── diarizer-server.py        # sidecar 服务，同样以 ConfigMap 挂载
 │   ├── r2t2-asr-deployment.yaml  # Deployment + Service；initContainer 下载权重
 │   ├── r2t2-asr-ingress.yaml     # ALB HTTPS :443，按主机名路由
 │   └── kustomization.yaml
 ├── overlays/
 │   ├── example/                  # 入库：示例取值，供复制
 │   └── <env-name>/               # 不入库：真实取值
-└── tests/test_asr_server.py      # 服务层单元测试（假模型，不需要 GPU）
+└── tests/                        # 服务层与 sidecar 单元测试（假模型，不需要 GPU）
 ```
 
 ## 架构
@@ -34,8 +36,12 @@ applications/r2t2-asr/
                                                        │  └ R2T2 streaming_transcribe（官方实现，原样调用）
                                                        └ Batcher → vllm.LLM.generate（多路合并为一次批调用）
                       ├ POST /v1/audio/alignments ── Qwen3-ForcedAligner（同进程，GPU）
-                      └ verbose_json / srt / vtt 识别后再对齐一遍，切成字幕粒度
+                      ├ verbose_json / srt / vtt 识别后再对齐一遍，切成字幕粒度
+                      └ diarized_json 同时调用 diarizer 容器（同 Pod，127.0.0.1:8010，CPU）
+                          Nemotron 3 Diarization，结果按词分配说话人
 ```
+
+**说话人分离为什么是 sidecar**：NeMo 需要 Python ≥ 3.12，ASR 镜像锁定在 3.10；模型在 CPU 上就够快，不占 GPU 槽位与显存。ASR 容器把解码后的录音写到两个容器共享的 emptyDir，把路径交给 sidecar，识别与分离并行，总耗时约为二者中较长的一个。sidecar 一次处理一个录音，特征分块提取，内存不随时长明显增长（3.6 小时峰值 2.2 GiB）。
 
 - **推理算法用官方实现**：`R2T2ASRModel.streaming_transcribe` / `finish_streaming_transcribe`
   不改写；逐块调度（自适应 max_new_tokens、幻觉检测）照官方 `ws_server.py`。
@@ -62,6 +68,8 @@ applications/r2t2-asr/
 | `ASR_ALIGNER_DEVICE` | `cuda` | GPU 上每 12 秒段约 30 ms、占约 2.4 GB；`cpu` 不占显存但每段约 1.4 秒 |
 | `ASR_MAX_CUE_SECONDS` | 7 | 字幕段上限，超出的句子按逗号或停顿再切 |
 | `ASR_ALIGN_WINDOW_SECONDS` | 90 | `/alignments` 超过此长度分窗。整段对齐 144 秒内误差 < 0.1 秒，217 秒处漂移约 9 秒；窗越长激活显存越大 |
+| `DIARIZER_URL` | `http://127.0.0.1:8010` | 说话人分离 sidecar；置空则 `diarized_json` 返回 400 |
+| `DIARIZER_THREADS`（sidecar） | 4 | 与容器 CPU 配额一致。实测 RTF 0.023-0.027（75 分钟会议 104 秒），较慢的 CPU 上 0.05。分离期间同 Pod 的实时识别首字延迟不变 |
 | `ASR_ALIGNER_KEEP_GIB` | 2.5 | 对齐后 PyTorch 显存缓存超过此值即归还。不归还时几次长窗对齐后从 2.4 涨到 5.6 GiB |
 
 **为什么要切段**：R2T2 每块都把整段从头重新喂一遍，段越长计算越多，且长段在
@@ -93,6 +101,8 @@ FLEURS 上会整句漏识别（60 s 段三个文件里两次）。段太短则�
 
 ```bash
 DOCKER_BUILDKIT=1 docker build -t <account>.dkr.ecr.<region>.amazonaws.com/r2t2-asr:<tag> .
+DOCKER_BUILDKIT=1 docker build -f diarizer/Dockerfile \
+    -t <account>.dkr.ecr.<region>.amazonaws.com/r2t2-asr-diarizer:<tag> .   # 约 2 GB，无需 GPU
 # 镜像内跑单元测试（依赖版本与生产一致）
 docker run --rm -v $PWD:/src -w /src --entrypoint bash <image> \
     -c "pip install -q pytest==8.4.2 && python3 -m pytest tests -q"
@@ -114,7 +124,7 @@ kubectl apply -k overlays/<env-name>
   Secret 即可，服务按文件变化重新读取，不必重启（kubelet 同步 Secret 约需 1 分钟）。
   同时保留新旧两行，等调用方切换后再删旧的。
 
-- 首次启动：initContainer 下载权重（R2T2 约 4 GB + FireRed VAD），版本固定在
+- 首次启动：initContainer 下载权重（R2T2 约 4 GB、FireRed VAD、对齐模型、Nemotron 3 Diarization），版本固定在
   Deployment 中；之后启动约 1.5 分钟，其中预热约 3 秒。
 - 显卡驱动的 JIT 缓存放在模型 PVC 的 `cache/r2t2-cuda` 子目录。驱动或 GPU 型号变化后首次
   启动会重新编译（约 50 秒），Pod 就绪前完成，不影响请求。
@@ -147,6 +157,16 @@ kubectl apply -k overlays/<env-name>
 
 FLEURS 英文参考文本与实际读法有出入（如写 `nineteen` 读 `19`），对齐在这些位置附近偏差较大。
 修正前：识别段每段 11-13 秒，7.3 秒三句话为一条。
+
+**说话人分离**（AliMeeting Test，每 0.1 秒单人语音检查归属是否正确，即服务按词分配的效果）：
+
+| | 远场 20 场 | 近场 20 场 | 1.1-3.4 小时拼接（7 人） |
+|---|---|---|---|
+| 归属错误 | 1.82% | 1.43% | 2.28% |
+| 说话人混淆（DER 分项） | 0.55% | 0.38% | 0.44% |
+
+同条件下 DiariZen（large-s80-md-v2，GPU）为 2.64% / 1.70% / 2.81%，故选用 Nemotron。总人数超过 8 时
+（实测 3.6 小时、多于 8 人的拼接录音），后出现的人沿用已有标签，归属错误明显上升。
 
 ## 许可
 

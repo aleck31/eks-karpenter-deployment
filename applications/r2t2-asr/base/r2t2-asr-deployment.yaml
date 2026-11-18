@@ -38,6 +38,8 @@ spec:
                "/models/FireRedVAD", ["Stream-VAD/*"]),
               ("Qwen/Qwen3-ForcedAligner-0.6B", "c7cbfc2048c462b0d63a45797104fc9db3ad62b7",
                "/models/Qwen3-ForcedAligner-0.6B", None),
+              ("nvidia/Nemotron-3-Diarization", "52a432672732425e4c19765b9fec9b5810e6f4ba",
+               "/models/Nemotron-3-Diarization", ["Nemotron-3-Diarization.nemo"]),
           ]
           for repo, rev, path, patterns in WANT:
               marker = os.path.join(path, ".revision")
@@ -78,6 +80,12 @@ spec:
         # process); set ASR_ALIGNER_PATH to "" to run without it.
         - name: ASR_ALIGNER_PATH
           value: /models/Qwen3-ForcedAligner-0.6B
+        # diarized_json: the diarizer container below, reached over localhost.
+        # Set DIARIZER_URL to "" to run without it (diarized_json then answers 400).
+        - name: DIARIZER_URL
+          value: http://127.0.0.1:8010
+        - name: DIARIZER_SHARED_DIR
+          value: /shared-audio
         # KV cache in bytes. A request holds KV only while it runs, so the peak
         # is (live streams + upload segments in flight) x segment length. A
         # 30 s segment, the longest there is, measured 474 tokens (390 audio
@@ -132,6 +140,8 @@ spec:
         - name: api-keys
           mountPath: /etc/r2t2-asr
           readOnly: true
+        - name: shared-audio
+          mountPath: /shared-audio
         resources:
           requests:
             cpu: "1"
@@ -172,6 +182,53 @@ spec:
           timeoutSeconds: 5
           failureThreshold: 3
 
+      # Speaker diarization (Nemotron 3 Diarization) on CPU. A separate image because
+      # NeMo needs Python >= 3.12; the ASR image is pinned to 3.10. Listens on localhost
+      # only and reads the recordings the ASR container writes to shared-audio.
+      - name: diarizer
+        image: 123456789012.dkr.ecr.us-west-2.amazonaws.com/r2t2-asr-diarizer:latest
+        env:
+        - name: DIARIZER_MODEL_PATH
+          value: /models/Nemotron-3-Diarization/Nemotron-3-Diarization.nemo
+        - name: DIARIZER_SHARED_DIR
+          value: /shared-audio
+        - name: DIARIZER_THREADS
+          value: "4"
+        volumeMounts:
+        - name: models
+          mountPath: /models
+          readOnly: true
+        - name: shared-audio
+          mountPath: /shared-audio
+          readOnly: true
+        - name: diarizer
+          mountPath: /app/diarizer-server.py
+          subPath: diarizer-server.py
+          readOnly: true
+        resources:
+          # One recording at a time on 4 threads: RTF 0.027-0.05 depending on the
+          # CPU. Peak memory 2.2 GiB for a 3.6 h file; features are extracted in
+          # pieces, so it grows only by ~0.2 GiB per hour.
+          requests:
+            cpu: "4"
+            memory: 3Gi
+          limits:
+            cpu: "4"
+            memory: 4Gi
+        # Bound to 127.0.0.1, so probes run inside the container.
+        startupProbe:
+          exec:
+            command: ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/ready', timeout=3)"]
+          periodSeconds: 5
+          timeoutSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          exec:
+            command: ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/health', timeout=5)"]
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+
       volumes:
       - name: models
         persistentVolumeClaim:
@@ -180,6 +237,14 @@ spec:
       - name: server
         configMap:
           name: r2t2-asr-server
+      - name: diarizer
+        configMap:
+          name: r2t2-asr-diarizer
+      # Decoded uploads handed to the diarizer, deleted after each request.
+      # A 4 h recording is 460 MB as 16 kHz PCM16.
+      - name: shared-audio
+        emptyDir:
+          sizeLimit: 8Gi
       # 非 optional：Secret 缺失时 Pod 不启动，而不是不带认证对外服务。
       - name: api-keys
         secret:

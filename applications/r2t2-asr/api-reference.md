@@ -50,10 +50,13 @@ multipart/form-data：
 | `model` | 接受并忽略（只有一个模型） |
 | `language` | ISO-639-1/3 代码：`zh`、`en`（及 `cmn`、`zh-cn` 等）；不填自动识别 |
 | `prompt` | 上下文提示，传给模型 |
-| `response_format` | `json`（默认）、`text`、`verbose_json`、`srt`、`vtt` |
+| `response_format` | `json`（默认）、`text`、`verbose_json`、`srt`、`vtt`、`diarized_json` |
 | `stream` | `true` 时以 SSE 返回 `transcript.text.delta` / `transcript.text.done`（仅 `json`、`text`） |
 | `temperature` | 接受并忽略（贪心解码） |
 | `timestamp_granularities[]` | `segment`（默认）、`word`，可同时给；仅 `verbose_json`。`word` 时返回 `words` |
+| `chunking_strategy` | 接受并忽略：上传总是在停顿处切段识别 |
+| `max_speakers` | 扩展，仅 `diarized_json`。1-8，可能发言的最多人数；多出的说话人并入最相近的一位 |
+| `known_speaker_names[]` / `known_speaker_references[]` | 尚不支持，给出时返回 400 |
 
 响应：
 
@@ -76,6 +79,28 @@ multipart/form-data：
  "segments": [{"id": 0, "start": 1.36, "end": 5.44, "text": "州长办公室表示，伤者中有十九人是警察。"}, …],
  "usage": {"type": "duration", "seconds": 73}}
 ```
+
+### diarized_json：说话人分离
+
+与 OpenAI `gpt-4o-transcribe-diarize` 的返回形状相同：
+
+```json
+{"task": "transcribe", "duration": 4507.1, "text": "……",
+ "segments": [{"type": "transcript.text.segment", "id": "seg_0", "start": 1.36, "end": 5.44,
+               "text": "州长办公室表示，伤者中有十九人是警察。", "speaker": "A"}, …],
+ "usage": {"type": "duration", "seconds": 4508}}
+```
+
+- `speaker` 为 `A`、`B`、…，按首次发言的顺序编号；同一录音内同一人始终是同一字母。
+- 每个识别出的词归给当时正在说话的人（多人重叠时取覆盖该词最多的一位，无人时取最近的一段），
+  段在句末和说话人切换处断开，超过 7 秒再按逗号或停顿切，与 `verbose_json` 的字幕段一致。
+- **每个文件最多 8 人发言**（模型的输出通道数）。超过 8 人时，后出现的人会沿用已有标签，
+  归属不可靠。会议的本地与远端两侧请分别作为两个文件提交。
+- 远端声音若被本地麦克风再次录入（未做回声消除的混合音轨），同一人会被拆成两个同时发言的
+  说话人。
+- 两人同时说话时只有一份文字稿，较轻的一方通常识别不出来，因而也无法归属。
+- 耗时：说话人分离在 CPU 上与识别并行，总耗时约为二者中较长的一个；实测 64 分钟录音 100 秒，75 分钟 104 秒。
+- 不支持 `stream`；部署未启用说话人分离时返回 400 `unsupported_value`。
 
 ## POST /v1/audio/alignments（扩展）
 
@@ -158,7 +183,8 @@ multipart/form-data：
 
 - **delta 只追加、不改写**，在说话过程中即开始发送（早于该轮的 committed），`completed.transcript` 等于该轮 delta 依次拼接。
 - **`turn_detection: null` 时**，客户端长时间不 commit，服务端会在轮次满 15 秒后的停顿处、或 30 秒时自行提交（发 `committed` 后接 `completed`），以限制单轮计算量。
-- 不支持：`audio/pcmu`、`audio/pcma`、`semantic_vad`、`noise_reduction`、`include`（logprobs）、`keywords`、`delay`、说话人分离。字段若出现则忽略，格式与 turn_detection 类型不支持时报错。
+- 不支持：`audio/pcmu`、`audio/pcma`、`semantic_vad`、`noise_reduction`、`include`（logprobs）、`keywords`、`delay`。字段若出现则忽略，格式与 turn_detection 类型不支持时报错。
+- `diarized_json`：最多 8 人；`known_speaker_names[]` / `known_speaker_references[]` 尚不支持（返回 400）；`chunking_strategy` 忽略；`prompt` 仍然生效（OpenAI 的 diarize 模型不支持）；`max_speakers` 为扩展。
 - 仅支持中文与英文。
 
 ## 其他

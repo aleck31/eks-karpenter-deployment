@@ -833,3 +833,69 @@ def test_rotated_key_takes_effect_without_restart(keyed_server):
         keyed_server.keys_file.write_text("sk-asr-new\n")
         assert c.get("/v1/models", headers={"Authorization": "Bearer sk-asr-good"}).status_code == 401
         assert c.get("/v1/models", headers={"Authorization": "Bearer sk-asr-new"}).status_code == 200
+
+
+# --- speaker diarization ---
+
+def test_words_take_the_speaker_covering_most_of_them(server):
+    turns = [(0.0, 1.0, 0), (0.9, 2.0, 1), (5.0, 6.0, 0)]
+    words = [_w("a", 0.1, 0.5), _w("b", 0.95, 1.6), _w("c", 3.0, 3.2), _w("d", 4.6, 4.8)]
+    got = [w["speaker"] for w in server.assign_speakers(words, turns)]
+    assert got == [0, 1, 1, 0]  # c is nearest to the turn ending at 2.0, d to the one at 5.0
+
+
+def test_segments_break_where_the_speaker_changes(server):
+    text = "你好吗？我很好，谢谢。"
+    words = [{**_w(ch, i * 0.3, i * 0.3 + 0.25), "speaker": 0 if i < 5 else 1}
+             for i, ch in enumerate("你好吗我很好谢谢")]
+    segs = server.sentence_segments(text, words, _units)
+    assert [(s["text"], s["speaker"]) for s in segs] == [("你好吗？", 0), ("我很", 0), ("好，谢谢。", 1)]
+
+
+def test_speaker_names_count_like_spreadsheet_columns(server):
+    assert [server._speaker_name(i) for i in (0, 1, 25, 26, 27)] == ["A", "B", "Z", "AA", "AB"]
+
+
+def _diarized(c, audio, **data):
+    return c.post("/v1/audio/transcriptions", data={"response_format": "diarized_json", **data},
+                  files={"file": ("a.wav", wav_bytes(audio), "audio/wav")})
+
+
+def test_http_diarized_json_is_openai_shape(server, monkeypatch):
+    audio = _two_segment_upload(server, monkeypatch)
+    seen = {}
+
+    async def fake_diarize(a, max_speakers):
+        seen["max_speakers"] = max_speakers
+        return [(0.0, 2.4, 3), (2.6, 5.0, 1)]  # sidecar channels need not start at 0
+
+    monkeypatch.setattr(server, "DIARIZER_URL", "http://diarizer")
+    monkeypatch.setattr(server, "diarize", fake_diarize)
+    with TestClient(server.app) as c:
+        server._vad = FakeVad(spans=[(0.0, 2.0), (3.0, 5.0)])
+        server._aligner = FakeAligner()
+        r = _diarized(c, audio, max_speakers="2", chunking_strategy="auto")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert set(body) == {"task", "duration", "text", "segments", "usage"}
+    segs = body["segments"]
+    assert all(s["type"] == "transcript.text.segment" and s["id"] == f"seg_{i}" for i, s in enumerate(segs))
+    assert [(s["text"], s["speaker"]) for s in segs] == [
+        ("第一句。", "A"), ("第二句。", "A"), ("Hello world.", "B"), ("Bye.", "B")]
+    assert seen["max_speakers"] == 2
+
+
+def test_http_diarized_json_errors(server, monkeypatch):
+    audio = tone(1.0)
+    with TestClient(server.app) as c:
+        off = _diarized(c, audio)
+        monkeypatch.setattr(server, "DIARIZER_URL", "http://diarizer")
+        known = c.post("/v1/audio/transcriptions",
+                       data={"response_format": "diarized_json", "known_speaker_names[]": ["agent"]},
+                       files={"file": ("a.wav", wav_bytes(audio), "audio/wav")})
+        cap = _post(c, audio, max_speakers="2")  # json, not diarized_json
+        many = _diarized(c, audio, max_speakers="9")
+    assert off.status_code == 400 and off.json()["error"]["code"] == "unsupported_value"
+    assert known.status_code == 400 and known.json()["error"]["param"] == "known_speaker_names"
+    assert cap.status_code == 400 and cap.json()["error"]["param"] == "max_speakers"
+    assert many.status_code == 400 and many.json()["error"]["param"] == "max_speakers"

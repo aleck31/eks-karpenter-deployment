@@ -13,6 +13,9 @@ images:
   - name: 123456789012.dkr.ecr.us-west-2.amazonaws.com/r2t2-asr
     newName: <your-account-id>.dkr.ecr.<your-region>.amazonaws.com/r2t2-asr
     newTag: latest
+  - name: 123456789012.dkr.ecr.us-west-2.amazonaws.com/r2t2-asr-diarizer
+    newName: <your-account-id>.dkr.ecr.<your-region>.amazonaws.com/r2t2-asr-diarizer
+    newTag: latest
 
 patches:
   # 模型存储：一个 RWX 的 PVC（如 EFS），存放权重与驱动 JIT 缓存。

@@ -913,7 +913,7 @@ def _tuned_policy(raw, default: SegmentPolicy) -> SegmentPolicy:
     return SegmentPolicy(float(raw[0]), float(raw[1]))
 
 
-RESPONSE_FORMATS = ("json", "text", "verbose_json", "srt", "vtt")
+RESPONSE_FORMATS = ("json", "text", "verbose_json", "srt", "vtt", "diarized_json")
 TIMESTAMP_GRANULARITIES = ("word", "segment")
 
 
@@ -1048,10 +1048,8 @@ def split_sentences(text: str) -> list[str]:
     return [p.rstrip("\x00") for p in out]
 
 
-def _split_at_pauses(clause: str, span: list[dict], tokenize) -> list[tuple[str, list[dict]]]:
-    """Cut a clause where its words pause; text is cut between the words."""
-    cuts = [k for k in range(1, len(span))
-            if span[k]["start"] - span[k - 1]["end"] >= CUE_PAUSE_SECONDS]
+def _cut_clause(clause: str, span: list[dict], cuts: list[int], tokenize) -> list[tuple[str, list[dict]]]:
+    """Split a clause before the words at indices `cuts`; text is cut between the words."""
     if not cuts:
         return [(clause, span)]
     # Cut each piece just before the first character of its first word, so
@@ -1066,17 +1064,33 @@ def _split_at_pauses(clause: str, span: list[dict], tokenize) -> list[tuple[str,
             for j in range(len(bounds) - 1)]
 
 
+def _split_at_pauses(clause: str, span: list[dict], tokenize) -> list[tuple[str, list[dict]]]:
+    """Cut a clause where its words pause."""
+    return _cut_clause(clause, span, [k for k in range(1, len(span))
+                                      if span[k]["start"] - span[k - 1]["end"] >= CUE_PAUSE_SECONDS],
+                       tokenize)
+
+
+def _split_at_speakers(clause: str, span: list[dict], tokenize) -> list[tuple[str, list[dict]]]:
+    """Cut a clause where the speaker of its words changes."""
+    return _cut_clause(clause, span, [k for k in range(1, len(span))
+                                      if span[k].get("speaker") != span[k - 1].get("speaker")],
+                       tokenize)
+
+
 def sentence_segments(text: str, words: list[dict], tokenize,
                       max_cue: float = MAX_CUE_SECONDS) -> list[dict] | None:
     """Subtitle-sized segments of `text`, timed by their first and last word.
 
     A segment is a sentence, or, for a sentence longer than `max_cue`, a run of
     its clauses packed up to that length. Words are the aligner's units in
-    order; each piece of text takes as many as it tokenizes into. None if the
-    two do not line up, so the caller keeps the pause-cut segments instead of
-    mislabelling every cue after a mismatch.
+    order; each piece of text takes as many as it tokenizes into. When words
+    carry a "speaker", a segment also ends where the speaker changes and
+    carries that speaker. None if text and words do not line up, so the caller
+    keeps the pause-cut segments instead of mislabelling every cue after a
+    mismatch.
     """
-    pieces = []  # (text, start, end, ends_sentence)
+    pieces = []  # (text, start, end, ends_sentence, speaker)
     i = 0
     for sentence in split_sentences(text):
         clauses = _split_at(_CLAUSE_END, sentence)
@@ -1085,8 +1099,8 @@ def sentence_segments(text: str, words: list[dict], tokenize,
             last = k == len(clauses) - 1
             if n == 0:
                 if pieces:  # stray punctuation belongs to the piece before
-                    t, a, b, e = pieces[-1]
-                    pieces[-1] = (t + clause, a, b, e or last)
+                    t, a, b, e, s = pieces[-1]
+                    pieces[-1] = (t + clause, a, b, e or last, s)
                 continue
             if i + n > len(words):
                 return None
@@ -1094,20 +1108,23 @@ def sentence_segments(text: str, words: list[dict], tokenize,
             i += n
             subs = _split_at_pauses(clause, span, tokenize) \
                 if span[-1]["end"] - span[0]["start"] > max_cue else [(clause, span)]
+            subs = [p for t, sp in subs for p in _split_at_speakers(t, sp, tokenize)]
             for k2, (t, sp) in enumerate(subs):
                 pieces.append((t, sp[0]["start"], max(w["end"] for w in sp),
-                               last and k2 == len(subs) - 1))
+                               last and k2 == len(subs) - 1, sp[0].get("speaker")))
     if i != len(words):
         return None
 
     segments: list[dict] = []
     cue = None
-    for text_, start, end, ends_sentence in pieces:
-        if cue is not None and end - cue["start"] > max_cue:
+    for text_, start, end, ends_sentence, speaker in pieces:
+        if cue is not None and (end - cue["start"] > max_cue or speaker != cue.get("speaker")):
             segments.append(cue)
             cue = None
         if cue is None:
             cue = {"id": len(segments), "start": start, "end": end, "text": text_}
+            if speaker is not None:
+                cue["speaker"] = speaker
         else:
             cue["text"] += text_
             cue["end"] = max(cue["end"], end)
@@ -1133,6 +1150,102 @@ async def align_words(audio: np.ndarray, ranges: list[tuple[int, int]],
         words += [{"word": w, "start": round(min(offset + s, end), 3),
                    "end": round(min(offset + e, end), 3)} for w, s, e in items]
     return words
+
+
+# --- speaker diarization (sidecar) ---
+
+# The diarizer sidecar in this pod (diarizer/diarizer-server.py); empty disables diarized_json.
+DIARIZER_URL = os.getenv("DIARIZER_URL", "")
+# Volume shared with the sidecar: the decoded upload is written here once and read by path.
+DIARIZER_SHARED_DIR = Path(os.getenv("DIARIZER_SHARED_DIR", "/shared-audio"))
+DIARIZER_MAX_SPEAKERS = 8  # output channels of Nemotron 3 Diarization
+
+
+def _write_wav(path: Path, audio: np.ndarray) -> None:
+    import wave
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SR)
+        for i in range(0, len(audio), SR * 60):
+            w.writeframes(_to_int16(audio[i:i + SR * 60]).tobytes())
+
+
+async def diarize(audio: np.ndarray, max_speakers: int | None) -> list[tuple[float, float, int]]:
+    """Speaker turns [(start, end, speaker)] from the sidecar, speakers in order of first speech."""
+    import httpx
+
+    path = DIARIZER_SHARED_DIR / f"{uuid.uuid4().hex}.wav"
+    try:
+        await _run(_write_wav, path, audio)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10.0)) as c:
+            r = await c.post(f"{DIARIZER_URL}/v1/diarize",
+                             json={"path": str(path), "max_speakers": max_speakers})
+        r.raise_for_status()
+        return [tuple(t) for t in r.json()["turns"]]
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def assign_speakers(words: list[dict], turns: list[tuple[float, float, int]]) -> list[dict]:
+    """Give each word the speaker that covers most of it, or the nearest turn when none does."""
+    import bisect
+
+    if not turns:
+        return [{**w, "speaker": 0} for w in words]
+    starts = [t[0] for t in turns]
+    longest = max(e - s for s, e, _ in turns)
+    out = []
+    for w in words:
+        ws, we = w["start"], max(w["end"], w["start"] + 0.01)
+        hi = bisect.bisect_left(starts, we)
+        lo = bisect.bisect_left(starts, ws - longest)
+        cover: dict[int, float] = {}
+        for s, e, spk in turns[lo:hi]:
+            o = min(we, e) - max(ws, s)
+            if o > 0:
+                cover[spk] = cover.get(spk, 0.0) + o
+        if cover:
+            spk = max(cover, key=cover.get)
+        else:
+            near = turns[max(0, hi - 1):hi + 1] + turns[lo:hi]
+            spk = min(near, key=lambda t: max(t[0] - we, ws - t[1], 0.0))[2]
+        out.append({**w, "speaker": spk})
+    return out
+
+
+def _segment_speaker(start: float, end: float, turns: list[tuple[float, float, int]]) -> int:
+    cover: dict[int, float] = {}
+    for s, e, spk in turns:
+        o = min(end, e) - max(start, s)
+        if o > 0:
+            cover[spk] = cover.get(spk, 0.0) + o
+    return max(cover, key=cover.get) if cover else 0
+
+
+def diarized_body(text: str, duration: float, segments: list[dict], usage: dict) -> dict:
+    """OpenAI TranscriptionDiarized. Speakers become A, B, ... in order of first appearance."""
+    names: dict = {}
+    out = []
+    for s in segments:
+        if not s["text"]:
+            continue
+        name = names.setdefault(s["speaker"], _speaker_name(len(names)))
+        out.append({"type": "transcript.text.segment", "id": f"seg_{len(out)}",
+                    "start": round(s["start"], 2), "end": round(s["end"], 2),
+                    "text": s["text"], "speaker": name})
+    return {"task": "transcribe", "duration": round(duration, 2), "text": text,
+            "segments": out, "usage": usage}
+
+
+def _speaker_name(i: int) -> str:
+    """A ... Z, then AA, AB, ... as spreadsheets count."""
+    name = ""
+    i += 1
+    while i:
+        i, r = divmod(i - 1, 26)
+        name = chr(65 + r) + name
+    return name
 
 
 def _timestamp(seconds: float, sep: str) -> str:
@@ -1164,14 +1277,22 @@ async def transcriptions(file: UploadFile = File(...), model: str = Form(""),
                          temperature: float = Form(0.0),
                          timestamp_granularities: list[str] | None = Form(
                              None, alias="timestamp_granularities[]"),
+                         chunking_strategy: str = Form(""),
+                         known_speaker_names: list[str] | None = Form(
+                             None, alias="known_speaker_names[]"),
+                         known_speaker_references: list[str] | None = Form(
+                             None, alias="known_speaker_references[]"),
+                         max_speakers: int | None = Form(None),
                          x_policy: str = Form(""), x_step_ms: str = Form("")):
     """OpenAI /v1/audio/transcriptions.
 
     `model` and `temperature` are accepted and ignored: one model, greedy
     decoding. `prompt` is passed to R2T2 as context. With the aligner loaded,
     verbose_json / srt / vtt segments are sentences, and
-    timestamp_granularities[]=word adds `words`. `x_*` fields are tuning
-    knobs honoured only with ASR_ALLOW_TUNING=1.
+    timestamp_granularities[]=word adds `words`. diarized_json adds a speaker
+    to every segment; `chunking_strategy` is accepted and ignored (uploads are
+    always cut at pauses), `max_speakers` is an extension. `x_*` fields are
+    tuning knobs honoured only with ASR_ALLOW_TUNING=1.
     """
     if not (_ready and _alive()):
         return _unavailable()
@@ -1179,6 +1300,20 @@ async def transcriptions(file: UploadFile = File(...), model: str = Form(""),
         return _error_response(ApiError(
             f"response_format must be one of {', '.join(RESPONSE_FORMATS)}",
             "invalid_value", "response_format"))
+    diarized = response_format == "diarized_json"
+    if diarized and not DIARIZER_URL:
+        return _error_response(ApiError(
+            "diarized_json needs the diarizer, which this deployment does not run",
+            "unsupported_value", "response_format"))
+    if known_speaker_names or known_speaker_references:
+        return _error_response(ApiError(
+            "Known speakers are not supported yet; speakers are labelled A, B, ...",
+            "unsupported_value",
+            "known_speaker_names" if known_speaker_names else "known_speaker_references"))
+    if max_speakers is not None and (not diarized or not 1 <= max_speakers <= DIARIZER_MAX_SPEAKERS):
+        return _error_response(ApiError(
+            f"max_speakers must be 1-{DIARIZER_MAX_SPEAKERS}, with response_format diarized_json",
+            "invalid_value", "max_speakers"))
     if stream and response_format not in ("json", "text"):
         return _error_response(ApiError(
             "stream is only supported with response_format json or text",
@@ -1202,6 +1337,9 @@ async def transcriptions(file: UploadFile = File(...), model: str = Form(""),
         return _error_response(ApiError("Could not decode the uploaded audio.",
                                         "invalid_audio", "file"))
     duration = len(audio) / SR
+    # Diarization reads the whole recording on CPU in the sidecar; it runs while
+    # recognition and alignment run here.
+    speakers_task = asyncio.ensure_future(diarize(audio, max_speakers)) if diarized else None
     policy = _tuned_policy(x_policy, FILE_POLICY)
     step_ms = int(x_step_ms) if ALLOW_TUNING and x_step_ms else FILE_STEP_MS
     spans = await _run(_vad.speech_spans, audio)
@@ -1242,6 +1380,8 @@ async def transcriptions(file: UploadFile = File(...), model: str = Form(""),
     try:
         results = await asyncio.gather(*tasks)
     except EngineDead:
+        if speakers_task:
+            speakers_task.cancel()
         return _unavailable()
     texts = [to_simplified(t) for t, _ in results]
     text = join_texts(texts)
@@ -1263,12 +1403,29 @@ async def transcriptions(file: UploadFile = File(...), model: str = Form(""),
                 return _error_response(ApiError(
                     "Word alignment failed.", "alignment_failed",
                     kind="server_error", status=500))
+    turns = None
+    if speakers_task:
+        try:
+            turns = await speakers_task
+        except Exception:
+            log.exception("diarization failed")
+            return _error_response(ApiError(
+                "Speaker diarization failed.", "diarization_failed",
+                kind="server_error", status=500))
         if words is not None:
-            sentences = sentence_segments(text, words, _aligner.tokenize)
-            if sentences is not None:
-                segments = sentences
-            else:
-                log.warning("sentence split did not match aligned words; keeping pause cuts")
+            words = assign_speakers(words, turns)
+    if words is not None:
+        sentences = sentence_segments(text, words, _aligner.tokenize)
+        if sentences is not None:
+            segments = sentences
+        else:
+            log.warning("sentence split did not match aligned words; keeping pause cuts")
+    if diarized:
+        # Without word times, a pause-cut segment takes the speaker covering most of it.
+        for s in segments:
+            if "speaker" not in s:
+                s["speaker"] = _segment_speaker(s["start"], s["end"], turns)
+        return diarized_body(text, duration, segments, usage)
     if response_format in ("srt", "vtt"):
         return PlainTextResponse(_subtitles(segments, response_format))
     body = {"task": "transcribe", "language": (detected or "").lower() or None,

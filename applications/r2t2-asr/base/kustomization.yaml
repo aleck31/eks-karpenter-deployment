@@ -10,3 +10,6 @@ configMapGenerator:
   - name: r2t2-asr-server
     files:
       - asr-server.py
+  - name: r2t2-asr-diarizer
+    files:
+      - diarizer-server.py
