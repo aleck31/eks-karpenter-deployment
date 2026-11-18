@@ -145,16 +145,16 @@ spec:
         resources:
           requests:
             cpu: "1"
-            # Resident memory measured at 6.7 GiB with the aligner loaded
-            # (server 4.3 + vLLM engine 4.0); the rest of the limit is page
-            # cache from reading weights, which the kernel reclaims.
-            memory: 8Gi
+            # Idle anonymous memory 6.5 GiB with the aligner loaded (server 3.4 +
+            # vLLM engine 3.0) plus ~4 GiB reclaimable page cache. Concurrent long
+            # uploads took the server to 8.0 and the engine to 4.4 GiB, past 12Gi.
+            memory: 10Gi
             nvidia.com/gpu: 1
           limits:
             # Feature extraction for every chunk, FireRed VAD and the
             # tokenizer run on CPU in this process, one stream per thread.
             cpu: "4"
-            memory: 12Gi
+            memory: 16Gi
             nvidia.com/gpu: 1
         # The server loads the model and warms up before it accepts connections,
         # so the startup probe covers load time; liveness starts after it.
