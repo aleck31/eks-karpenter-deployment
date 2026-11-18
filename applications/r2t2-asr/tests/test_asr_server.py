@@ -844,6 +844,25 @@ def test_words_take_the_speaker_covering_most_of_them(server):
     assert got == [0, 1, 1, 0]  # c is nearest to the turn ending at 2.0, d to the one at 5.0
 
 
+def test_at_the_speaker_limit_long_uncovered_speech_is_unknown(server):
+    turns = [(0.0, 1.0, server.UNKNOWN_SPEAKER), (1.0, 2.0, 0), (6.0, 7.0, 1)]
+    words = [_w("a", 0.1, 0.5), _w("b", 1.2, 1.6),            # in an unknown turn, in a turn
+             _w("c", 1.98, 3.5), _w("d", 3.6, 4.2),           # 2.2 s outside, c brushing a turn
+             _w("e", 5.5, 5.8)]                               # 0.3 s outside: nearest turn
+    got = [w["speaker"] for w in server.assign_speakers(words, turns, limit_reached=True)]
+    assert got == [-1, 0, -1, -1, 1]
+    assert [w["speaker"] for w in server.assign_speakers(words, turns)][2:] == [0, 0, 1]
+
+
+def test_diarized_body_names_unknown_and_warns_at_the_limit(server):
+    segs = [{"start": 0, "end": 1, "text": "x", "speaker": server.UNKNOWN_SPEAKER},
+            {"start": 1, "end": 2, "text": "y", "speaker": 5}]
+    body = server.diarized_body("xy", 2.0, segs, {}, limit_reached=True)
+    assert [s["speaker"] for s in body["segments"]] == ["unknown", "A"]
+    assert body["warnings"][0]["code"] == "speaker_limit_reached"
+    assert "warnings" not in server.diarized_body("xy", 2.0, segs, {})
+
+
 def test_segments_break_where_the_speaker_changes(server):
     text = "你好吗？我很好，谢谢。"
     words = [{**_w(ch, i * 0.3, i * 0.3 + 0.25), "speaker": 0 if i < 5 else 1}
@@ -867,7 +886,7 @@ def test_http_diarized_json_is_openai_shape(server, monkeypatch):
 
     async def fake_diarize(a, max_speakers):
         seen["max_speakers"] = max_speakers
-        return [(0.0, 2.4, 3), (2.6, 5.0, 1)]  # sidecar channels need not start at 0
+        return [(0.0, 2.4, 3), (2.6, 5.0, 1)], False  # sidecar channels need not start at 0
 
     monkeypatch.setattr(server, "DIARIZER_URL", "http://diarizer")
     monkeypatch.setattr(server, "diarize", fake_diarize)

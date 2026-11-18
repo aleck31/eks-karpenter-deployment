@@ -1159,6 +1159,15 @@ DIARIZER_URL = os.getenv("DIARIZER_URL", "")
 # Volume shared with the sidecar: the decoded upload is written here once and read by path.
 DIARIZER_SHARED_DIR = Path(os.getenv("DIARIZER_SHARED_DIR", "/shared-audio"))
 DIARIZER_MAX_SPEAKERS = 8  # output channels of Nemotron 3 Diarization
+UNKNOWN_SPEAKER = -1  # the sidecar's label for speech that matched none of the 8 speakers
+# With all 8 used, speech this long outside every turn is an extra speaker: on AliMeeting joined
+# to 9-12 speakers, the 8 found ones never left 1 s uncovered.
+UNCOVERED_UNKNOWN_S = 1.0
+UNCOVERED_PAUSE_S = 0.5  # a longer pause ends a run of uncovered words (the VAD's own cut)
+SPEAKER_LIMIT_WARNING = {
+    "code": "speaker_limit_reached",
+    "message": f"The diarizer used all {DIARIZER_MAX_SPEAKERS} of its speaker slots. If more "
+               "people spoke, speech that matched none of them is labelled \"unknown\"."}
 
 
 def _write_wav(path: Path, audio: np.ndarray) -> None:
@@ -1171,8 +1180,9 @@ def _write_wav(path: Path, audio: np.ndarray) -> None:
             w.writeframes(_to_int16(audio[i:i + SR * 60]).tobytes())
 
 
-async def diarize(audio: np.ndarray, max_speakers: int | None) -> list[tuple[float, float, int]]:
-    """Speaker turns [(start, end, speaker)] from the sidecar, speakers in order of first speech."""
+async def diarize(audio: np.ndarray, max_speakers: int | None) -> tuple[list[tuple[float, float, int]], bool]:
+    """Speaker turns [(start, end, speaker)] from the sidecar, speakers in order of first speech,
+    and whether all 8 speakers were used (then some turns may be UNKNOWN_SPEAKER)."""
     import httpx
 
     path = DIARIZER_SHARED_DIR / f"{uuid.uuid4().hex}.wav"
@@ -1182,13 +1192,16 @@ async def diarize(audio: np.ndarray, max_speakers: int | None) -> list[tuple[flo
             r = await c.post(f"{DIARIZER_URL}/v1/diarize",
                              json={"path": str(path), "max_speakers": max_speakers})
         r.raise_for_status()
-        return [tuple(t) for t in r.json()["turns"]]
+        body = r.json()
+        return [tuple(t) for t in body["turns"]], bool(body.get("speaker_limit_reached"))
     finally:
         path.unlink(missing_ok=True)
 
 
-def assign_speakers(words: list[dict], turns: list[tuple[float, float, int]]) -> list[dict]:
-    """Give each word the speaker that covers most of it, or the nearest turn when none does."""
+def assign_speakers(words: list[dict], turns: list[tuple[float, float, int]],
+                    limit_reached: bool = False) -> list[dict]:
+    """Give each word the speaker that covers most of it, or the nearest turn when none does.
+    With limit_reached, uncovered runs of words spanning UNCOVERED_UNKNOWN_S or more are unknown."""
     import bisect
 
     if not turns:
@@ -1196,6 +1209,7 @@ def assign_speakers(words: list[dict], turns: list[tuple[float, float, int]]) ->
     starts = [t[0] for t in turns]
     longest = max(e - s for s, e, _ in turns)
     out = []
+    uncovered = []
     for w in words:
         ws, we = w["start"], max(w["end"], w["start"] + 0.01)
         hi = bisect.bisect_left(starts, we)
@@ -1210,32 +1224,54 @@ def assign_speakers(words: list[dict], turns: list[tuple[float, float, int]]) ->
         else:
             near = turns[max(0, hi - 1):hi + 1] + turns[lo:hi]
             spk = min(near, key=lambda t: max(t[0] - we, ws - t[1], 0.0))[2]
+        uncovered.append(sum(cover.values()) < 0.5 * (we - ws))  # an edge brush is not cover
         out.append({**w, "speaker": spk})
+    if limit_reached:
+        i = 0
+        while i < len(out):
+            if not uncovered[i]:
+                i += 1
+                continue
+            j = i + 1
+            while j < len(out) and uncovered[j] and out[j]["start"] - out[j - 1]["end"] <= UNCOVERED_PAUSE_S:
+                j += 1
+            if out[j - 1]["end"] - out[i]["start"] >= UNCOVERED_UNKNOWN_S:
+                for w in out[i:j]:
+                    w["speaker"] = UNKNOWN_SPEAKER
+            i = j
     return out
 
 
-def _segment_speaker(start: float, end: float, turns: list[tuple[float, float, int]]) -> int:
+def _segment_speaker(start: float, end: float, turns: list[tuple[float, float, int]],
+                     limit_reached: bool = False) -> int:
     cover: dict[int, float] = {}
     for s, e, spk in turns:
         o = min(end, e) - max(start, s)
         if o > 0:
             cover[spk] = cover.get(spk, 0.0) + o
+    if limit_reached and sum(cover.values()) < 0.5 * (end - start):
+        return UNKNOWN_SPEAKER
     return max(cover, key=cover.get) if cover else 0
 
 
-def diarized_body(text: str, duration: float, segments: list[dict], usage: dict) -> dict:
-    """OpenAI TranscriptionDiarized. Speakers become A, B, ... in order of first appearance."""
-    names: dict = {}
+def diarized_body(text: str, duration: float, segments: list[dict], usage: dict,
+                  limit_reached: bool = False) -> dict:
+    """OpenAI TranscriptionDiarized. Speakers become A, B, ... in order of first appearance;
+    UNKNOWN_SPEAKER becomes "unknown". With limit_reached, adds `warnings` (an extension)."""
+    names: dict = {UNKNOWN_SPEAKER: "unknown"}
     out = []
     for s in segments:
         if not s["text"]:
             continue
-        name = names.setdefault(s["speaker"], _speaker_name(len(names)))
+        name = names.setdefault(s["speaker"], _speaker_name(len(names) - 1))
         out.append({"type": "transcript.text.segment", "id": f"seg_{len(out)}",
                     "start": round(s["start"], 2), "end": round(s["end"], 2),
                     "text": s["text"], "speaker": name})
-    return {"task": "transcribe", "duration": round(duration, 2), "text": text,
+    body = {"task": "transcribe", "duration": round(duration, 2), "text": text,
             "segments": out, "usage": usage}
+    if limit_reached:
+        body["warnings"] = [SPEAKER_LIMIT_WARNING]
+    return body
 
 
 def _speaker_name(i: int) -> str:
@@ -1404,16 +1440,17 @@ async def transcriptions(file: UploadFile = File(...), model: str = Form(""),
                     "Word alignment failed.", "alignment_failed",
                     kind="server_error", status=500))
     turns = None
+    limit_reached = False
     if speakers_task:
         try:
-            turns = await speakers_task
+            turns, limit_reached = await speakers_task
         except Exception:
             log.exception("diarization failed")
             return _error_response(ApiError(
                 "Speaker diarization failed.", "diarization_failed",
                 kind="server_error", status=500))
         if words is not None:
-            words = assign_speakers(words, turns)
+            words = assign_speakers(words, turns, limit_reached)
     if words is not None:
         sentences = sentence_segments(text, words, _aligner.tokenize)
         if sentences is not None:
@@ -1424,8 +1461,8 @@ async def transcriptions(file: UploadFile = File(...), model: str = Form(""),
         # Without word times, a pause-cut segment takes the speaker covering most of it.
         for s in segments:
             if "speaker" not in s:
-                s["speaker"] = _segment_speaker(s["start"], s["end"], turns)
-        return diarized_body(text, duration, segments, usage)
+                s["speaker"] = _segment_speaker(s["start"], s["end"], turns, limit_reached)
+        return diarized_body(text, duration, segments, usage, limit_reached)
     if response_format in ("srt", "vtt"):
         return PlainTextResponse(_subtitles(segments, response_format))
     body = {"task": "transcribe", "language": (detected or "").lower() or None,

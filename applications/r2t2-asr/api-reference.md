@@ -55,7 +55,7 @@ multipart/form-data：
 | `temperature` | 接受并忽略（贪心解码） |
 | `timestamp_granularities[]` | `segment`（默认）、`word`，可同时给；仅 `verbose_json`。`word` 时返回 `words` |
 | `chunking_strategy` | 接受并忽略：上传总是在停顿处切段识别 |
-| `max_speakers` | 扩展，仅 `diarized_json`。1-8，可能发言的最多人数；多出的说话人并入最相近的一位 |
+| `max_speakers` | 扩展，仅 `diarized_json`。1-8，可能发言的最多人数；多出的说话人并入最相近的一位。给出时不做 8 人上限的声纹核对 |
 | `known_speaker_names[]` / `known_speaker_references[]` | 尚不支持，给出时返回 400 |
 
 响应：
@@ -94,13 +94,37 @@ multipart/form-data：
 - `speaker` 为 `A`、`B`、…，按首次发言的顺序编号；同一录音内同一人始终是同一字母。
 - 每个识别出的词归给当时正在说话的人（多人重叠时取覆盖该词最多的一位，无人时取最近的一段），
   段在句末和说话人切换处断开，超过 7 秒再按逗号或停顿切，与 `verbose_json` 的字幕段一致。
-- **每个文件最多 8 人发言**（模型的输出通道数）。超过 8 人时，后出现的人会沿用已有标签，
-  归属不可靠。会议的本地与远端两侧请分别作为两个文件提交。
+- **每个文件最多分出 8 人**（模型的输出通道数）。8 个通道都用上时（未给 `max_speakers`），
+  每个通道的单人语音用 CAM++ 声纹再核对一遍：不像该通道主声音的部分，以及长于 1 秒却不在任何
+  通道里的语音，`speaker` 记为 `"unknown"`，响应顶层多一个 `warnings`（见下）。这能减少多出的人
+  被记到别人名下，但不能消除，多出的人也不会各自得到标签。实测 AliMeeting 拼接的 12 人录音：
+  多出 4 人的语音 44% 标为 `unknown`，其余仍记在某个字母上（多为短句、与他人重叠或紧贴他人发言）；
+  8 位被分出的人的语音没有被标 `unknown`。8 人对照录音中也没有。会议的本地与远端两侧仍建议
+  分别作为两个文件提交。
 - 远端声音若被本地麦克风再次录入（未做回声消除的混合音轨），同一人会被拆成两个同时发言的
   说话人。
 - 两人同时说话时只有一份文字稿，较轻的一方通常识别不出来，因而也无法归属。
 - 耗时：说话人分离在 CPU 上与识别并行，总耗时约为二者中较长的一个；实测 64 分钟录音 100 秒，75 分钟 104 秒。
+  8 个通道用满时声纹核对另加 20-35 秒（50-75 分钟录音）。
 - 不支持 `stream`；部署未启用说话人分离时返回 400 `unsupported_value`。
+
+**与 OpenAI 规范的差异**（只在 8 个通道用满时出现）：
+
+```json
+{"task": "transcribe", "duration": 4500.0, "text": "……",
+ "segments": [{"type": "transcript.text.segment", "id": "seg_7", "start": 61.2, "end": 63.0,
+               "text": "……", "speaker": "unknown"}, …],
+ "usage": {"type": "duration", "seconds": 4500},
+ "warnings": [{"code": "speaker_limit_reached",
+               "message": "The diarizer used all 8 of its speaker slots. If more people spoke, speech that matched none of them is labelled \"unknown\"."}]}
+```
+
+- `speaker: "unknown"` 类型仍是字符串，SDK 照常解析；但 OpenAI 文档只说标签是 `A`、`B`、…
+  或 `known_speaker_names[]` 中的名字。按字母推算人数或下标的客户端需把 `unknown` 单独处理；
+  它代表所有未能归属的人，不是一个人。
+- `warnings` 是扩展字段，OpenAI 的 `TranscriptionDiarized` 没有。openai-python 的模型允许额外字段
+  （`resp.warnings` 或 `resp.model_extra["warnings"]`），openai-go 在 `resp.JSON.ExtraFields["warnings"]`；
+  严格按 schema 拒绝未知字段的客户端会出错。
 
 ## POST /v1/audio/alignments（扩展）
 

@@ -38,7 +38,7 @@ applications/r2t2-asr/
                       ├ POST /v1/audio/alignments ── Qwen3-ForcedAligner（同进程，GPU）
                       ├ verbose_json / srt / vtt 识别后再对齐一遍，切成字幕粒度
                       └ diarized_json 同时调用 diarizer 容器（同 Pod，127.0.0.1:8010，CPU）
-                          Nemotron 3 Diarization，结果按词分配说话人
+                          Nemotron 3 Diarization，结果按词分配说话人；8 个通道用满时 CAM++ 核对声纹
 ```
 
 **说话人分离为什么是 sidecar**：NeMo 需要 Python ≥ 3.12，ASR 镜像锁定在 3.10；模型在 CPU 上就够快，不占 GPU 槽位与显存。ASR 容器把解码后的录音写到两个容器共享的 emptyDir，把路径交给 sidecar，识别与分离并行，总耗时约为二者中较长的一个。sidecar 一次处理一个录音，特征分块提取，内存不随时长明显增长（3.6 小时峰值 2.2 GiB）。
