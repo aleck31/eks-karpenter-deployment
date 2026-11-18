@@ -31,6 +31,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -121,12 +122,27 @@ VAD_MAX_GAIN_DB = 50.0
 # for cutting uploads, where it is only a candidate cut and FILE_POLICY decides.
 # At 200 ms every comma ended a live turn, so turns were fragments.
 VAD_SILENCE_MS = int(os.getenv("ASR_VAD_SILENCE_MS", "500"))
-VAD_PREFIX_PADDING_MS = 300  # reported only; turns are contiguous, see Session._vad_scan
+VAD_PREFIX_PADDING_MS = 300  # reported only; turns are contiguous, see Session._on_frame
 # A turn is cut this far before the frame where its end was detected, which
 # trails the actual silence by the smoothing window (5 frames).
 VAD_CUT_MARGIN_MS = 50
-# Pieces of a split chunk shorter than this are not decoded on their own.
-MIN_DECODE_SAMPLES = SR // 10
+# FireRed frames: 25 ms windows every 10 ms. A stream is fed whole frames only; features
+# computed per block lose the 15 ms at each block's end (46 frames per 480 ms, not 48), and the
+# reported times then ran 4.2% slow.
+VAD_HOP, VAD_WIN = 160, 400
+# The smoothing (5-frame mean) reports a speech end ~3 frames late, and a frame is complete
+# 15 ms after it starts. A client's silence_duration_ms is shortened by both, so a turn closes
+# once that much silence has arrived, not ~40 ms later.
+VAD_SMOOTH_LAG_FRAMES = 3
+VAD_END_LAG_FRAMES = 7
+# A turn still speaking is cut from TURN_SOFT_S at the first dip below the speech threshold, by
+# TURN_HARD_S at the least speech-like frame of its last CUT_SEARCH_S, which is held back from
+# the decoder until then. FireRed's own cut at 20 s fell wherever the count ran out.
+TURN_SOFT_S, TURN_HARD_S, CUT_SEARCH_S = 15.0, 20.0, 1.0
+# Each model call costs ~2 ms whatever its length, so frames are run in batches of at least
+# this many (50 ms); the realtime loop flushes the rest when the client pauses sending.
+VAD_BATCH_FRAMES = 5
+REALTIME_IDLE_FLUSH_S = 0.1
 # The gain follows the loudest audio of the last few seconds, not of the whole
 # input: a -55 dBFS speaker after a 0 dBFS one was otherwise never detected.
 VAD_GAIN_WINDOW_S = 3.0
@@ -336,7 +352,7 @@ class VadFactory:
         self._model = DetectModel.from_pretrained(model_dir).cpu()
 
     def stream(self, speech_threshold: float | None = None,
-               min_silence_frame: int | None = None):
+               min_silence_frame: int | None = None, max_speech_frame: int | None = None):
         """A fresh stream detector. Arguments override VAD_CONFIG per session."""
         from fireredvad.core.stream_vad_postprocessor import StreamVadPostprocessor
         from fireredvad.stream_vad import FireRedStreamVad
@@ -344,7 +360,8 @@ class VadFactory:
         c = self._config
         post = StreamVadPostprocessor(c.smooth_window_size,
                                       c.speech_threshold if speech_threshold is None else speech_threshold,
-                                      c.pad_start_frame, c.min_speech_frame, c.max_speech_frame,
+                                      c.pad_start_frame, c.min_speech_frame,
+                                      c.max_speech_frame if max_speech_frame is None else max_speech_frame,
                                       c.min_silence_frame if min_silence_frame is None else min_silence_frame)
         return FireRedStreamVad(self._feat, self._model, post, c)
 
@@ -427,11 +444,13 @@ class Session:
         self.step = int(round(step_ms / 1000 * SR))
         self.look = int(round(LOOKAHEAD_MS / 1000 * SR))
         self.chunk_s = step_ms / 1000
-        self.vad = vad_factory.stream(**(vad_overrides or {})) if vad_factory else None
-        # Frames of silence the VAD waits before reporting an end; the speech
-        # itself ended that long before the frame it reports.
-        self.vad_silence_frames = (vad_overrides or {}).get(
-            "min_silence_frame", VAD_CONFIG["min_silence_frame"])
+        overrides = dict(vad_overrides or {})
+        if "min_silence_frame" in overrides:  # the client's silence_duration_ms
+            overrides["min_silence_frame"] = max(1, overrides["min_silence_frame"] - VAD_END_LAG_FRAMES)
+        # Frames of silence the VAD waits before reporting an end.
+        self.vad_silence_frames = overrides.get("min_silence_frame", VAD_CONFIG["min_silence_frame"])
+        overrides["max_speech_frame"] = 10 ** 9  # long turns are cut in _on_frame instead
+        self.vad = vad_factory.stream(**overrides) if vad_factory else None
         self.first_max_new = max(1, int((self.step + self.look) / 1280))
         self.max_new: float = self.first_max_new
         self.floor = min(32, max(4, 2 * int(self.step / 1280)))
@@ -443,15 +462,17 @@ class Session:
         # this is the stream position (ms) they are relative to.
         self.vad_base_ms = 0
         self.audio_ms = 0
-        # Samples the VAD has seen since its last reset, to place its frames,
-        # and where finalize() padding sits among them. That padding is not
-        # client audio; counted as such, every commit shifted later
-        # timestamps 0.5 s.
+        # Samples given to the VAD since its last reset; positions below are in
+        # these units, and pending audio always ends at vad_samples. Where
+        # finalize() padding sits among them: it is not client audio, and
+        # counted as such every commit shifted later timestamps 0.5 s.
         self.vad_samples = 0
         self.vad_pads: list[tuple[int, int]] = []  # (vad sample, length)
-        # Start of the next turn held back from a split chunk, decoded with
-        # the next chunk because it is too short to decode alone.
-        self.carry = np.zeros(0, dtype=np.float32)
+        self.vad_buf = np.zeros(0, dtype=np.int16)  # samples of frames not yet complete
+        self.vad_frames = 0
+        self.recent: deque = deque(maxlen=int(CUT_SEARCH_S * 100) + 20)  # (sample, raw prob)
+        self.turn_start: int | None = None  # where the speech of the open turn started
+        self.resume_at: int | None = None  # after a cut at a dip: the next turn's start
         # Set while finalize() feeds its padding, which is silence by
         # construction and must not close the segment a second time.
         self._closing = False
@@ -483,78 +504,131 @@ class Session:
             self._new_segment()
 
     def feed(self, pcm: np.ndarray) -> list[Event]:
+        """Audio in arrival order. The VAD sees it in batches of whole frames and
+        acts on each frame in order; the engine decodes it in step-sized chunks."""
+        pcm = np.asarray(pcm, dtype=np.float32)
         self.audio_ms += int(len(pcm) * 1000 / SR)
-        self.pending = np.concatenate([self.pending, np.asarray(pcm, dtype=np.float32)])
+        self.pending = np.concatenate([self.pending, pcm])
         events: list[Event] = []
-        while True:
-            need = self.step + self.look if self.is_first else self.step
-            if len(self.pending) < need:
-                return events
-            seg, self.pending = self.pending[:need], self.pending[need:]
-            events += self._process(seg)
+        for r in self._vad_frames(pcm, VAD_BATCH_FRAMES):
+            events += self._on_frame(r)
+        return events + self._decode_ready()
 
-    def _process(self, seg: np.ndarray) -> list[Event]:
-        events, cut = self._vad_scan(seg)
-        p = self.policy
-        if cut is not None and not self._closing and self.seg_s + len(seg) / SR >= p.pause_cut_s:
-            # Split the chunk where the pause was detected: audio before it is
-            # the silence that ended this turn, audio after it may already be
-            # the next phrase. Feeding the whole chunk to the closing segment
-            # lost that onset -- the first word of every turn after a cut.
-            head, tail = seg[:cut], seg[cut:]
-            if len(head):
-                events += self._decode(head)
-            # The same trailing silence a client commit gets: cut at the pause,
-            # the segment ends right after its last word, and R2T2 did not emit
-            # that word -- "第一句" came back as "第一".
-            events += self._decode(np.zeros(int(FINAL_PAD_S * SR), dtype=np.float32))
-            events += self._close_segment(emit_empty=False)
-            if len(tail) >= MIN_DECODE_SAMPLES:
-                events += self._decode(tail)
-            else:
-                self.carry = tail
+    def flush(self) -> list[Event]:
+        """Run the VAD on every complete frame still held back for a batch."""
+        events: list[Event] = []
+        for r in self._vad_frames(np.zeros(0, dtype=np.float32), 1):
+            events += self._on_frame(r)
+        return events + self._decode_ready()
+
+    def _vad_frames(self, pcm: np.ndarray, batch: int) -> list:
+        """VAD results for the complete frames buffered, once there are `batch` of them."""
+        self.vad_samples += len(pcm)
+        if self.vad is None:
+            return []
+        if len(pcm):
+            gain = vad_gain(self.peak.update(pcm))
+            self.vad_buf = np.concatenate([self.vad_buf, _to_int16(pcm * gain)])
+        n = 0 if len(self.vad_buf) < VAD_WIN else 1 + (len(self.vad_buf) - VAD_WIN) // VAD_HOP
+        if n < batch or not n:
+            return []
+        results = self.vad.detect_chunk(self.vad_buf[:(n - 1) * VAD_HOP + VAD_WIN])
+        self.vad_buf = self.vad_buf[n * VAD_HOP:]
+        return results
+
+    def _dec_pos(self) -> int:
+        """Where the audio not yet decoded starts."""
+        return self.vad_samples - len(self.pending)
+
+    def _on_frame(self, r) -> list[Event]:
+        """Turn events for one VAD frame, closing the segment where a turn ends or is cut."""
+        events: list[Event] = []
+        self.vad_frames += 1
+        pos = (self.vad_frames - 1) * VAD_HOP + VAD_WIN // 2  # frame centre
+        self.recent.append((pos, r.raw_prob))
+        if r.is_speech_start:
+            self.resume_at = None
+            self.turn_start = max(0, r.speech_start_frame - 1) * VAD_HOP
+            events.append(Event("speech_started", ms=self._client_ms(self.turn_start)))
+        elif self.resume_at is not None and r.is_speech:
+            # Speech went on after the dip we cut at: that is where this turn began.
+            self.turn_start, self.resume_at = self.resume_at, None
+            events.append(Event("speech_started", ms=self._client_ms(self.turn_start)))
+        if r.is_speech_end:
+            if self.resume_at is not None:  # the dip we cut at became a pause; already closed
+                self.resume_at = None
+                return events
+            self.turn_start = None
+            # OpenAI's audio_end_ms is where speech ended, not where the
+            # silence after it was long enough to be sure.
+            spoke = max(0, r.speech_end_frame - 1 - self.vad_silence_frames - VAD_SMOOTH_LAG_FRAMES) * VAD_HOP
+            events.append(Event("speech_stopped", ms=self._client_ms(spoke)))
+            cut = max((r.speech_end_frame - 1) * VAD_HOP - VAD_CUT_MARGIN_MS * SR // 1000,
+                      spoke + 30 * SR // 1000)
+            if not self._closing and self._seg_s_at(cut) >= self.policy.pause_cut_s:
+                events += self._cut(cut)
             return events
-        events += self._decode(seg)
-        if not self._closing and (self.seg_s >= p.hard_s or detect_hallucination(self.last_fixed)):
-            events += self._close_segment(emit_empty=False)
+        if self.turn_start is None or self._closing or not self.server_vad:
+            return events
+        ran = (pos - self.turn_start) / SR
+        if ran >= TURN_HARD_S:
+            lo = max(self._dec_pos(), self.turn_start + int((TURN_HARD_S - CUT_SEARCH_S) * SR))
+        elif ran >= TURN_SOFT_S and not r.is_speech:
+            lo = max(self._dec_pos(), pos - 6 * VAD_HOP)  # the dip, back across the smoothing lag
+        else:
+            return events
+        window = [(p, q) for p, q in self.recent if p >= lo]
+        cut = min(window, key=lambda t: t[1])[0] if window else max(pos, self._dec_pos())
+        ms = self._client_ms(cut)
+        events.append(Event("speech_stopped", ms=ms))
+        events += self._cut(cut)
+        if r.is_speech:
+            self.turn_start = cut
+            events.append(Event("speech_started", ms=ms))
+        else:
+            self.turn_start, self.resume_at = None, cut
         return events
 
-    def _vad_scan(self, seg: np.ndarray) -> tuple[list[Event], int | None]:
-        """VAD events for `seg`, and the sample index in it to cut at on a pause."""
-        events: list[Event] = []
-        cut = None
-        start = self.vad_samples
-        self.vad_samples += len(seg)
-        if self.vad is None:
-            return events, cut
-        gain = vad_gain(self.peak.update(seg))
-        for r in self.vad.detect_chunk(_to_int16(seg * gain)):
-            if r.is_speech_start:
-                events.append(Event("speech_started", ms=self._client_ms(max(0, r.speech_start_frame - 1) * 10)))
-            if r.is_speech_end:
-                # OpenAI's audio_end_ms is where speech ended, not where the
-                # silence after it was long enough to be sure.
-                spoke = max(0, r.speech_end_frame - 1 - self.vad_silence_frames) * 10
-                events.append(Event("speech_stopped", ms=self._client_ms(spoke)))
-                # speech_end_frame is where the end was *detected*, after
-                # min_silence frames of silence; the smoothing window lags it
-                # by a few frames more, so step back by that margin.
-                at = (max(0, r.speech_end_frame - 1) * 10 - VAD_CUT_MARGIN_MS) * SR // 1000
-                cut = min(len(seg), max(0, at - start))
-                if cut < MIN_DECODE_SAMPLES:
-                    cut = 0  # too little to decode alone; it goes to the next turn
-        return events, cut
+    def _seg_s_at(self, pos: int) -> float:
+        return self.seg_s + max(0, pos - self._dec_pos()) / SR
 
-    def _client_ms(self, vad_ms: int) -> int:
-        """A VAD position (ms since its reset) as a position in the client's audio."""
-        pos = vad_ms * SR // 1000
+    def _cut(self, pos: int) -> list[Event]:
+        """Close the segment at `pos`: audio before it ends this turn, audio after it is the next."""
+        events = self._decode_ready(limit=pos)
+        head_n = min(len(self.pending), max(0, pos - self._dec_pos()))
+        head, self.pending = self.pending[:head_n], self.pending[head_n:]
+        if len(head):
+            events += self._decode(head)
+        # The same trailing silence a client commit gets: cut at the pause,
+        # the segment ends right after its last word, and R2T2 did not emit
+        # that word -- "第一句" came back as "第一".
+        events += self._decode(np.zeros(int(FINAL_PAD_S * SR), dtype=np.float32))
+        # Even empty: its speech_started/stopped were sent, and the next turn needs its own item.
+        return events + self._close_segment(emit_empty=True)
+
+    def _decode_ready(self, limit: int | None = None) -> list[Event]:
+        """Decode whole chunks of pending audio that end by `limit`, or by the
+        hold before a turn's forced cut."""
+        events: list[Event] = []
+        if limit is None and self.turn_start is not None and self.server_vad and not self._closing:
+            limit = self.turn_start + int((TURN_HARD_S - CUT_SEARCH_S) * SR)
+        while True:
+            need = self.step + self.look if self.is_first else self.step
+            if len(self.pending) < need or (limit is not None and self._dec_pos() + need > limit):
+                return events
+            seg, self.pending = self.pending[:need], self.pending[need:]
+            events += self._decode(seg)
+            if not self._closing and (self.seg_s >= self.policy.hard_s
+                                      or detect_hallucination(self.last_fixed)):
+                events += self._close_segment(emit_empty=False)
+
+    def _client_ms(self, pos: int) -> int:
+        """A VAD sample position as a position (ms) in the client's audio."""
         skip = sum(min(n, max(0, pos - start)) for start, n in self.vad_pads)
         return self.vad_base_ms + (pos - skip) * 1000 // SR
 
     def _decode(self, seg: np.ndarray) -> list[Event]:
         events: list[Event] = []
-        if len(self.carry):
-            seg, self.carry = np.concatenate([self.carry, seg]), self.carry[:0]
         self.is_first = False
         self.fed = True
         self.state.chunk_size_sec = len(seg) / SR
@@ -598,21 +672,21 @@ class Session:
         if self.fed:
             self._closing = True
             pad = int(pad_s * SR)
-            pad_at = self.vad_samples + len(self.pending)
+            pad_at = self.vad_samples
+            if self.vad is not None and pad:
+                self.vad_pads.append((pad_at, pad))
             try:
-                events = [e for e in self.feed(np.zeros(pad, dtype=np.float32))
-                          if e.kind == "delta"]
+                # The turn's speech_stopped, if the padding confirms it, is
+                # kept; nothing in the padding opens or cuts a turn.
+                events = [e for e in self.feed(np.zeros(pad, dtype=np.float32)) + self.flush()
+                          if e.kind in ("delta", "speech_stopped")]
             finally:
                 self._closing = False
                 self.audio_ms -= int(pad_s * 1000)  # padding is not client audio
-                # The VAD saw everything fed except what is left in pending,
-                # which goes straight to the engine below: pad - len(pending)
-                # more samples than the client sent.
-                if self.vad is not None and pad > len(self.pending):
-                    self.vad_pads.append((pad_at, pad - len(self.pending)))
-        if len(self.carry):
-            self.pending = np.concatenate([self.carry, self.pending])
-            self.carry = self.carry[:0]
+            if self.turn_start is not None or self.resume_at is not None:
+                # Speech not yet over at the commit: if it goes on, the next
+                # turn starts where this one was committed.
+                self.turn_start, self.resume_at = None, pad_at
         if len(self.pending):
             # Shorter than a chunk: R2T2 buffers it and finish() decodes it.
             self.state.chunk_size_samples = len(self.pending) + 1
@@ -623,12 +697,15 @@ class Session:
     def clear(self) -> list[Event]:
         """Drop the segment without a result (input_audio_buffer.clear)."""
         self.pending = np.zeros(0, dtype=np.float32)
-        self.carry = self.carry[:0]
         if self.vad is not None:
             self.vad.reset()
             self.vad_base_ms = self.audio_ms
             self.vad_samples = 0
             self.vad_pads = []
+            self.vad_buf = self.vad_buf[:0]
+            self.vad_frames = 0
+            self.recent.clear()
+        self.turn_start = self.resume_at = None
         self._new_segment()
         return []
 
@@ -1843,11 +1920,24 @@ async def _realtime_session(ws: WebSocket) -> None:
                 state["turn"] = Turn()
 
     async def processor() -> None:
-        while (item := await work.get()) is not None:
+        unflushed = False
+        while True:
+            try:
+                # The VAD runs frames in batches; when the client pauses sending,
+                # run the rest so a turn closes on the silence already received.
+                item = await (asyncio.wait_for(work.get(), REALTIME_IDLE_FLUSH_S) if unflushed
+                              else work.get())
+            except asyncio.TimeoutError:
+                unflushed = False
+                await emit(await _run(state["session"].flush))
+                continue
+            if item is None:
+                return
             kind, payload = item
             if state["session"] is None:
                 state["session"] = await _run(make_session)
             session = state["session"]
+            unflushed = kind == "audio"
             if kind == "config":
                 session.configure(cfg.language, cfg.server_vad, cfg.stream_policy,
                                   cfg.vad_policy, cfg.prompt)

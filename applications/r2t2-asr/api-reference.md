@@ -177,7 +177,7 @@ multipart/form-data：
 | `transcription.language` / `languages` | `zh`、`en`；二者只能给一个，多种语言时自动识别 |
 | `transcription.prompt` | 上下文提示 |
 | `turn_detection` | `{"type": "server_vad", ...}` 或 `null`（客户端 commit） |
-| `turn_detection.silence_duration_ms` | 静音多久结束一轮，默认 **500**（同 OpenAI）。调大则轮次更长、`completed` 更晚，delta 不受影响 |
+| `turn_detection.silence_duration_ms` | 静音多久结束一轮，默认 **500**（同 OpenAI）。语音后收到这么长的静音即结束（VAD 自身约 70 ms 的检测延迟已扣除，故比设定值短约 70 ms 的停顿也可能断轮）。调大则轮次更长、`completed` 更晚，delta 不受影响 |
 | `turn_detection.prefix_padding_ms` | 接受并回显，默认 300。轮次音频首尾相接，前一轮结束点之后的音频全部归下一轮，不会丢段首 |
 | `turn_detection.threshold` | FireRed VAD 的语音概率阈值，默认 0.4 |
 
@@ -195,13 +195,17 @@ multipart/form-data：
 | 事件 | 说明 |
 |------|------|
 | `session.created` / `session.updated` | 当前会话配置 |
-| `input_audio_buffer.speech_started` / `speech_stopped` | 带 `audio_start_ms` / `audio_end_ms`、`item_id`。时间为客户端音频中的位置（commit 时内部补的静音不计入）；`audio_end_ms` 是语音结束处，事件本身在其后 `silence_duration_ms` 才发出 |
+| `input_audio_buffer.speech_started` / `speech_stopped` | 带 `audio_start_ms` / `audio_end_ms`、`item_id`。时间为客户端音频中的位置（commit 时内部补的静音不计入），长会话不漂移；`audio_end_ms` 是语音结束处，事件本身在其后 `silence_duration_ms` 才发出。`speech_started` 带的是它开启的那一轮的 `item_id`，在上一轮 `completed` 之后发出 |
 | `input_audio_buffer.committed` | 轮次提交（客户端 commit 或 VAD），带 `item_id`、`previous_item_id` |
 | `conversation.item.input_audio_transcription.delta` | `item_id`、`content_index`、`delta` |
 | `conversation.item.input_audio_transcription.completed` | `item_id`、`content_index`、`transcript`、`languages: [{"code": "zh"}]` |
 | `error` | `error: {type, code, message, param, event_id}`；`backend_unavailable` 后以 1013 关闭 |
 
 所有服务端事件带 `event_id`。用 `item_id` 把 delta、committed、completed 对应到同一轮次。
+
+**长轮次的切分**：一轮连续说话超过 15 秒后，在第一个语音概率低于阈值的帧（词间或句间的短停顿）切开；到 20 秒仍无停顿，则在最后 1 秒内语音概率最低处切开（这 1 秒在切点确定前暂不解码，delta 会晚到至多约 1.5 秒）。切开处被切的一轮先 `speech_stopped`（`audio_end_ms` 为切点）再 `completed`（无识别文字时 `transcript` 为空），之后才是下一轮的 `speech_started`；话没停时它的 `audio_start_ms` 就等于切点，若切点处其实是一段停顿的开头，则取停顿后真正开口的位置。只在 `server_vad` 下切分；`turn_detection: null` 时由客户端 commit 决定。
+
+VAD 每攒够 50 ms 音频运行一次；客户端停止发送 100 ms 后会把剩余音频也跑完，所以轮次在静音收齐后至多约 100 ms 内结束。
 
 ## 与 OpenAI 的差异
 
